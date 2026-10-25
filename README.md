@@ -75,6 +75,18 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   yourself. On 10M rows vs DuckDB (`compare/bench-distinct.mjs`): 365 days
   4 ms vs 5; regions per day 9 ms vs 34; 1M accounts 81 ms vs 48; accounts per
   region (5.7M pairs) 214 ms vs 100.
+- **Lazy queries (a planner):** `t.lazy()` records a chain (`filter`, `derive`,
+  `select`, `join`, `groupBy().agg`, `sort`, `limit`/`top`) and optimizes it as a
+  whole before running it with `collect()`, `toRows()`, `agg()` or `count()`
+  (and `…Async`). Derived columns are inlined where they are used (never built
+  unless needed as a column, and then only for matching rows); filters move
+  below derives, selects and sorts, below `groupBy` when they only use its
+  keys, and into each side of a join; joins and sorts copy only the columns
+  used later; `sort` + `limit` becomes top-k. `explain()` prints the plan.
+  Every kernel also computes constant parts once and repeated parts once per
+  row (`sum(year(ts))`: 26 → 7.5 ms). `npm run bench:plan`, 10M orders, step by
+  step vs lazy: derive + filter + total 19.8 → 2.9 ms; join then filter 144 →
+  22 ms; sort then first 10 177 → 12 ms.
 - **Joins:** `orders.join(customers, { on: 'customer_id' })`, several keys
   (`on: ['region', 'day']`), different names (`on: { left: 'cust', right: 'id' }`),
   `how: 'inner'` (default) or `'left'`. Put the smaller table on the right: its

@@ -48,6 +48,7 @@ export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, 
   const f = new Fn('k', [...Array(A).fill(I32), I32, I32, I32, I32, ...Array(extra).fill(I32), ...Array(scalarNames.length).fill(F64)], []);
   const env = bindValues(f, t, arrayNames, A + 4 + extra, scalarNames);
   const em = new Emitter(f, t, env);
+  em.prepare([...items.map((it) => it.ast), pred]); // (the loop body is emitted once: no reset needed)
   const stop = f.local(I32), idx = f.local(I32), addr = f.local(I32), copy = f.local(I32);
   const bases = items.map(() => f.local(I32));
 

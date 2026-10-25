@@ -137,19 +137,51 @@ export function analyze(spec) {
     if (isReduction(ast)) {
       let arg = ast.args[0];
       checkElementwise(arg, src);
+      arg = fold(arg);
       if (ast.fn === 'count' && !isMask(arg)) arg = { t: 'bin', op: '!=', l: arg, r: { t: 'num', v: 0 } };
-      return { key, src, reduce: ast.fn, ast: arg };
+      return { key, src, reduce: ast.fn, ast: arg, raw: ast.args[0] };
     }
     checkElementwise(ast, src);
-    return { key, src, reduce: null, ast };
+    return { key, src, reduce: null, ast: fold(ast), raw: ast };
   });
   const maps = items.filter((it) => !it.reduce);
   if (maps.length && items.length > 1) throw new SyntaxError('vectro: an elementwise expression must be compiled on its own (one output array)');
   if (items.filter((it) => it.reduce).length > 8) throw new RangeError('vectro: at most 8 reductions per kernel');
 
   const vars = [];
-  for (const it of items) walk(it.ast, (n) => { if (n.t === 'var' && !vars.includes(n.name)) vars.push(n.name); });
+  for (const it of items) walk(it.raw, (n) => { if (n.t === 'var' && !vars.includes(n.name)) vars.push(n.name); }); // (before folding: the inputs stay the same)
   return { shape: typeof spec === 'string' ? 'single' : Array.isArray(spec) ? 'array' : 'object', items, vars, isMap: maps.length === 1 };
+}
+
+// Constant parts computed now: 2 * 3 -> 6, floor(2.5) -> 2, (1 ? x : y) -> x.
+// Same results as the kernels (IEEE doubles; f32 kernels round literals).
+const FOLD_BIN = { '+': (a, b) => a + b, '-': (a, b) => a - b, '*': (a, b) => a * b, '/': (a, b) => a / b };
+const FOLD_FN = { abs: Math.abs, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, min: Math.min, max: Math.max };
+export function fold(n) {
+  const isNum = (x) => x.t === 'num';
+  switch (n.t) {
+    case 'un': {
+      const x = fold(n.x);
+      if (isNum(x)) return { t: 'num', v: n.op === '-' ? -x.v : +(x.v === 0) };
+      return { ...n, x };
+    }
+    case 'bin': {
+      const l = fold(n.l), r = fold(n.r);
+      if (isNum(l) && isNum(r) && FOLD_BIN[n.op]) return { t: 'num', v: FOLD_BIN[n.op](l.v, r.v) };
+      return { ...n, l, r };
+    }
+    case 'call': {
+      const args = n.args.map(fold);
+      if (FOLD_FN[n.fn] && args.every(isNum)) return { t: 'num', v: FOLD_FN[n.fn](...args.map((a) => a.v)) };
+      return { ...n, args };
+    }
+    case 'cond': {
+      const c = fold(n.c), x = fold(n.x), y = fold(n.y);
+      if (isNum(c)) return c.v !== 0 ? x : y; // (as in the kernels: NaN != 0, so NaN counts as true)
+      return { ...n, c, x, y };
+    }
+  }
+  return n;
 }
 
 // ---- code generation ---------------------------------------------------------
@@ -169,15 +201,57 @@ const F64_OPS = { add: 0xa0, min: 0xa4, max: 0xa5 };
 const HIGH_HALF = [8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7]; // i8x16.shuffle lanes
 
 // Emits code for one AST in vector mode (v128, k = unroll slot) or scalar mode.
+// Repeated subexpressions: after prepare(asts), a value subtree that occurs
+// more than once in the kernel is computed once per row (per vector) into a
+// local and read back after that; call reset() at the start of each loop body.
 export class Emitter {
   constructor(f, t, env) {
     this.f = f;
     this.t = t;
     this.ty = TY[t];
     this.env = env;
+    this.repeated = new Set();
+    this.memo = new Map();
   }
 
-  vec(n, k) {
+  prepare(asts) {
+    const seen = new Map();
+    const visit = (n) => {
+      if (n.t === 'num' || n.t === 'var' || n.t === 'str') return;
+      const key = toSource(n);
+      seen.set(key, (seen.get(key) ?? 0) + 1);
+      if (seen.get(key) > 1) return; // (its parts are counted once)
+      if (n.t === 'bin') { visit(n.l); visit(n.r); } else if (n.t === 'un') visit(n.x);
+      else if (n.t === 'call') n.args.forEach(visit); else if (n.t === 'cond') { visit(n.c); visit(n.x); visit(n.y); }
+    };
+    for (const a of asts) if (a) visit(a);
+    for (const [key, c] of seen) if (c > 1) this.repeated.add(key);
+    this.keys = new Map();
+  }
+
+  reset() { this.memo.clear(); }
+
+  // emit(node) once, then from a local (key: subtree + unroll slot or 'sca')
+  #reuse(n, slot, type, emit) {
+    if (!this.repeated.size || n.t === 'num' || n.t === 'var') return emit();
+    let key = this.keys.get(n);
+    if (key === undefined) { key = toSource(n); this.keys.set(n, key); }
+    if (!this.repeated.has(key)) return emit();
+    const m = `${key}|${slot}`;
+    const local = this.memo.get(m);
+    if (local !== undefined) return this.f.emit(get(local));
+    emit();
+    this.locals ??= new Map();
+    let l = this.locals.get(m);
+    if (l === undefined) { l = this.f.local(type); this.locals.set(m, l); }
+    this.f.emit([0x22, ...get(l).slice(1)]); // local.tee
+    this.memo.set(m, l);
+  }
+
+  vec(n, k) { return this.#reuse(n, k, V128, () => this.#vec(n, k)); }
+  sca(n) { return this.#reuse(n, 'sca', this.ty.val, () => this.#sca(n)); }
+
+  #vec(n, k) {
     const { f, env } = this, V = VEC[this.t];
     switch (n.t) {
       case 'num': return f.emit(get(env.constVec(n.v)));
@@ -209,7 +283,7 @@ export class Emitter {
     f.emit(get(env.constVec(0)), simd(V.ne));
   }
 
-  sca(n) {
+  #sca(n) {
     const { f, env, ty } = this, S = SCA[this.t];
     switch (n.t) {
       case 'num': return f.emit(ty.cnst(n.v));
@@ -287,6 +361,7 @@ export function generate(analysis, t, arrayNames, scalarNames, shared = true) {
   literals.forEach((v) => env.constVec(v));
 
   const em = new Emitter(f, t, env);
+  em.prepare(items.map((it) => it.ast));
   const tmp = f.local(V128);
 
   // Accumulators. float64: f64x2 per slot. float32: sums widen to float64
@@ -307,6 +382,7 @@ export function generate(analysis, t, arrayNames, scalarNames, shared = true) {
   loops(f, ty, {
     ptrs, n, U,
     body: () => {
+      em.reset();
       for (let k = 0; k < U; k++) {
         for (const a of env.arrays.values()) f.emit(get(a.ptr), vload(16 * k), set(a.vec[k]));
         if (isMap) { f.emit(get(out)); em.vec(items[0].ast, k); f.emit(vstore(16 * k)); continue; }
@@ -341,6 +417,7 @@ export function generate(analysis, t, arrayNames, scalarNames, shared = true) {
       }
     },
     tail: () => {
+      em.reset();
       for (const a of env.arrays.values()) f.emit(get(a.ptr), ty.load, set(a.sca));
       if (isMap) { f.emit(get(out)); em.sca(items[0].ast); f.emit(ty.store); return; }
       for (const acc of accs) {

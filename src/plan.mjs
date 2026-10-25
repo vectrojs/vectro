@@ -1,0 +1,375 @@
+// Lazy queries: table.lazy() records a chain, optimizes it as a whole, then
+// runs it with the table methods. Nothing runs until collect(), toRows(),
+// agg(), count() (or their Async versions).
+//
+//   orders.lazy()
+//     .derive('revenue', 'price * qty')
+//     .filter("region == 'EU' && revenue > 100")
+//     .groupBy('customer').agg({ spend: 'sum(revenue)', orders: 'count()' })
+//     .sort('-spend').limit(10)
+//     .collect();
+//
+// What the optimizer does:
+//   - derived columns are inlined: filters, aggregations and sort keys use
+//     the expression itself, so `revenue` above is never built as a column;
+//     a derived column that is needed as a column (output, group key, join
+//     key) is built after the filters, on the matching rows only;
+//   - filters move down: below derives (by inlining), selects and sorts,
+//     below groupBy when they only use its keys, and into each side of a join
+//     when they only use that side's columns;
+//   - only the columns used later are carried (joins, sorts and collects copy
+//     nothing else), and derives nobody uses are dropped;
+//   - sort + limit becomes top(k), which doesn't sort everything;
+//   - parameters become constants, and constant parts of expressions are
+//     computed once (in the kernel compiler, which also computes repeated
+//     parts of an expression once per row).
+// explain() prints the optimized plan.
+
+import { parse, toSource, walk } from './fuse.mjs';
+import { DATE_RESULT } from './dates.mjs';
+
+const vars = (ast) => { const out = new Set(); walk(ast, (n) => { if (n.t === 'var') out.add(n.name); }); return out; };
+const and = (a, b) => (a ? { t: 'bin', op: '&&', l: a, r: b } : b);
+function conjuncts(ast) { return ast.t === 'bin' && ast.op === '&&' ? [...conjuncts(ast.l), ...conjuncts(ast.r)] : [ast]; }
+
+// Parameters as constants (dates as ms); text stays text.
+function bindParams(ast, params) {
+  if (!params || !Object.keys(params).length) return ast;
+  const sub = (n) => {
+    if (n.t === 'var' && n.name in params) {
+      const v = params[n.name] instanceof Date ? params[n.name].getTime() : params[n.name];
+      return typeof v === 'string' ? { t: 'str', v } : { t: 'num', v };
+    }
+    if (n.t === 'bin') return { ...n, l: sub(n.l), r: sub(n.r) };
+    if (n.t === 'un') return { ...n, x: sub(n.x) };
+    if (n.t === 'call') return { ...n, args: n.args.map(sub) };
+    if (n.t === 'cond') return { ...n, c: sub(n.c), x: sub(n.x), y: sub(n.y) };
+    return n;
+  };
+  return sub(ast);
+}
+
+// Replace derived names by their expressions. A text literal compared with a
+// derived date (monthStart(ts) >= '2024-01-01') becomes date('...').
+function inline(ast, derived) {
+  if (!derived.size) return ast;
+  const isDerivedDate = (n) => n.t === 'var' && derived.get(n.name)?.date;
+  const sub = (n) => {
+    if (n.t === 'var' && derived.has(n.name)) return derived.get(n.name).ast;
+    if (n.t === 'bin') {
+      let { l, r } = n;
+      if (l.t === 'str' && isDerivedDate(r)) l = { t: 'call', fn: 'date', args: [l] };
+      if (r.t === 'str' && isDerivedDate(l)) r = { t: 'call', fn: 'date', args: [r] };
+      return { ...n, l: sub(l), r: sub(r) };
+    }
+    if (n.t === 'un') return { ...n, x: sub(n.x) };
+    if (n.t === 'call') return { ...n, args: n.args.map(sub) };
+    if (n.t === 'cond') return { ...n, c: sub(n.c), x: sub(n.x), y: sub(n.y) };
+    return n;
+  };
+  return sub(ast);
+}
+
+// Sort keys: '-name' or an expression.
+const IDENT = /^\s*(-?)\s*([A-Za-z_]\w*)\s*$/;
+const keyList = (by) => (Array.isArray(by) ? by : [by]);
+
+export class Query {
+  constructor(node) { this.node = node; }
+
+  filter(expr, params = {}) { return new Query({ op: 'filter', input: this.node, ast: bindParams(parse(expr), params) }); }
+  derive(name, expr, params = {}) { return new Query({ op: 'derive', input: this.node, name, ast: bindParams(parse(expr), params) }); }
+  select(...names) { return new Query({ op: 'select', input: this.node, names: names.flat() }); }
+  sort(by) { return new Query({ op: 'sort', input: this.node, by: keyList(by) }); }
+  limit(n) { return new Query({ op: 'limit', input: this.node, n: Math.max(0, Math.floor(n)) }); }
+  top(k, by) { return this.sort(by).limit(k); }
+  join(other, opts) {
+    const right = other instanceof Query ? other.node : { op: 'scan', table: other };
+    return new Query({ op: 'join', left: this.node, right, opts: opts ?? {} });
+  }
+  groupBy(keys) {
+    return { agg: (spec, params = {}) => new Query({ op: 'aggregate', input: this.node, keys: keyList(keys), spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) }) };
+  }
+
+  // ---- running --------------------------------------------------------------------
+  collect() { return runSync(this.#final()); }
+  collectAsync() { return runAsync(this.#final()); }
+  toRows(limit = Infinity) { const t = this.collect(); try { return t.toRows(limit); } finally { t.dispose(); } }
+  async toRowsAsync(limit = Infinity) { const t = await this.collectAsync(); try { return await t.toRowsAsync(limit); } finally { t.dispose(); } }
+  agg(spec, params = {}) { return runSync(this.#aggNode(spec, params)); }
+  aggAsync(spec, params = {}) { return runAsync(this.#aggNode(spec, params)); }
+  count() { return this.agg({ n: 'count()' }).n; }
+  async countAsync() { return (await this.aggAsync({ n: 'count()' })).n; }
+
+  // The optimized plan, one step per line (innermost first).
+  explain() { return describe(optimize(this.#final().node)); }
+
+  #final() { return new Query({ op: 'output', input: this.node }); }
+  #aggNode(spec, params) {
+    return new Query({ op: 'total', input: this.node, spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) });
+  }
+}
+
+// ---- optimizing: move filters down --------------------------------------------------
+
+// Column names a node produces (null: unknown, e.g. a table we haven't seen).
+function namesOf(node) {
+  switch (node.op) {
+    case 'scan': return node.table.columnNames;
+    case 'filter': case 'sort': case 'limit': case 'output': return namesOf(node.input);
+    case 'derive': return [...new Set([...namesOf(node.input), node.name])];
+    case 'select': return node.names;
+    case 'aggregate': return [...node.keys, ...Object.keys(node.spec)];
+    case 'join': return joinNames(node).all;
+  }
+  return [];
+}
+
+// Output names of a join, and where each comes from.
+function joinNames(node) {
+  const left = namesOf(node.left), right = namesOf(node.right);
+  const { on, suffix = '_right' } = node.opts;
+  const [lk, rk] = typeof on === 'string' || Array.isArray(on) ? [[on].flat(), [on].flat()] : [[on?.left].flat(), [on?.right].flat()];
+  const same = new Set(rk.filter((n, k) => lk[k] === n));
+  const fromRight = new Map(); // output name -> right column
+  const all = [...left];
+  for (const n of right) {
+    if (same.has(n)) continue;
+    let out = n;
+    while (all.includes(out)) out += suffix;
+    all.push(out);
+    fromRight.set(out, n);
+  }
+  return { all, left: new Set(left), fromRight };
+}
+
+const rename = (ast, map) => {
+  const sub = (n) => {
+    if (n.t === 'var' && map.has(n.name)) return { ...n, name: map.get(n.name) };
+    if (n.t === 'bin') return { ...n, l: sub(n.l), r: sub(n.r) };
+    if (n.t === 'un') return { ...n, x: sub(n.x) };
+    if (n.t === 'call') return { ...n, args: n.args.map(sub) };
+    if (n.t === 'cond') return { ...n, c: sub(n.c), x: sub(n.x), y: sub(n.y) };
+    return n;
+  };
+  return sub(ast);
+};
+
+// Place one condition as deep as it can go below `node`.
+function pushFilter(node, cond) {
+  const used = vars(cond);
+  switch (node.op) {
+    case 'filter': return { ...node, input: pushFilter(node.input, cond) };
+    case 'sort': case 'select': return { ...node, input: pushFilter(node.input, cond) };
+    case 'derive': // below the derive, with its expression in place of its name
+      return { ...node, input: pushFilter(node.input, used.has(node.name) ? inline(cond, new Map([[node.name, { ast: node.ast, date: isDateExpr(node) }]])) : cond) };
+    case 'aggregate':
+      if ([...used].every((n) => node.keys.includes(n))) return { ...node, input: pushFilter(node.input, cond), pushed: (node.pushed ?? 0) + 1 };
+      break;
+    case 'join': {
+      const { left, fromRight } = joinNames(node);
+      if ([...used].every((n) => left.has(n))) return { ...node, left: pushFilter(node.left, cond) };
+      if ([...used].every((n) => fromRight.has(n))) return { ...node, right: pushFilter(node.right, rename(cond, fromRight)) };
+      break;
+    }
+  }
+  return { op: 'filter', input: node, ast: cond };
+}
+const isDateExpr = (node) => node.ast.t === 'call' && DATE_RESULT.has(node.ast.fn);
+
+export function optimize(node) {
+  switch (node.op) {
+    case 'scan': return node;
+    case 'filter': {
+      let input = optimize(node.input);
+      for (const c of conjuncts(node.ast)) input = pushFilter(input, c);
+      return input;
+    }
+    case 'join': return { ...node, left: optimize(node.left), right: optimize(node.right) };
+    default: return { ...node, input: optimize(node.input) };
+  }
+}
+
+// ---- running -------------------------------------------------------------------------
+// The executor is a generator of table calls { table, method, args } (sync
+// or async drivers run them), building on pipeline states:
+//   { table (a Table, maybe filtered), derived: name -> { ast, date }, visible }
+
+function* execG(node, needed, temps) {
+  switch (node.op) {
+    case 'scan': return { table: node.table, derived: new Map(), visible: node.table.columnNames };
+    case 'filter': {
+      const s = yield* execG(node.input, union(needed, vars(node.ast)), temps);
+      return { ...s, table: s.table.filter(toSource(inline(node.ast, s.derived))) };
+    }
+    case 'derive': {
+      if (needed && !needed.has(node.name)) return yield* execG(node.input, needed, temps); // nobody uses it
+      const s = yield* execG(node.input, union(minus(needed, node.name), vars(node.ast)), temps);
+      const derived = new Map(s.derived).set(node.name, { ast: inline(node.ast, s.derived), date: isDateExpr(node) || (node.ast.t === 'var' && !!s.table.cols.get(node.ast.name)?.date) });
+      return { ...s, derived, visible: [...s.visible.filter((n) => n !== node.name), node.name] };
+    }
+    case 'select': {
+      for (const n of node.names) if (!namesOf(node.input).includes(n)) throw new Error(`vectro: no column "${n}"`);
+      const s = yield* execG(node.input, needed ? new Set(node.names.filter((n) => needed.has(n))) : new Set(node.names), temps);
+      return { ...s, visible: node.names };
+    }
+    case 'aggregate': {
+      const specAsts = Object.values(node.spec);
+      const want = new Set([...node.keys, ...specAsts.flatMap((a) => [...vars(a)])]);
+      const s = yield* execG(node.input, want, temps);
+      const t = yield* materializeG(s, new Set(node.keys), temps, specAsts);
+      const spec = Object.fromEntries(Object.entries(node.spec).map(([k, a]) => [k, toSource(inline(a, s.derived))]));
+      const g = yield { table: t, method: 'groupAgg', args: [node.keys, spec] };
+      return { table: g, derived: new Map(), visible: g.columnNames };
+    }
+    case 'limit': case 'sort': {
+      const sortNode = node.op === 'sort' ? node : node.input.op === 'sort' ? node.input : null;
+      const k = node.op === 'limit' ? node.n : null;
+      const below = sortNode ? sortNode.input : node.input;
+      const keyAsts = (sortNode?.by ?? []).map((b) => parse(String(b).trim()));
+      const s = yield* execG(below, union(needed, new Set(keyAsts.flatMap((a) => [...vars(a)]))), temps);
+      const keep = needed ? s.visible.filter((n) => needed.has(n)) : s.visible;
+      // the rows to output, then derived output columns on those rows only
+      const later = keep.filter((n) => s.derived.has(n)).map((n) => s.derived.get(n).ast); // derived outputs: built on the rows kept
+      const base = yield* materializeG(s, new Set(keep.filter((n) => !s.derived.has(n))), temps, [...keyAsts, ...later], true);
+      let r;
+      if (sortNode) {
+        const by = sortNode.by.map((b) => {
+          const m = IDENT.exec(String(b));
+          if (m && !s.derived.has(m[2])) return String(b).trim(); // a column ('-region' stays a label sort)
+          return toSource(inline(parse(String(b)), s.derived));
+        });
+        r = yield { table: base, method: k === null ? 'sort' : 'top', args: k === null ? [by] : [k, by] };
+      } else r = yield { table: base, method: 'head', args: [k] };
+      for (const n of keep) {
+        const d = s.derived.get(n);
+        if (!d) continue;
+        r = yield { table: r, method: 'derive', args: [n, toSource(d.ast)], date: d.date };
+        }
+      return { table: r, derived: new Map(), visible: keep };
+    }
+    case 'join': {
+      const { left: leftNames, fromRight } = joinNames(node);
+      const { on } = node.opts;
+      const [lk, rk] = typeof on === 'string' || Array.isArray(on) ? [[on].flat(), [on].flat()] : [[on?.left].flat(), [on?.right].flat()];
+      const needL = new Set(lk), needR = new Set(rk);
+      for (const n of needed ?? namesOf(node)) { if (leftNames.has(n)) needL.add(n); else if (fromRight.has(n)) needR.add(fromRight.get(n)); else if (rk.includes(n)) needR.add(n); }
+      const sl = yield* execG(node.left, needL, temps), sr = yield* execG(node.right, needR, temps);
+      const lt = yield* materializeG(sl, needL, temps, [], true), rt = yield* materializeG(sr, needR, temps, [], true);
+      const j = yield { table: lt, method: 'join', args: [rt, node.opts] };
+      return { table: j, derived: new Map(), visible: j.columnNames };
+    }
+    case 'output': {
+      const s = yield* execG(node.input, null, temps);
+      const t = yield* materializeG(s, new Set(s.visible), temps, [], true);
+      const out = yield { table: t.select(...s.visible), method: 'collect', args: [] };
+      return out.columnNames.length === s.visible.length ? out : out.select(...s.visible); // (a filter's columns came along: drop them)
+    }
+    case 'total': {
+      const asts = Object.values(node.spec);
+      const s = yield* execG(node.input, new Set(asts.flatMap((a) => [...vars(a)])), temps);
+      const spec = Object.fromEntries(Object.entries(node.spec).map(([k, a]) => [k, toSource(inline(a, s.derived))]));
+      return yield { table: s.table, method: 'agg', args: [spec] };
+    }
+  }
+  throw new Error(`vectro: unknown plan step ${node.op}`);
+}
+
+// A table holding `names` (base or derived) of state s, still filtered.
+// Derived columns are built on the matching rows only (collect first).
+// exprs: expressions that will be evaluated on it (their columns are kept).
+function* materializeG(s, names, temps, exprs = [], keepVisibleOrder = false) {
+  const derivedNames = [...names].filter((n) => s.derived.has(n));
+  const base = new Set([...names].filter((n) => !s.derived.has(n)));
+  for (const n of derivedNames) for (const v of vars(s.derived.get(n).ast)) base.add(v);
+  for (const e of exprs) for (const v of vars(inline(e, s.derived))) if (s.table.cols.has(v)) base.add(v);
+  for (const n of base) if (!s.table.cols.has(n)) throw new Error(`vectro: no column "${n}"`);
+  let t = base.size ? s.table.select(...base) : s.table;
+  if (!derivedNames.length) return t;
+  if (t.pred) t = yield { table: t, method: 'collect', args: [] };
+  for (const n of derivedNames) {
+    const d = s.derived.get(n);
+    t = yield { table: t, method: 'derive', args: [n, toSource(d.ast)], date: d.date };
+  }
+  return t;
+}
+
+const union = (a, b) => (a ? new Set([...a, ...b]) : null);
+const minus = (a, name) => (a ? new Set([...a].filter((n) => n !== name)) : null);
+
+// Free the intermediate tables, except columns the result still uses.
+function release(result, temps) {
+  const used = new Set();
+  if (result?.cols) for (const c of result.cols.values()) used.add(c.data);
+  for (const t of temps) {
+    if (t === result) continue;
+    for (const name of [...t.owned]) {
+      const c = t.cols.get(name);
+      if (c && used.has(c.data)) { // the result shares it: the result owns it now
+        t.owned = t.owned.filter((n) => n !== name);
+        const outName = [...result.cols].find(([, rc]) => rc.data === c.data)?.[0];
+        if (outName && !result.owned.includes(outName)) result.owned.push(outName);
+      }
+    }
+    t.dispose();
+  }
+}
+
+function call(req, sync) {
+  const { table, method, args } = req;
+  const suffix = sync ? '' : 'Async';
+  if (method === 'groupAgg') return table.groupBy(args[0])[`agg${suffix}`](args[1]);
+  if (method === 'derive' && req.date) { // keep the date flag of dayStart(ts) and friends
+    const mark = (t) => { t.cols.get(args[0]).date = true; return t; };
+    return sync ? mark(table.derive(...args)) : table.deriveAsync(...args).then(mark);
+  }
+  return table[`${method}${suffix}`](...args);
+}
+
+// Tables a call made (not the one it was called on) are intermediate: freed
+// at the end unless the result uses their columns.
+const record = (temps, req, out) => { if (out && out !== req.table && out.cols && !temps.includes(out)) temps.push(out); return out; };
+
+function runSync(q) {
+  const temps = [];
+  const g = execG(optimize(q.node), null, temps);
+  let result;
+  try {
+    let step = g.next();
+    while (!step.done) step = g.next(record(temps, step.value, call(step.value, true)));
+    result = step.value;
+    return result;
+  } finally { release(result, temps); }
+}
+
+async function runAsync(q) {
+  const temps = [];
+  const g = execG(optimize(q.node), null, temps);
+  let result;
+  try {
+    let step = g.next();
+    while (!step.done) step = g.next(record(temps, step.value, await call(step.value, false)));
+    result = step.value;
+    return result;
+  } finally { release(result, temps); }
+}
+
+// ---- explain -----------------------------------------------------------------------------
+function describe(node, depth = 0) {
+  const pad = '  '.repeat(depth);
+  switch (node.op) {
+    case 'scan': return `${pad}scan [${node.table.columnNames.join(', ')}]`;
+    case 'filter': return `${describe(node.input, depth)}\n${pad}filter ${toSource(node.ast)}`;
+    case 'derive': return `${describe(node.input, depth)}\n${pad}derive ${node.name} = ${toSource(node.ast)} (inlined where used)`;
+    case 'select': return `${describe(node.input, depth)}\n${pad}select ${node.names.join(', ')}`;
+    case 'aggregate': return `${describe(node.input, depth)}\n${pad}groupBy ${node.keys.join(', ')}: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}${node.pushed ? ` (${node.pushed} filter(s) on keys moved below)` : ''}`;
+    case 'sort': return `${describe(node.input, depth)}\n${pad}sort ${node.by.join(', ')}`;
+    case 'limit': return node.input.op === 'sort'
+      ? `${describe(node.input.input, depth)}\n${pad}top ${node.n} by ${node.input.by.join(', ')} (sort + limit)`
+      : `${describe(node.input, depth)}\n${pad}limit ${node.n}`;
+    case 'join': return `${pad}join ${JSON.stringify(node.opts.on)} ${node.opts.how ?? 'inner'}\n${pad}  left:\n${describe(node.left, depth + 2)}\n${pad}  right:\n${describe(node.right, depth + 2)}`;
+    case 'output': return describe(node.input, depth);
+    case 'total': return `${describe(node.input, depth)}\n${pad}totals: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}`;
+  }
+  return `${pad}${node.op}`;
+}

@@ -31,6 +31,7 @@ class Program {
     this.nTmp = 0;
     this.consts = [];    // { value } or { param }
     this.constIndex = new Map();
+    this.memo = new Map(); // value numbering: the same op on the same inputs is computed once
   }
 
   #const(key, entry) {
@@ -43,8 +44,12 @@ class Program {
       const R = this.t === 'f32' ? Math.fround : (x) => x; // constants are stored at the column type
       return this.num(R(FOLD[name](...args.map((r) => R(this.consts[r.i].value)))));
     }
+    const key = `${name}(${args.map((r) => (r.k === 'col' ? `c:${r.name}` : `${r.k[0]}${r.i}`)).join(',')})`;
+    const seen = this.memo.get(key);
+    if (seen) return seen;
     const dst = { k: 'tmp', i: this.nTmp++ };
     this.ops.push({ fn: `v${name}_${this.t}`, dst, args });
+    this.memo.set(key, dst);
     return dst;
   }
 

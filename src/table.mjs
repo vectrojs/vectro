@@ -13,6 +13,7 @@ import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
 import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { joinTablesG } from './join.mjs';
+import { Query } from './plan.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
 import { DATE_FNS, DATE_RESULT, parseDateText, toMillis } from './dates.mjs';
@@ -943,6 +944,21 @@ export class Table {
     }
     if (t !== this) t.dispose();
     return rows;
+  }
+
+  // A lazy query over this table (see plan.mjs): steps are recorded,
+  // optimized together and run by collect() / toRows() / agg() / count().
+  lazy() { return new Query({ op: 'scan', table: this }); }
+
+  // The first n rows (matching the filter) as a new table.
+  head(n) { return this.engine._drive(this.#headG(n)); }
+  headAsync(n) { return this.engine._driveAsync(this.#headG(n)); }
+  *#headG(n) {
+    const t = yield* this.#collectG();
+    if (n >= t.n) return t;
+    const out = t.#gather(Uint32Array.from({ length: Math.max(0, n) }, (_, i) => i), Math.max(0, n));
+    if (t !== this) t.dispose();
+    return out;
   }
 
   // Hash join: orders.join(customers, { on: 'customer_id', how: 'inner' | 'left' }).
