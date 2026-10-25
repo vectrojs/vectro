@@ -10,6 +10,7 @@ import { parseNDJSON } from './ndjson.mjs';
 import { ZONE_ROWS } from './zones.mjs';
 import { FrameReader } from './frames.mjs';
 import { ArrowReader } from './arrow.mjs';
+import { SKETCH_SIZE, sketchAdd, sketchMerge, hashNumber, hashText } from './sketch.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
@@ -230,12 +231,12 @@ export function createStreams(getEngine) {
   // group-by: key = (slice - first slice in the batch) * groups + group code.
   const GROUP_KEYS = 2 ** 24;
 
-  function openWindow(s, { wid, by = null, every, last, timeColumn, ask, fns }) {
+  function openWindow(s, { wid, by = null, every, last, timeColumn, ask, fns, sketches = [] }) {
     const time = timeColumn ?? s.timeColumn;
     if (!s.cols.has(time)) throw new Error(`vectro: window needs timeColumn, a number column of milliseconds (columns: ${s.names.join(', ')})`);
     if (by != null && !s.cols.get(by)?.dict) throw new Error(`vectro: window "by" must be a category column, got "${by}"`);
     if (!(every > 0) || !(last >= every)) throw new Error('vectro: window needs every > 0 and last >= every (milliseconds)');
-    const w = { by, every, slices: Math.ceil(last / every), time, ask, fns, buckets: new Map(), newest: -Infinity };
+    const w = { by, every, slices: Math.ceil(last / every), time, ask, fns, buckets: new Map(), newest: -Infinity, sketches, sk: new Map() };
     s.windows.set(wid, w);
     if (s.n > s.start) updateWindow(s, w, s.start, s.n - s.start); // rows already kept count too
     return true;
@@ -312,12 +313,82 @@ export function createStreams(getEngine) {
         }
       } finally { for (const d of derived) d?.dispose(); }
     }
+    if (w.sketches.length) updateSketches(s, w, t, from, m);
     // drop slices that fell out of the window
     for (const slice of w.buckets.keys()) if (slice <= w.newest - w.slices) w.buckets.delete(slice);
+    for (const slice of w.sk.keys()) if (slice <= w.newest - w.slices) w.sk.delete(slice);
+  }
+
+  // Distinct-count sketches of a window: per (slice, group), one sketch per
+  // approxDistinct (SKETCH_SIZE bytes each, side by side). Text hashes by
+  // label, so every worker's dictionary gives the same hashes.
+  function updateSketches(s, w, t, from, m) {
+    const engine = getEngine(), J = w.sketches.length;
+    const ts = engine.live(s.cols.get(w.time).data).subarray(from, from + m);
+    const codes = w.by ? engine.live(s.cols.get(w.by).data).subarray(from, from + m) : null;
+    const dictBy = w.by ? s.cols.get(w.by).dict : null;
+    const derived = [];
+    const vals = w.sketches.map(({ arg }, j) => {
+      const name = arg.trim(), c = /^[A-Za-z_]\w*$/.test(name) ? s.cols.get(name) : null;
+      if (c) return { data: engine.live(c.data).subarray(from, from + m), dict: c.dict };
+      const d = t.derive(`__np_s${j}`, arg);
+      derived.push(d);
+      return { data: engine.live(d.cols.get(`__np_s${j}`).data), dict: null };
+    });
+    try {
+      const hashes = vals.map((v) => (v.dict ? v.dict.map(hashText) : null)); // per label, once
+      const cache = new Map();
+      for (let i = 0; i < m; i++) {
+        const tv = ts[i];
+        if (tv !== tv) continue;
+        const slice = Math.floor(tv / w.every), code = codes ? codes[i] : 0;
+        if (slice > w.newest) w.newest = slice;
+        let bySlice = cache.get(slice);
+        if (!bySlice) cache.set(slice, (bySlice = []));
+        let regs = bySlice[code];
+        if (!regs) {
+          let b = w.sk.get(slice);
+          if (!b) w.sk.set(slice, (b = new Map()));
+          const group = dictBy ? dictBy[code] : null;
+          regs = b.get(group);
+          if (!regs) b.set(group, (regs = new Uint8Array(J * SKETCH_SIZE)));
+          bySlice[code] = regs;
+        }
+        for (let j = 0; j < J; j++) {
+          const x = vals[j].data[i];
+          if (hashes[j]) sketchAdd(regs, j * SKETCH_SIZE, hashes[j][x]);
+          else if (x === x) sketchAdd(regs, j * SKETCH_SIZE, hashNumber(x));
+        }
+      }
+    } finally {
+      for (const d of derived) d.dispose();
+    }
   }
 
   const handlers = {
     streamOpen: open,
+    // A window's sketches from slice `since` on: merged per group, or per
+    // (slice, group) with series. -> { keys: [[slice | null, group]], sketches }
+    streamWindowSketches({ id, wid, since, series }) {
+      const s = get(id), w = s.windows.get(wid);
+      if (!w) throw new Error(`vectro: no window ${wid} on this stream`);
+      flush(s);
+      const J = w.sketches.length, out = new Map();
+      for (const [slice, groups] of w.sk) {
+        if (slice < since) continue;
+        for (const [group, regs] of groups) {
+          const key = series ? `${slice}\u0000${group}` : group;
+          let e = out.get(key);
+          if (!e) out.set(key, (e = { slice: series ? slice : null, group, regs: new Uint8Array(J * SKETCH_SIZE) }));
+          sketchMerge(e.regs, 0, regs, 0);
+          for (let j = 1; j < J; j++) sketchMerge(e.regs, j * SKETCH_SIZE, regs, j * SKETCH_SIZE);
+        }
+      }
+      const list = [...out.values()];
+      const sketches = new Uint8Array(list.length * J * SKETCH_SIZE);
+      list.forEach((e, i) => sketches.set(e.regs, i * J * SKETCH_SIZE));
+      return { keys: list.map((e) => [e.slice, e.group]), sketches };
+    },
     streamWindow({ id, ...opts }) { return openWindow(get(id), opts); },
     // Every slice kept: [slice, group label, ...values in ask order].
     streamWindowRead({ id, wid }) {

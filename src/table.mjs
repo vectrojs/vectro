@@ -17,7 +17,8 @@ import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
 
 const IDENT = /^[A-Za-z_]\w*$/;
-const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count']);
+const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count', 'countDistinct', 'approxDistinct']);
+const DISTINCT = new Set(['countDistinct', 'approxDistinct']); // exact on a table (see #distinctCountsG)
 const IDENTITY = { sum: 0, count: 0, mean: 0, min: Infinity, max: -Infinity };
 const MAX_GROUP_SLOTS = 2 ** 28; // threads * aggregations * groups (2GB of float64)
 const PARALLEL_SORT_ROWS = 50_000; // smaller tables sort on the calling thread
@@ -174,7 +175,18 @@ export class Table {
     if (narrow !== this) return yield* narrow.#aggG(spec, params);
     const merged = this.#mergeParams(params);
     const P = this.pred;
-    const items = Object.entries(spec).map(([out, src]) => ({ out, ...this.#aggItem(src, merged) }));
+    const all = Object.entries(spec).map(([out, src]) => ({ out, ...this.#aggItem(src, merged) }));
+    const distinct = all.filter((it) => DISTINCT.has(it.fn));
+    if (distinct.length) { // distinct values of the matching rows
+      const t = yield* this.#collectG();
+      try {
+        for (const it of distinct) it.value = (yield* t.#distinctCountsG(it.arg, merged, null, 1))[0];
+      } finally {
+        if (t !== this) t.dispose();
+      }
+    }
+    const items = all.filter((it) => !DISTINCT.has(it.fn));
+    const done = (values) => Object.fromEntries(all.map((it) => [it.out, it.value !== undefined ? it.value : values[it.out]]));
     if (P && !this.engine.jit) {
       // interpreter: evaluate the filter once and aggregate only matching rows
       const truthy = (ast) => (isMask(ast) ? ast : { t: 'bin', op: '!=', l: ast, r: { t: 'num', v: 0 } });
@@ -184,7 +196,7 @@ export class Table {
       }));
       const t = this.type === Float32Array ? 'f32' : 'f64';
       const values = interpretFilteredReduce(this.engine, t, parse(P), work, this.#vars(merged), merged, this.n);
-      return Object.fromEntries(items.map((it, j) => [it.out, values[j]]));
+      return done(Object.fromEntries(items.map((it, j) => [it.out, values[j]])));
     }
     const reductions = [];
     const slot = (s) => reductions.push(s) - 1;
@@ -200,7 +212,7 @@ export class Table {
     }
     const r = reductions.length ? yield* this.engine.evalG(reductions, this.#vars(merged)) : [];
     const value = (it) => (it.value !== undefined ? it.value : it.countSlot === undefined ? r[it.slot] : r[it.slot] / r[it.countSlot]);
-    return Object.fromEntries(items.map((it) => [it.out, value(it)]));
+    return done(Object.fromEntries(items.map((it) => [it.out, value(it)])));
   }
 
   sum(expr, params) { return this.agg({ v: `sum(${expr})` }, params).v; }
@@ -219,9 +231,12 @@ export class Table {
   #aggItem(src, params) {
     const ast = parse(src);
     if (ast.t !== 'call' || !AGG_FNS.has(ast.fn) || ast.args.length > 1 || (ast.fn !== 'count' && ast.args.length !== 1)) {
-      throw new SyntaxError(`vectro: an aggregation must look like sum(expr), mean(expr), min(expr), max(expr) or count([expr]), got "${src}"`);
+      throw new SyntaxError(`vectro: an aggregation must look like sum(expr), mean(expr), min(expr), max(expr), count([expr]) or countDistinct(expr), got "${src}"`);
     }
     if (!ast.args.length) return { fn: ast.fn, arg: null };
+    if (DISTINCT.has(ast.fn) && ast.args[0].t === 'var' && this.cols.get(ast.args[0].name)?.strings) {
+      throw new Error(`vectro: ${ast.fn} can't count a free-text column ("${ast.args[0].name}"); load it as a category`);
+    }
     return { fn: ast.fn, arg: this.#bind(toSource(ast.args[0]), params).src };
   }
 
@@ -250,6 +265,10 @@ export class Table {
     const merged = this.#mergeParams(params);
     const items = Object.entries(spec).map(([out, src]) => ({ out, ...this.#aggItem(src, merged) }));
     for (const it of items) if (keys.includes(it.out)) throw new Error(`vectro: aggregation "${it.out}" has the same name as a key`);
+    if (this.pred && items.some((it) => DISTINCT.has(it.fn))) { // distinct counts need the matching rows themselves
+      const t = yield* this.#collectG();
+      try { return yield* t.#groupAggG(keys, spec, params); } finally { t.dispose(); }
+    }
     const direct = yield* this.#directGroups(keys, items.length + 1);
     if (direct) {
       try { return yield* this.#runGroupsG(keys, direct, items, merged); } finally { if (direct.owned) this.engine.free(direct.data); }
@@ -425,7 +444,56 @@ export class Table {
   }
 
   // Run the group kernel over group numbers `groups.data` (0..K-1).
-  *#runGroupsG(keys, groups, items, merged) {
+  *#runGroupsG(keys, groups, allItems, merged) {
+    const { engine } = this;
+    const { K } = groups;
+    const items = allItems.filter((it) => !DISTINCT.has(it.fn));
+    const totals = yield* this.#groupTotalsG(groups, items, merged);
+    // Keep groups that have rows, sorted by key (codes for text keys, so
+    // dictionary order; NaN last), and build whole columns.
+    const counts = totals[0];
+    let m = 0;
+    for (let g = 0; g < K; g++) if (counts[g] > 0) m++;
+    let keep = new Float64Array(m);
+    for (let g = 0, r = 0; g < K; g++) if (counts[g] > 0) keep[r++] = g;
+    let codes = keys.map((_, k) => groups.keyColumn(k, keep));
+    if (!groups.sorted) {
+      let idx;
+      if (engine.jit && m >= PARALLEL_SORT_ROWS) { // many groups: sort them on every thread
+        const arrays = codes.map((a) => { const x = engine.alloc(Float64Array, m); engine.live(x).set(a); return x; });
+        try {
+          const perm = yield* sortPermG(engine, arrays, m, 'f64');
+          idx = engine.live(perm).slice();
+          engine.free(perm);
+        } finally {
+          for (const x of arrays) engine.free(x);
+        }
+      } else idx = sortIndex(codes, m);
+      const order = new Float64Array(m);
+      for (let r = 0; r < m; r++) order[r] = keep[idx[r]];
+      keep = order;
+      codes = codes.map((a) => { const out = new Float64Array(m); for (let r = 0; r < m; r++) out[r] = a[idx[r]]; return out; });
+    }
+    const columns = {};
+    keys.forEach((key, k) => {
+      const dict = this.cols.get(key).dict;
+      columns[key] = dict ? { codes: new Uint32Array(codes[k]), labels: dict } : codes[k];
+    });
+    for (const it of allItems) { // distinct counts per group: from (group, value) pairs
+      if (DISTINCT.has(it.fn)) it.perGroup = yield* this.#distinctCountsG(it.arg, merged, groups.data, K);
+    }
+    allItems.forEach((it) => {
+      const i = items.indexOf(it);
+      const v = i >= 0 ? totals[i + 1] : it.perGroup, out = new Float64Array(m);
+      if (it.fn === 'mean') for (let r = 0; r < m; r++) out[r] = v[keep[r]] / counts[keep[r]];
+      else for (let r = 0; r < m; r++) out[r] = v[keep[r]];
+      columns[it.out] = out;
+    });
+    return Table.fromColumns(engine, columns, { type: Float64Array });
+  }
+
+  // Per group number (0..K-1): [row counts, then one array per item].
+  *#groupTotalsG(groups, items, merged) {
     const { engine } = this;
     const { K } = groups;
     const sources = ['count(1)', ...items.map((it) => `${it.fn === 'mean' ? 'sum' : it.fn}(${it.arg ?? 1})`)];
@@ -518,43 +586,43 @@ export class Table {
       engine.free(acc);
     }
 
-    // Keep groups that have rows, sorted by key (codes for text keys, so
-    // dictionary order; NaN last), and build whole columns.
-    const counts = totals[0];
-    let m = 0;
-    for (let g = 0; g < K; g++) if (counts[g] > 0) m++;
-    let keep = new Float64Array(m);
-    for (let g = 0, r = 0; g < K; g++) if (counts[g] > 0) keep[r++] = g;
-    let codes = keys.map((_, k) => groups.keyColumn(k, keep));
-    if (!groups.sorted) {
-      let idx;
-      if (engine.jit && m >= PARALLEL_SORT_ROWS) { // many groups: sort them on every thread
-        const arrays = codes.map((a) => { const x = engine.alloc(Float64Array, m); engine.live(x).set(a); return x; });
-        try {
-          const perm = yield* sortPermG(engine, arrays, m, 'f64');
-          idx = engine.live(perm).slice();
-          engine.free(perm);
-        } finally {
-          for (const x of arrays) engine.free(x);
-        }
-      } else idx = sortIndex(codes, m);
-      const order = new Float64Array(m);
-      for (let r = 0; r < m; r++) order[r] = keep[idx[r]];
-      keep = order;
-      codes = codes.map((a) => { const out = new Float64Array(m); for (let r = 0; r < m; r++) out[r] = a[idx[r]]; return out; });
+    return totals;
+  }
+
+  // Distinct values of `arg` (bound source) in each group: groupData holds
+  // each row's group number (0..K-1), or null for one group. The table must
+  // have no filter. The (group, value) pairs are numbered with the hash
+  // table (every thread), and each pair adds one to its group. Missing values
+  // (NaN) don't count, as in SQL's COUNT(DISTINCT x).
+  *#distinctCountsG(arg, merged, groupData, K) {
+    const { engine, n } = this;
+    const counts = new Float64Array(K);
+    if (!n) return counts;
+    const plain = /^[A-Za-z_]\w*$/.test(arg.trim()) ? this.cols.get(arg.trim()) : null;
+    let own = null;
+    if (!plain) { own = engine.alloc(this.type, n); yield* engine.evalG(arg, this.#vars(merged), own); }
+    const cols = new Map();
+    if (groupData) cols.set('g', { data: groupData, dict: null, codes: null });
+    cols.set('v', { data: plain ? plain.data : own, dict: null, codes: null });
+    const tmp = new Table(engine, cols, n, { zones: false });
+    const keys = groupData ? ['g', 'v'] : ['v'];
+    let pairs = null;
+    try {
+      // small values: pair numbers as they are; others: the hash table
+      pairs = (yield* tmp.#directGroups(keys, 1)) ?? (engine.jit && n >= 4096 ? yield* tmp.#hashGroupsParallelG(keys) : tmp.#hashGroups(keys));
+      const [rowsPer] = yield* tmp.#groupTotalsG(pairs, [], merged); // which pair numbers have rows (every thread)
+      let m = 0;
+      for (let p = 0; p < pairs.K; p++) if (rowsPer[p] > 0) m++;
+      const keep = new Float64Array(m);
+      for (let p = 0, r = 0; p < pairs.K; p++) if (rowsPer[p] > 0) keep[r++] = p;
+      const gs = groupData ? pairs.keyColumn(0, keep) : null, vs = pairs.keyColumn(groupData ? 1 : 0, keep);
+      for (let r = 0; r < m; r++) if (vs[r] === vs[r]) counts[gs ? gs[r] : 0]++;
+      return counts;
+    } finally {
+      if (pairs?.owned) engine.free(pairs.data);
+      for (const x of pairs?.extra ?? []) engine.free(x);
+      if (own) engine.free(own);
     }
-    const columns = {};
-    keys.forEach((key, k) => {
-      const dict = this.cols.get(key).dict;
-      columns[key] = dict ? { codes: new Uint32Array(codes[k]), labels: dict } : codes[k];
-    });
-    items.forEach((it, i) => {
-      const v = totals[i + 1], out = new Float64Array(m);
-      if (it.fn === 'mean') for (let r = 0; r < m; r++) out[r] = v[keep[r]] / counts[keep[r]];
-      else for (let r = 0; r < m; r++) out[r] = v[keep[r]];
-      columns[it.out] = out;
-    });
-    return Table.fromColumns(engine, columns, { type: Float64Array });
   }
 
   // Many groups (more than per-thread accumulators allow): evaluate each

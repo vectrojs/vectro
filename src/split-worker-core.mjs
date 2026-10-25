@@ -7,6 +7,7 @@ import { parse } from './fuse.mjs';
 import { createStreams } from './stream-worker.mjs';
 import { parseKeys } from './sort.mjs';
 import { searchTable } from './vectors.mjs';
+import { SKETCH_SIZE, sketchAdd, hashNumber, hashText } from './sketch.mjs';
 
 export function serveSplitWorker(post, listen) {
   let engine;
@@ -158,6 +159,36 @@ export function serveSplitWorker(post, listen) {
     vectorTop({ id, preds, query, opts }) {
       return searchTable(view(id, preds), query, opts);
     },
+    // Distinct (group..., value) pairs of this worker's rows, or with sketch
+    // one distinct-count sketch per group (the page merges them).
+    distinct({ id, preds, keys, arg, params, sketch }) {
+      const v = view(id, preds);
+      const plain = /^[A-Za-z_]\w*$/.test(arg.trim()) && v.cols.has(arg.trim()) && !keys.includes(arg.trim()); // (a key: count a copy)
+      const t = plain ? v : v.derive('__np_dv', arg, params);
+      const name = plain ? arg.trim() : '__np_dv';
+      const g = t.groupBy([...keys, name]).agg({ __np_n: 'count()' });
+      try {
+        const colOf = (k) => { const c = g.cols.get(k), d = engine.live(c.data); return c.dict ? Array.from(d, (x) => c.dict[x]) : Float64Array.from(d); };
+        const keyCols = keys.map(colOf), values = colOf(name);
+        if (!sketch) return { keyCols, values };
+        const index = new Map(), groupCols = keys.map(() => []), regs = [];
+        for (let r = 0; r < values.length; r++) {
+          const tuple = keyCols.map((c) => c[r]);
+          const id = tuple.map((x) => (typeof x === 'string' ? JSON.stringify(x) : String(x))).join(',');
+          let at = index.get(id);
+          if (at === undefined) { at = index.size; index.set(id, at); tuple.forEach((x, k) => groupCols[k].push(x)); regs.push(new Uint8Array(SKETCH_SIZE)); }
+          const x = values[r];
+          if (typeof x === 'string') sketchAdd(regs[at], 0, hashText(x));
+          else if (x === x) sketchAdd(regs[at], 0, hashNumber(x));
+        }
+        const sketches = new Uint8Array(regs.length * SKETCH_SIZE);
+        regs.forEach((r, i) => sketches.set(r, i * SKETCH_SIZE));
+        return { keyCols: groupCols, sketches };
+      } finally {
+        g.dispose();
+        if (!plain) t.dispose();
+      }
+    },
     columns({ id, preds, segs }) {
       return { columns: view(id, preds).toColumns(), segs: segmentCounts(id, preds, segs) };
     },
@@ -190,6 +221,8 @@ function transferList(value) {
   if (value && typeof value === 'object') {
     if (ArrayBuffer.isView(value.keys)) out.push(value.keys.buffer);
     if (value.keyCols) for (const k of value.keyCols) if (ArrayBuffer.isView(k)) out.push(k.buffer);
+    if (ArrayBuffer.isView(value.sketches)) out.push(value.sketches.buffer);
+    if (ArrayBuffer.isView(value.values)) out.push(value.values.buffer);
     if (value.cols) for (const c of Object.values(value.cols)) out.push(c.buffer);
     if (ArrayBuffer.isView(value.segs)) out.push(value.segs.buffer);
     if (value.columns) for (const c of Object.values(value.columns)) if (ArrayBuffer.isView(c) || ArrayBuffer.isView(c.codes)) out.push((c.codes ?? c).buffer);

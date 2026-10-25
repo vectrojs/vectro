@@ -94,3 +94,4 @@ export { Table } from './table.mjs';
 export { VectorIndex } from './vectors.mjs';
 export { BatchEncoder, FrameReader, encodeSchema, encodeEnd } from './frames.mjs';
 export { readArrow, writeArrow, ArrowReader, ArrowEncoder } from './arrow.mjs';
+export { DistinctSketch } from './sketch.mjs';

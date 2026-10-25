@@ -22,11 +22,12 @@ import { parse, toSource } from './fuse.mjs';
 import { mergeHits } from './vectors.mjs';
 import { isCoded } from './table.mjs';
 import { readArrow, writeArrow } from './arrow.mjs';
+import { SKETCH_SIZE, sketchMerge, sketchEstimate } from './sketch.mjs';
 
 const NL = 10, QUOTE = 34;
 const BLOCK_ROWS = 4096; // rows per block when dealing out arrays
 const CSV_PIECE_BYTES = 64 * 1024, MAX_CSV_PIECES_PER_WORKER = 64;
-const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count']);
+const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count', 'countDistinct', 'approxDistinct']);
 
 // spawn() must return { post(msg, transfer), onMessage(fn), terminate() } and
 // may add onError(fn): fn(error) when the worker crashes or is killed.
@@ -268,13 +269,16 @@ function cutRows(bytes, start, end, parts) {
 
 // 'mean(price)' -> what to ask each worker for, and how to combine answers.
 // A mean becomes a sum and a count (hidden names __np_sum_<out>, __np_n_<out>).
+// Distinct counts don't merge as numbers: they are asked for separately
+// (outs entries with `arg`), as value sets or sketches (see #distinct).
 function plan(spec) {
   const ask = {};
   const outs = Object.entries(spec).map(([out, src]) => {
     const ast = parse(src);
     if (ast.t !== 'call' || !AGG_FNS.has(ast.fn) || ast.args.length > 1 || (ast.fn !== 'count' && ast.args.length !== 1)) {
-      throw new SyntaxError(`vectro: an aggregation must look like sum(expr), mean(expr), min(expr), max(expr) or count([expr]), got "${src}"`);
+      throw new SyntaxError(`vectro: an aggregation must look like sum(expr), mean(expr), min(expr), max(expr), count([expr]) or countDistinct(expr), got "${src}"`);
     }
+    if (ast.fn === 'countDistinct' || ast.fn === 'approxDistinct') return { out, fn: ast.fn, arg: toSource(ast.args[0]) };
     if (ast.fn === 'mean') {
       const arg = toSource(ast.args[0]);
       ask[`__np_sum_${out}`] = `sum(${arg})`;
@@ -286,6 +290,10 @@ function plan(spec) {
   });
   return { ask, outs };
 }
+
+// One string per key tuple: numbers as text (NaN, -0 = 0, Infinity apart),
+// text JSON-quoted, so no two tuples collide.
+const tupleId = (tuple) => tuple.map((v) => (typeof v === 'string' ? JSON.stringify(v) : String(v === 0 ? 0 : v))).join(',');
 
 const START = { sum: 0, count: 0, min: Infinity, max: -Infinity };
 const COMBINE = { sum: (a, b) => a + b, count: (a, b) => a + b, min: Math.min, max: Math.max };
@@ -360,8 +368,11 @@ export class SplitTable {
 
   async aggAsync(spec, params = {}) {
     const { ask, outs } = plan(spec);
-    const parts = await this.#all('agg', { spec: ask, params });
+    const parts = Object.keys(ask).length ? await this.#all('agg', { spec: ask, params }) : [];
+    const distinct = {};
+    for (const o of outs) if (o.arg) distinct[o.out] = (await this.#distinct([], o, params)).get('') ?? 0;
     return Object.fromEntries(outs.map(({ out, fn }) => {
+      if (out in distinct) return [out, distinct[out]];
       if (fn === 'mean') {
         const s = parts.reduce((a, p) => a + p[`__np_sum_${out}`], 0);
         const n = parts.reduce((a, p) => a + p[`__np_n_${out}`], 0);
@@ -384,10 +395,46 @@ export class SplitTable {
     return { aggAsync: (spec, params = {}) => this.#groupAgg(keys, spec, params) };
   }
 
+  // Distinct counts per group key id (see tupleId): countDistinct merges
+  // every worker's distinct values exactly; approxDistinct merges sketches.
+  async #distinct(keys, { fn, arg }, params) {
+    const sketch = fn === 'approxDistinct';
+    const parts = await this.#all('distinct', { keys, arg, params, sketch });
+    const out = new Map();
+    if (sketch) {
+      const merged = new Map();
+      for (const { keyCols, sketches } of parts) {
+        const rows = keys.length ? keyCols[0].length : sketches.length / SKETCH_SIZE;
+        for (let r = 0; r < rows; r++) {
+          const id = tupleId(keyCols.map((c) => c[r]));
+          let regs = merged.get(id);
+          if (!regs) merged.set(id, (regs = new Uint8Array(SKETCH_SIZE)));
+          sketchMerge(regs, 0, sketches, r * SKETCH_SIZE);
+        }
+      }
+      for (const [id, regs] of merged) out.set(id, sketchEstimate(regs));
+      return out;
+    }
+    const sets = new Map();
+    for (const { keyCols, values } of parts) {
+      for (let r = 0; r < values.length; r++) {
+        const x = values[r];
+        if (x !== x) continue; // NaN: not a value
+        const id = tupleId(keyCols.map((c) => c[r]));
+        let set = sets.get(id);
+        if (!set) sets.set(id, (set = new Set()));
+        set.add(typeof x === 'string' ? `s${x}` : x === 0 ? 0 : x);
+      }
+    }
+    for (const [id, set] of sets) out.set(id, set.size);
+    return out;
+  }
+
   // Each worker groups its slice; partial groups are merged here by key and
   // returned as a normal (small) table on the page.
   async #groupAgg(keys, spec, params) {
     const { ask, outs } = plan(spec);
+    if (!Object.keys(ask).length) ask.__np_rows = 'count()'; // (groups come from the main pass)
     const askKeys = Object.keys(ask);
     const parts = await this.#all('groupBy', { keys, spec: ask, params });
     const index = new Map();
@@ -399,7 +446,7 @@ export class SplitTable {
       const rows = keyCols[0].length;
       for (let r = 0; r < rows; r++) {
         const tuple = keyCols.map((c) => c[r]);
-        const id = one ? tuple[0] : tuple.map((v) => (typeof v === 'string' ? JSON.stringify(v) : String(v))).join(','); // exact: NaN, -0, Infinity kept apart
+        const id = one ? tuple[0] : tupleId(tuple); // exact: NaN, -0, Infinity kept apart
         let g = index.get(id);
         if (g === undefined) {
           g = groups.length;
@@ -428,7 +475,13 @@ export class SplitTable {
     const col = (k) => order.map((g) => acc[askKeys.indexOf(k)][g]);
     const columns = {};
     keys.forEach((key, k) => { columns[key] = order.map((g) => groups[g][k]); });
-    for (const { out, fn } of outs) {
+    for (const o of outs) {
+      if (!o.arg) continue;
+      const counts = await this.#distinct(keys, o, params);
+      columns[o.out] = order.map((g) => counts.get(tupleId(groups[g])) ?? 0);
+    }
+    for (const { out, fn, arg } of outs) {
+      if (arg) continue;
       if (fn === 'mean') {
         const s = col(`__np_sum_${out}`), n = col(`__np_n_${out}`);
         columns[out] = s.map((v, i) => v / n[i]);
@@ -600,10 +653,14 @@ export class StreamTable extends SplitTable {
   // The window ends at the newest time seen and covers whole slices.
   async windowAsync({ by = null, every, last, timeColumn = null, agg }) {
     const { ask, outs } = plan(agg);
+    const exact = outs.find((o) => o.fn === 'countDistinct');
+    if (exact) throw new Error(`vectro: windows keep totals, not rows: use approxDistinct(${exact.arg}) for "${exact.out}" (within ~1.6%)`);
+    const sketches = outs.filter((o) => o.arg).map(({ out, arg }) => ({ out, arg }));
+    if (!Object.keys(ask).length) ask.__np_rows = 'count()';
     const fns = Object.keys(ask).map((k) => outs.find((o) => o.out === k)?.fn ?? (k.startsWith('__np_n_') ? 'count' : 'sum'));
     const wid = ++this.engine.nextTable;
-    await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamWindow', { id: this.id, wid, by, every, last, timeColumn, ask, fns })));
-    return new LiveWindow(this, wid, { by, every, slices: Math.ceil(last / every), ask, fns, outs });
+    await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamWindow', { id: this.id, wid, by, every, last, timeColumn, ask, fns, sketches })));
+    return new LiveWindow(this, wid, { by, every, slices: Math.ceil(last / every), ask, fns, outs, sketches });
   }
 }
 
@@ -626,11 +683,30 @@ class LiveWindow {
         values.forEach((v, j) => { const f = fns[j]; acc.values[j] = f === 'min' ? Math.min(acc.values[j], v) : f === 'max' ? Math.max(acc.values[j], v) : acc.values[j] + v; });
       }
     }
-    const rows = [...merged.values()].map(({ slice, group, values }) => {
+    // distinct counts: sketches of the same slices, merged across workers
+    const { sketches } = this.spec, distinct = new Map();
+    if (sketches.length) {
+      const J = sketches.length;
+      const sk = await Promise.all(this.stream.counts.map((_, w) => engine._call(w, 'streamWindowSketches', { id, wid: this.wid, since: newest - slices + 1, series })));
+      const regsOf = new Map();
+      for (const { keys, sketches: bytes } of sk) {
+        keys.forEach(([slice, group], i) => {
+          const key = series ? `${slice}\u0000${group}` : group;
+          let regs = regsOf.get(key);
+          if (!regs) regsOf.set(key, (regs = new Uint8Array(J * SKETCH_SIZE)));
+          for (let j = 0; j < J; j++) sketchMerge(regs, j * SKETCH_SIZE, bytes, (i * J + j) * SKETCH_SIZE);
+        });
+      }
+      for (const [key, regs] of regsOf) distinct.set(key, sketches.map((_, j) => sketchEstimate(regs, j * SKETCH_SIZE)));
+    }
+    const rows = [...merged.entries()].map(([key, { slice, group, values }]) => {
       const row = series ? { t: slice * every } : {};
       if (by) row[by] = group;
       const val = (name) => values[askNames.indexOf(name)];
-      for (const { out, fn } of outs) row[out] = fn === 'mean' ? val(`__np_sum_${out}`) / val(`__np_n_${out}`) : val(out);
+      for (const { out, fn, arg } of outs) {
+        if (arg) row[out] = distinct.get(key)?.[sketches.findIndex((x) => x.out === out)] ?? 0;
+        else row[out] = fn === 'mean' ? val(`__np_sum_${out}`) / val(`__np_n_${out}`) : val(out);
+      }
       return row;
     });
     const label = (r) => (by ? r[by] : '');

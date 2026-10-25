@@ -47,6 +47,17 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
 
   With millions of groups, about half of Vectro's time is sorting the groups
   by key (DuckDB returns them unsorted) on one thread.
+- **Distinct counts:** `countDistinct(expr)` in `agg` and `groupBy().agg`
+  (`{ customers: 'countDistinct(customer_id)' }`), exact; missing values (NaN)
+  don't count, as in SQL. On split tables and streams the workers' distinct
+  values are merged exactly. `approxDistinct(expr)` gives the same answer on a
+  table, and on split tables, streams and **live windows** it uses HyperLogLog
+  sketches (4 KB, within ~1.6%): each worker keeps one per time slice and
+  group, and sketches merge, so "distinct customers in the last 5 minutes" is
+  a cheap read. `DistinctSketch` (exported) builds, merges and ships sketches
+  yourself. On 10M rows vs DuckDB (`compare/bench-distinct.mjs`): 365 days
+  4 ms vs 5; regions per day 9 ms vs 34; 1M accounts 81 ms vs 48; accounts per
+  region (5.7M pairs) 214 ms vs 100.
 - **Joins:** `orders.join(customers, { on: 'customer_id' })`, several keys
   (`on: ['region', 'day']`), different names (`on: { left: 'cust', right: 'id' }`),
   `how: 'inner'` (default) or `'left'`. Put the smaller table on the right: its
