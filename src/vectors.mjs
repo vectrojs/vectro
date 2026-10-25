@@ -59,53 +59,13 @@ export class VectorIndex {
 
   // The k closest vectors to `query` (among rows matching `filter`), best first.
   async searchAsync(query, { k = 10, filter = null, params = {} } = {}) {
-    const q = Float64Array.from(query);
+    const q = Array.from(query);
     if (q.length !== this.dim) throw new RangeError(`vectro: query has ${q.length} values, the index has dim ${this.dim}`);
-    if (this.metric === 'cosine') {
-      const len = Math.hypot(...q);
-      if (len > 0) for (let j = 0; j < q.length; j++) q[j] /= len;
-    }
-    let view = filter ? this.table.filter(filter, params) : this.table;
-    const made = [];
-    try {
-      // running dot product, DIMS_PER_PASS dimensions per pass
-      let prev = null;
-      for (let j0 = 0, pass = 0; j0 < this.dim; j0 += DIMS_PER_PASS, pass++) {
-        const terms = [], scalars = {};
-        for (let j = j0; j < Math.min(this.dim, j0 + DIMS_PER_PASS); j++) {
-          terms.push(`__np_q${j - j0} * v${j}`);
-          scalars[`__np_q${j - j0}`] = q[j];
-        }
-        const name = `__np_dot${pass}`;
-        view = await view.deriveAsync(name, prev ? `${prev} + ${terms.join(' + ')}` : terms.join(' + '), scalars);
-        made.push(view);
-        prev = name;
-      }
-      let key;
-      if (this.metric === 'l2') {
-        view = await view.deriveAsync('__np_score', `__np_norm2 - 2 * ${prev} + __np_qq`, { __np_qq: q.reduce((a, x) => a + x * x, 0) });
-        made.push(view);
-        key = '__np_score';
-      } else {
-        key = `-${prev}`;
-      }
-      // top over a narrow view: the hits' columns and the score, not the vectors
-      const keep = [...this.names, this.metric === 'l2' ? '__np_score' : prev];
-      const best = view.select ? await view.select(keep).topAsync(k, key) : await view.topAsync(k, key, { columns: keep });
-      try {
-        const rows = best.toRows();
-        return rows.map((r) => {
-          const hit = {};
-          for (const name of this.names) hit[name] = r[name];
-          hit.score = this.metric === 'l2' ? Math.max(0, r.__np_score) : r[prev];
-          return hit;
-        });
-      } finally {
-        best.dispose();
-      }
-    } finally {
-      for (const t of made.reverse()) await t.dispose();
-    }
+    const view = filter ? this.table.filter(filter, params) : this.table;
+    const opts = { k, metric: this.metric, dim: this.dim, names: this.names };
+    // split tables: every worker searches its own rows in one round trip
+    if (typeof view.vectorSearchAsync === 'function') return view.vectorSearchAsync(q, opts);
+    return searchTable(view, q, opts);
   }
 
   async dispose() { await this.table.dispose(); }
@@ -122,4 +82,57 @@ function flatten(vectors, dim) {
     flat.set(v, i * dim);
   });
   return flat;
+}
+
+// Search one table (or filtered view): running dot product, DIMS_PER_PASS
+// dimensions per pass, then top k over a narrow view (not the vectors).
+export async function searchTable(view, query, { k, metric, dim, names }) {
+  const q = Float64Array.from(query);
+  if (metric === 'cosine') {
+    const len = Math.hypot(...q);
+    if (len > 0) for (let j = 0; j < q.length; j++) q[j] /= len;
+  }
+  const made = [];
+  try {
+    let prev = null;
+    for (let j0 = 0, pass = 0; j0 < dim; j0 += DIMS_PER_PASS, pass++) {
+      const terms = [], scalars = {};
+      for (let j = j0; j < Math.min(dim, j0 + DIMS_PER_PASS); j++) {
+        terms.push(`__np_q${j - j0} * v${j}`);
+        scalars[`__np_q${j - j0}`] = q[j];
+      }
+      const name = `__np_dot${pass}`;
+      view = await view.deriveAsync(name, prev ? `${prev} + ${terms.join(' + ')}` : terms.join(' + '), scalars);
+      made.push(view);
+      prev = name;
+    }
+    let key, scoreCol = prev;
+    if (metric === 'l2') {
+      view = await view.deriveAsync('__np_score', `__np_norm2 - 2 * ${prev} + __np_qq`, { __np_qq: q.reduce((a, x) => a + x * x, 0) });
+      made.push(view);
+      key = scoreCol = '__np_score';
+    } else {
+      key = `-${prev}`;
+    }
+    const best = await view.select(...names, scoreCol).topAsync(k, key);
+    try {
+      return best.toRows().map((r) => {
+        const hit = {};
+        for (const name of names) hit[name] = r[name];
+        hit.score = metric === 'l2' ? Math.max(0, r[scoreCol]) : r[scoreCol];
+        return hit;
+      });
+    } finally {
+      best.dispose();
+    }
+  } finally {
+    for (const t of made.reverse()) await t.dispose();
+  }
+}
+
+// Merge per-worker hits (each best first) into the overall best k.
+export function mergeHits(lists, k, metric) {
+  const all = lists.flat();
+  const better = metric === 'l2' ? (a, b) => a.score - b.score : (a, b) => b.score - a.score;
+  return all.sort(better).slice(0, k);
 }

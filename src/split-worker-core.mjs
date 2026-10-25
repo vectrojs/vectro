@@ -6,6 +6,7 @@ import { Table } from './table.mjs';
 import { parse } from './fuse.mjs';
 import { createStreams } from './stream-worker.mjs';
 import { parseKeys } from './sort.mjs';
+import { searchTable } from './vectors.mjs';
 
 export function serveSplitWorker(post, listen) {
   let engine;
@@ -149,6 +150,10 @@ export function serveSplitWorker(post, listen) {
       } finally {
         t.dispose();
       }
+    },
+    // Vector search over this worker's rows (see vectors.mjs).
+    vectorTop({ id, preds, query, opts }) {
+      return searchTable(view(id, preds), query, opts);
     },
     toRows({ id, preds, limit, segs }) {
       return { rows: view(id, preds).toRows(limit), segs: segmentCounts(id, preds, segs, limit ?? Infinity) };

@@ -96,6 +96,13 @@ was short of memory, so treat these as provisional):
 | 100,000 (154 MB) | 11.4 ms | 36.9 ms |
 | 200,000 (307 MB) | 16.2 ms | 75.4 ms |
 
+With a `SplitEngine`, every worker searches its own rows in one round trip
+and the page keeps the best k. Open question: in Chrome (50,000 × 384) the
+page's own thread (10 ms) beat 8 Web Workers (58 ms), and in Node more threads
+helped little (200,000 × 384: 14.6 ms split, 18.8 ms threads, 21.7 ms one
+thread). Measured on a machine short of memory and CPU; to re-measure on a
+clean one (`examples/check/vectors.html` in a browser).
+
 `table.select(...columns)` (a narrow view, no copy) and
 `splitTable.topAsync(k, by, { columns })` keep top-k cheap on wide tables.
 

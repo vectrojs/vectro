@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Vectro vector check</title>
+<style>body { font: 15px/1.5 -apple-system, Helvetica, Arial, sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; }</style></head>
+<body>
+<h1>Vector search in this browser</h1>
+<pre id="out">Running…</pre>
+<script type="module">
+// Exact vector search with Web Workers (split tables) and on the page's
+// thread, compared with brute force. ?report=name posts the result.
+import { SplitEngine, Engine, VectorIndex } from '../../src/browser.mjs';
+const out = document.getElementById('out');
+const R = { userAgent: navigator.userAgent, runs: [] };
+let seed = 5;
+const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff) - 0.5;
+try {
+  const N = 50_000, DIM = 384;
+  const flat = Float32Array.from({ length: N * DIM }, rnd);
+  const q = Float32Array.from({ length: DIM }, rnd);
+  // brute force cosine, in float32 like the index
+  const scores = new Float64Array(N);
+  let qq = 0; for (let j = 0; j < DIM; j++) qq += q[j] * q[j];
+  for (let i = 0; i < N; i++) { let d = 0, vv = 0; for (let j = 0; j < DIM; j++) { const v = flat[i * DIM + j]; d += v * q[j]; vv += v * v; } scores[i] = d / Math.sqrt(vv * qq); }
+  const want = Array.from(scores.keys()).sort((a, b) => scores[b] - scores[a]).slice(0, 10);
+  for (const [name, make] of [['split tables (Web Workers)', () => new SplitEngine()], ['page thread', () => new Engine()]]) {
+    const e = make();
+    const idx = await VectorIndex.create(e, { vectors: flat, dim: DIM, columns: { id: Float64Array.from({ length: N }, (_, i) => i) } });
+    await idx.searchAsync(q, { k: 10 });
+    let best = Infinity, hits;
+    for (let r = 0; r < 5; r++) { const s = performance.now(); hits = await idx.searchAsync(q, { k: 10 }); best = Math.min(best, performance.now() - s); }
+    const okIds = hits.map((h) => h.id).every((id, j) => Math.abs(scores[id] - scores[want[j]]) < 1e-5);
+    R.runs.push({ name, workers: e.size ?? 1, ms: best, correct: okIds });
+    await idx.dispose(); await e.close();
+  }
+  out.textContent = JSON.stringify(R, null, 1);
+} catch (err) { R.error = String(err?.stack ?? err); out.textContent = R.error; }
+R.done = true;
+const report = new URLSearchParams(location.search).get('report');
+if (report) fetch(`/report?name=${encodeURIComponent(report)}`, { method: 'POST', body: JSON.stringify(R) });
+</script>
+</body>
+</html>

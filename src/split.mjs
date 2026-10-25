@@ -19,6 +19,7 @@ import { Engine as LocalEngine } from './engine.mjs';
 import { inspectCSV } from './csv.mjs';
 import { encode, countByte } from './bytes.mjs';
 import { parse, toSource } from './fuse.mjs';
+import { mergeHits } from './vectors.mjs';
 
 const NL = 10, QUOTE = 34;
 const BLOCK_ROWS = 4096; // rows per block when dealing out arrays
@@ -403,6 +404,13 @@ export class SplitTable {
     const rows = cand.sort(cmp).slice(0, k).map((c) => c.row);
     const names = rows.length ? Object.keys(rows[0]) : (columns ?? this.meta.names);
     return this.engine.local.table(Object.fromEntries(names.map((name) => [name, rows.map((r) => r[name])])));
+  }
+
+  // Vector search (see VectorIndex): each worker searches its own rows in one
+  // round trip; the page keeps the best k of all workers' hits.
+  async vectorSearchAsync(query, opts) {
+    const lists = await this.#all('vectorTop', { query, opts });
+    return mergeHits(lists, opts.k, opts.metric);
   }
 
   // Each worker sends its first `limit` rows (in its order) and the matches
