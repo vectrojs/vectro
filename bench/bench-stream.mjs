@@ -8,7 +8,9 @@
 //   plain    one connection; the usual toString/split/Number parsing, a loop per query
 //   push     Vectro, one connection: the main thread deals whole lines to the workers
 //   connect  Vectro, one connection per worker: data never touches the main thread
-// Usage: node bench/bench-stream.mjs   (WORKERS=n DURATION_MS=n KEEP_ROWS=n)
+// FORMAT=ndjson sends JSON lines instead ({"ts":…,"price":…,"qty":…,"region":"EU"});
+// plain Node then uses JSON.parse per line, the way most apps read them.
+// Usage: node bench/bench-stream.mjs   (WORKERS=n DURATION_MS=n KEEP_ROWS=n FORMAT=csv|ndjson MODES=plain,push,connect)
 import { fork } from 'node:child_process';
 import { createServer, connect } from 'node:net';
 import { availableParallelism } from 'node:os';
@@ -17,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 const WORKERS = Number(process.env.WORKERS ?? Math.max(1, availableParallelism() - 1));
 const DURATION_MS = Number(process.env.DURATION_MS ?? 4000);
 const KEEP_ROWS = Number(process.env.KEEP_ROWS ?? 10_000_000);
+const FORMAT = process.env.FORMAT ?? 'csv';
 const REG = ['EU', 'US', 'APAC', 'LATAM', 'MEA', 'UK', 'CA', 'ANZ'];
 const role = process.argv[2];
 
@@ -25,7 +28,10 @@ if (role === 'producer') {
   let seed = 5;
   const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
   const lines = [];
-  for (let i = 0; i < 1_000_000; i++) lines.push(`${1_700_000_000_000 + i},${(rnd() * 1000).toFixed(2)},${1 + Math.floor(rnd() * 9)},${REG[Math.floor(rnd() * 8)]}`);
+  for (let i = 0; i < 1_000_000; i++) {
+    const ts = 1_700_000_000_000 + i, price = (rnd() * 1000).toFixed(2), qty = 1 + Math.floor(rnd() * 9), region = REG[Math.floor(rnd() * 8)];
+    lines.push(FORMAT === 'ndjson' ? `{"ts":${ts},"price":${price},"qty":${qty},"region":"${region}"}` : `${ts},${price},${qty},${region}`);
+  }
   const buf = Buffer.from(lines.join('\n') + '\n');
   const server = createServer((socket) => {
     socket.on('error', () => {});
@@ -76,11 +82,13 @@ if (role === 'plain') {
     const lines = (partial + chunk.toString()).split('\n');
     partial = lines.pop();
     for (const line of lines) {
-      const f = line.split(',');
-      let c = codes.get(f[3]);
-      if (c === undefined) { c = codes.size; codes.set(f[3], c); }
+      let t, p, q, r;
+      if (FORMAT === 'ndjson') { const o = JSON.parse(line); t = o.ts; p = o.price; q = o.qty; r = o.region; }
+      else { const f = line.split(','); t = Number(f[0]); p = Number(f[1]); q = Number(f[2]); r = f[3]; }
+      let c = codes.get(r);
+      if (c === undefined) { c = codes.size; codes.set(r, c); }
       const i = n % KEEP_ROWS; // ring buffer of the newest rows
-      ts[i] = Number(f[0]); price[i] = Number(f[1]); qty[i] = Number(f[2]); region[i] = c;
+      ts[i] = t; price[i] = p; qty[i] = q; region[i] = c;
       n++; total++;
     }
   });
@@ -102,7 +110,7 @@ if (role === 'push' || role === 'connect') {
   const port = Number(process.argv[3]);
   const { SplitEngine } = await import('../src/node.mjs');
   const engine = new SplitEngine({ workers: WORKERS });
-  const stream = await engine.streamAsync({ columns: { ts: 'number', price: 'number', qty: 'number', region: 'category' }, keepRows: KEEP_ROWS });
+  const stream = await engine.streamAsync({ format: FORMAT, columns: { ts: 'number', price: 'number', qty: 'number', region: 'category' }, keepRows: KEEP_ROWS });
   let socket;
   if (role === 'connect') {
     await Promise.all(engine.workers.map((_, w) => stream.connect(w, { port })));
@@ -138,7 +146,7 @@ if (!role) {
   const producer = fork(self, ['producer']);
   const info = await new Promise((r) => producer.once('message', r));
   const avgRowBytes = info.bytesPerBuffer / info.rowsPerBuffer;
-  console.log(`Streaming orders over TCP (localhost), ${avgRowBytes.toFixed(1)} bytes per row; ${WORKERS} workers; keep the newest ${(KEEP_ROWS / 1e6).toFixed(0)}M rows; ${DURATION_MS / 1000} s per run`);
+  console.log(`Streaming orders as ${FORMAT === 'ndjson' ? 'JSON lines' : 'CSV lines'} over TCP (localhost), ${avgRowBytes.toFixed(1)} bytes per row; ${WORKERS} workers; keep the newest ${(KEEP_ROWS / 1e6).toFixed(0)}M rows; ${DURATION_MS / 1000} s per run`);
   console.log('Live query every 250 ms: orders + revenue per region, and a filtered aggregate, over every row kept.\n');
   const rows = [];
   for (const mode of (process.env.MODES ?? 'plain,push,connect').split(',')) {

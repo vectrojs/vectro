@@ -19,10 +19,12 @@ export function decodeString(bytes, v) {
 }
 
 // Dictionary keyed by raw bytes, so repeated values never become JS strings:
-// a string is made once per distinct value per chunk.
-class ByteDict {
-  constructor(bytes) {
+// a string is made once per distinct value per chunk. `unescape` turns the
+// raw bytes of an escaped value into its text (CSV: "" -> ").
+export class ByteDict {
+  constructor(bytes, unescape = (str) => str.replaceAll('""', '"')) {
     this.bytes = bytes;
+    this.unescape = unescape;
     this.cap = 64;
     this.slots = new Int32Array(this.cap).fill(-1);
     this.hashes = new Uint32Array(this.cap);
@@ -50,7 +52,7 @@ class ByteDict {
   #insert(slot, h, s, e, escaped) {
     const code = this.strings.length;
     const str = decode(this.bytes, s, e);
-    this.strings.push(escaped ? str.replaceAll('""', '"') : str);
+    this.strings.push(escaped ? this.unescape(str) : str);
     this.starts.push(s);
     this.lens.push(e - s);
     this.slots[slot] = code;

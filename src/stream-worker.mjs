@@ -1,10 +1,12 @@
-// Worker side of streams. Rows arrive as CSV lines without a header, either
+// Worker side of streams. Rows arrive as CSV lines without a header, or as
+// JSON lines (format: 'ndjson', one flat object per line), either
 // from the page (streamPush) or from this worker's own TCP connection
 // (streamConnect). They are parsed in batches of about 1 MB with the normal
 // CSV parser and appended to growing columns in engine memory. Queries get a
 // Table over the rows still kept (see keepRows / keepMs), so every split-table
 // query (agg, groupBy, collect, toRows) works on a live stream unchanged.
 import { Table } from './table.mjs';
+import { parseNDJSON } from './ndjson.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
@@ -22,7 +24,8 @@ const KINDS = { number: 'number', category: 'category' };
 export function createStreams(getEngine) {
   const streams = new Map(); // id -> stream state
 
-  function open({ id, columns, keepRows = Infinity, keepMs = null, timeColumn = null }) {
+  function open({ id, columns, format = 'csv', keepRows = Infinity, keepMs = null, timeColumn = null }) {
+    if (format !== 'csv' && format !== 'ndjson') throw new Error(`vectro: stream format must be 'csv' or 'ndjson', got "${format}"`);
     const engine = getEngine();
     const names = Object.keys(columns);
     for (const [name, kind] of Object.entries(columns)) {
@@ -35,7 +38,7 @@ export function createStreams(getEngine) {
       codes: columns[name] === 'category' ? new Map() : null,
     }]));
     streams.set(id, {
-      id, names, types: columns, header: new TextEncoder().encode(`${names.join(',')}\n`),
+      id, names, format, badLines: 0, types: columns, header: new TextEncoder().encode(`${names.join(',')}\n`),
       cols, cap: 1 << 16, n: 0, start: 0, keepRows, keepMs, timeColumn, maxTime: -Infinity,
       pending: [], pendingBytes: 0, partial: null, timer: null, scheduled: false, sockets: [], waiters: [], paused: false,
       rowsIn: 0, bytesIn: 0, batches: 0, error: null,
@@ -68,40 +71,52 @@ export function createStreams(getEngine) {
     s.cap = cap;
   }
 
-  // Parse complete lines and append them.
+  // Parse complete lines (CSV or JSON lines) and append them.
   function ingest(s, bytes) {
     if (!bytes.length) return;
+    if (s.format === 'ndjson') {
+      const r = parseNDJSON(bytes, 0, bytes.length, s.names, s.names.map((n) => s.types[n]));
+      s.badLines += r.bad;
+      append(s, r.rows, (k) => ({ data: r.cols[k], dict: r.dicts[k] }), bytes.length);
+      return;
+    }
     const engine = getEngine();
     const buf = new Uint8Array(s.header.length + bytes.length);
     buf.set(s.header, 0);
     buf.set(bytes, s.header.length);
     const t = engine.parseCSV(buf, { types: s.types, sampleRows: 1 }); // types are known
     try {
-      const m = t.length;
-      reserve(s, s.n + m);
-      for (const [name, c] of s.cols) {
-        const from = t.cols.get(name);
-        const src = engine.live(from.data), dst = engine.live(c.data);
-        if (!c.dict) { dst.set(src, s.n); continue; }
-        // the batch has its own dictionary; renumber into the stream's
-        const lut = from.dict.map((str) => {
-          let g = c.codes.get(str);
-          if (g === undefined) { g = c.dict.length; c.dict.push(str); c.codes.set(str, g); }
-          return g;
-        });
-        for (let i = 0; i < m; i++) dst[s.n + i] = lut[src[i]];
-      }
-      if (s.timeColumn) {
-        const ts = engine.live(s.cols.get(s.timeColumn).data);
-        for (let i = s.n; i < s.n + m; i++) if (ts[i] > s.maxTime) s.maxTime = ts[i];
-      }
-      s.n += m;
-      s.rowsIn += m;
-      s.bytesIn += bytes.length;
-      s.batches++;
+      append(s, t.length, (k) => { const f = t.cols.get(s.names[k]); return { data: engine.live(f.data), dict: f.dict }; }, bytes.length);
     } finally {
       t.dispose();
     }
+  }
+
+  // Append m parsed rows. part(k) gives column k's values (and, for
+  // categories, the batch's own dictionary); it is called after growing,
+  // because growing can move engine memory.
+  function append(s, m, part, nbytes) {
+    const engine = getEngine();
+    reserve(s, s.n + m);
+    s.names.forEach((name, k) => {
+      const c = s.cols.get(name), { data: src, dict } = part(k), dst = engine.live(c.data);
+      if (!c.dict) { dst.set(src, s.n); return; }
+      // the batch has its own dictionary; renumber into the stream's
+      const lut = dict.map((str) => {
+        let g = c.codes.get(str);
+        if (g === undefined) { g = c.dict.length; c.dict.push(str); c.codes.set(str, g); }
+        return g;
+      });
+      for (let i = 0; i < m; i++) dst[s.n + i] = lut[src[i]];
+    });
+    if (s.timeColumn) {
+      const ts = engine.live(s.cols.get(s.timeColumn).data);
+      for (let i = s.n; i < s.n + m; i++) if (ts[i] > s.maxTime) s.maxTime = ts[i];
+    }
+    s.n += m;
+    s.rowsIn += m;
+    s.bytesIn += nbytes;
+    s.batches++;
     // what is kept: the last keepRows rows, and rows newer than maxTime - keepMs
     if (s.n - s.start > s.keepRows) s.start = s.n - s.keepRows;
     if (s.keepMs != null) {
@@ -213,7 +228,7 @@ export function createStreams(getEngine) {
     },
   };
 
-  const stats = (s) => ({ rows: s.n - s.start, rowsIn: s.rowsIn, bytesIn: s.bytesIn, batches: s.batches, unparsedBytes: s.pendingBytes + (s.partial?.length ?? 0), error: s.error });
+  const stats = (s) => ({ rows: s.n - s.start, rowsIn: s.rowsIn, badLines: s.badLines, bytesIn: s.bytesIn, batches: s.batches, unparsedBytes: s.pendingBytes + (s.partial?.length ?? 0), error: s.error });
 
   return {
     handlers,

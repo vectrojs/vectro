@@ -185,18 +185,19 @@ export class SplitEngine {
     return new SplitTable(this, id, segs, { names: loaded[0].names, dicts, strings: new Set(loaded[0].strings) }, [], {}, true);
   }
 
-  // A live table fed by a stream of CSV lines (no header), spread over the
-  // workers. columns: { name: 'number' | 'category' } in the order of the
-  // fields in each line. keepRows: rows kept in total (the oldest are
+  // A live table fed by a stream of lines, spread over the workers. format:
+  // 'csv' (no header; columns in the order of the fields in each line) or
+  // 'ndjson' (one flat JSON object per line; columns pick the keys).
+  // columns: { name: 'number' | 'category' }. keepRows: rows kept in total (the oldest are
   // dropped); keepMs + timeColumn: keep rows newer than the newest time minus
   // keepMs. Feed it with push() from here, or connect() each worker to its own
   // TCP stream (Node), so the data never passes through this thread.
-  async streamAsync({ columns, keepRows = Infinity, keepMs = null, timeColumn = null } = {}) {
+  async streamAsync({ columns, format = 'csv', keepRows = Infinity, keepMs = null, timeColumn = null } = {}) {
     await this.ready;
     if (!columns || !Object.keys(columns).length) throw new Error('vectro: streamAsync needs columns, e.g. { ts: "number", region: "category" }');
     const id = ++this.nextTable;
     const perWorker = Number.isFinite(keepRows) ? Math.ceil(keepRows / this.size) : Infinity;
-    await Promise.all(this.workers.map((_, w) => this._call(w, 'streamOpen', { id, columns, keepRows: perWorker, keepMs, timeColumn })));
+    await Promise.all(this.workers.map((_, w) => this._call(w, 'streamOpen', { id, columns, format, keepRows: perWorker, keepMs, timeColumn })));
     return new StreamTable(this, id, Object.keys(columns));
   }
 
@@ -466,7 +467,7 @@ function join(a, b) {
 }
 
 function total(list) {
-  const out = { rows: 0, rowsIn: 0, bytesIn: 0, batches: 0, unparsedBytes: 0, perWorker: list.map((s) => s.rows), errors: list.map((s) => s.error).filter(Boolean) };
-  for (const s of list) for (const k of ['rows', 'rowsIn', 'bytesIn', 'batches', 'unparsedBytes']) out[k] += s[k];
+  const out = { rows: 0, rowsIn: 0, badLines: 0, bytesIn: 0, batches: 0, unparsedBytes: 0, perWorker: list.map((s) => s.rows), errors: list.map((s) => s.error).filter(Boolean) };
+  for (const s of list) for (const k of ['rows', 'rowsIn', 'badLines', 'bytesIn', 'batches', 'unparsedBytes']) out[k] += s[k];
   return out;
 }
