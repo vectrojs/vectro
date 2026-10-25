@@ -41,6 +41,29 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   comparisons, `&& || !`, `? :`, `abs sqrt floor ceil min max`. There is no
   `eval`, so formulas typed by users or AI models are safe to run.
 
+## For AI assistants (MCP server)
+
+`mcp/server.mjs` lets Claude, ChatGPT or any MCP client analyze your data
+files with Vectro: it loads CSV, TSV or JSON-lines files and answers questions
+on all cores, locally. It needs no dependencies.
+
+```bash
+# Claude Code
+claude mcp add vectro -- node /path/to/vectro/mcp/server.mjs --root ~/data
+```
+
+```json
+// Claude Desktop: claude_desktop_config.json
+{ "mcpServers": { "vectro": { "command": "node", "args": ["/path/to/vectro/mcp/server.mjs", "--root", "/Users/you/data"] } } }
+```
+
+Tools: `load_file`, `list_tables`, `describe_table` (column stats, common
+labels), `query` (filter, group_by, aggregates, sort, limit), `add_column`,
+`drop_table`. The assistant can only read files under `--root`, and its
+expressions are Vectro's small math language (no code runs). Mistakes come
+back as tool errors the assistant can read and fix. Answers include `ms`, the
+time Vectro took.
+
 ## Vector search
 
 Exact nearest-neighbour search over embeddings, on every core, in any
