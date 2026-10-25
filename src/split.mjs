@@ -23,6 +23,7 @@ import { mergeHits } from './vectors.mjs';
 import { isCoded } from './table.mjs';
 import { readArrow, writeArrow } from './arrow.mjs';
 import { SKETCH_SIZE, sketchMerge, sketchEstimate } from './sketch.mjs';
+import { toMillis } from './dates.mjs';
 
 const NL = 10, QUOTE = 34;
 const BLOCK_ROWS = 4096; // rows per block when dealing out arrays
@@ -92,8 +93,10 @@ export class SplitEngine {
   // type: Float32Array stores every column as float32 (half the memory).
   // Text is encoded here once (codes + one dictionary), so only numbers travel
   // to the workers, moved without copying.
-  async tableAsync(columns, { type = Float64Array } = {}) {
+  async tableAsync(columns, { type = Float64Array, dates = [] } = {}) {
     await this.ready;
+    const dateNames = Object.keys(columns).filter((name) => dates.includes(name) || (Array.isArray(columns[name]) && columns[name].find((v) => v != null) instanceof Date));
+    if (dateNames.length) columns = { ...columns, ...Object.fromEntries(dateNames.map((name) => [name, Float64Array.from(columns[name], toMillis)])) };
     const entries = Object.entries(columns);
     const len = (v) => (isCoded(v) ? v.codes.length : v.length);
     const n = entries[0] ? len(entries[0][1]) : 0;
@@ -145,12 +148,12 @@ export class SplitEngine {
         }
         transfer.push(part.buffer);
       }
-      return this._call(w, 'loadEncoded', { id, order: entries.map(([name]) => name), numbers, text: textPart, float32: type === Float32Array }, transfer);
+      return this._call(w, 'loadEncoded', { id, order: entries.map(([name]) => name), numbers, text: textPart, float32: type === Float32Array, dates: dateNames }, transfer);
     }));
     const dicts = Object.fromEntries(Object.entries(text).map(([name, t]) => [name, t.dict]));
     const names = entries.map(([name]) => name);
     const segs = blocks.map((list) => Float64Array.from(list, ([s, e]) => e - s));
-    return new SplitTable(this, id, segs, { names, dicts, strings: new Set() }, [], {}, true);
+    return new SplitTable(this, id, segs, { names, dicts, strings: new Set(), dates: dateNames }, [], {}, true);
   }
 
   // Every worker encoded its own text; agree on one dictionary per column
@@ -179,7 +182,10 @@ export class SplitEngine {
   // Parse CSV text or bytes: the page cuts it at row boundaries (quote-aware)
   // and every worker parses its piece in parallel.
   // Load Arrow IPC bytes (stream or file format) as a split table.
-  async fromArrowAsync(bytes, { columns, type } = {}) { return this.tableAsync(readArrow(bytes, { columns }).columns, { type }); }
+  async fromArrowAsync(bytes, { columns, type } = {}) {
+    const r = readArrow(bytes, { columns });
+    return this.tableAsync(r.columns, { type, dates: r.dates });
+  }
 
   async parseCSVAsync(text, opts = {}) {
     await this.ready;
@@ -207,7 +213,7 @@ export class SplitEngine {
     }));
     const dicts = await this.#shareDictionaries(id, loaded);
     const segs = loaded.map((r) => Float64Array.from(r.segs));
-    return new SplitTable(this, id, segs, { names: loaded[0].names, dicts, strings: new Set(loaded[0].strings) }, [], {}, true);
+    return new SplitTable(this, id, segs, { names: loaded[0].names, dicts, strings: new Set(loaded[0].strings), dates: loaded[0].dates }, [], {}, true);
   }
 
   // A live table fed by a stream, spread over the workers. format: 'csv'
@@ -224,7 +230,7 @@ export class SplitEngine {
     const id = ++this.nextTable;
     const perWorker = Number.isFinite(keepRows) ? Math.ceil(keepRows / this.size) : Infinity;
     await Promise.all(this.workers.map((_, w) => this._call(w, 'streamOpen', { id, columns, format, keepRows: perWorker, keepMs, timeColumn })));
-    const t = new StreamTable(this, id, Object.keys(columns));
+    const t = new StreamTable(this, id, Object.keys(columns), [], {}, true, Object.keys(columns).filter((n) => columns[n] === 'date'));
     t.format = format;
     return t;
   }
@@ -282,7 +288,7 @@ function plan(spec) {
     if (ast.fn === 'mean') {
       const arg = toSource(ast.args[0]);
       ask[`__np_sum_${out}`] = `sum(${arg})`;
-      ask[`__np_n_${out}`] = 'count()';
+      ask[`__np_n_${out}`] = `count((${arg}) == (${arg}))`; // the values present (missing ones don't count)
       return { out, fn: 'mean' };
     }
     ask[out] = src;
@@ -295,8 +301,9 @@ function plan(spec) {
 // text JSON-quoted, so no two tuples collide.
 const tupleId = (tuple) => tuple.map((v) => (typeof v === 'string' ? JSON.stringify(v) : String(v === 0 ? 0 : v))).join(',');
 
-const START = { sum: 0, count: 0, min: Infinity, max: -Infinity };
-const COMBINE = { sum: (a, b) => a + b, count: (a, b) => a + b, min: Math.min, max: Math.max };
+// min / max start from NaN (nothing yet), and a part's NaN (no values) is skipped
+const START = { sum: 0, count: 0, min: NaN, max: NaN };
+const COMBINE = { sum: (a, b) => a + b, count: (a, b) => a + b, min: (a, b) => (b < a || a !== a ? b : a), max: (a, b) => (b > a || a !== a ? b : a) };
 
 // Table order is round by round: block 0 of every worker (worker 0 first),
 // then block 1 of every worker, and so on. Calls fn(worker, block, rows).
@@ -487,7 +494,7 @@ export class SplitTable {
         columns[out] = s.map((v, i) => v / n[i]);
       } else columns[out] = col(out);
     }
-    return this.engine.local.table(columns);
+    return this.engine.local.table(columns, { dates: keys.filter((k) => this.meta.dates?.includes(k)) });
   }
 
   // The filtered rows as a new split table: each worker keeps its own
@@ -561,7 +568,7 @@ export class SplitTable {
   }
 
   // The rows (matching the filters) as Arrow IPC bytes (see Table.toArrow).
-  async toArrowAsync({ file = false } = {}) { return writeArrow(await this.toColumnsAsync(), { file }); }
+  async toArrowAsync({ file = false } = {}) { return writeArrow(await this.toColumnsAsync(), { file, dates: this.meta.dates ?? [] }); }
 
   async dispose() {
     if (!this.owned) return;
@@ -574,8 +581,8 @@ export class SplitTable {
 // flushAsync() first to include rows still waiting in a batch). Rows have no
 // global order across workers, so toRowsAsync returns worker 0's rows first.
 export class StreamTable extends SplitTable {
-  constructor(engine, id, names, preds = [], params = {}, owned = true) {
-    super(engine, id, engine.workers.map(() => Float64Array.of(Infinity)), { names, dicts: {}, strings: new Set() }, preds, params, owned);
+  constructor(engine, id, names, preds = [], params = {}, owned = true, dates = []) {
+    super(engine, id, engine.workers.map(() => Float64Array.of(Infinity)), { names, dicts: {}, strings: new Set(), dates }, preds, params, owned);
     this.partial = null;
     this.next = 0; // worker for the next pushed chunk
   }
@@ -584,7 +591,9 @@ export class StreamTable extends SplitTable {
 
   // A filtered view of the live stream (still live).
   filter(expr, params = {}) {
-    return new StreamTable(this.engine, this.id, this.meta.names, [...this.preds, { expr, params }], { ...this.params, ...params }, false);
+    const t = new StreamTable(this.engine, this.id, this.meta.names, [...this.preds, { expr, params }], { ...this.params, ...params }, false, this.meta.dates);
+    t.format = this.format;
+    return t;
   }
 
   async deriveAsync() {
@@ -680,7 +689,7 @@ class LiveWindow {
         const key = series ? `${slice}\u0000${group}` : group;
         const acc = merged.get(key);
         if (!acc) { merged.set(key, { slice, group, values: values.slice() }); continue; }
-        values.forEach((v, j) => { const f = fns[j]; acc.values[j] = f === 'min' ? Math.min(acc.values[j], v) : f === 'max' ? Math.max(acc.values[j], v) : acc.values[j] + v; });
+        values.forEach((v, j) => { acc.values[j] = COMBINE[fns[j]](acc.values[j], v); });
       }
     }
     // distinct counts: sketches of the same slices, merged across workers

@@ -54,7 +54,7 @@ const TOOLS = [
     name: 'query',
     description: [
       'Answer a question about a table. All parts are optional except table.',
-      'Expressions use column names, numbers, + - * /, comparisons (== != < <= > >=), && || !, cond ? a : b, and abs sqrt floor ceil min max. Text is compared with quotes: region == \'EU\'. Category text functions: startsWith(col, \'x\'), endsWith(col, \'x\'), contains(col, \'x\'), in(col, \'a\', \'b\'), like(col, \'EU-%\') (% any run, _ one character).',
+      'Expressions use column names, numbers, + - * /, comparisons (== != < <= > >=), && || !, cond ? a : b, and abs sqrt floor ceil min max. Text is compared with quotes: region == \'EU\'. Category text functions: startsWith(col, \'x\'), endsWith(col, \'x\'), contains(col, \'x\'), in(col, \'a\', \'b\'), like(col, \'EU-%\') (% any run, _ one character). Date columns compare with ISO text (ts >= \'2024-03-01\') and have year(ts), month(ts), day(ts), hour(ts), weekday(ts) (1 = Monday), dayStart(ts), weekStart(ts), monthStart(ts). Missing values: isMissing(x), coalesce(x, 0); sum, mean, min, max and count(x) skip them.',
       'filter: which rows, e.g. "region == \'EU\' && price > 100".',
       'aggregates: { name: "sum(expr)" | "mean(expr)" | "min(expr)" | "max(expr)" | "count()" | "count(condition)" | "countDistinct(expr)" }.',
       'group_by: a column (any text or number column) or a list of columns, to aggregate per group.',
@@ -129,8 +129,8 @@ function getTable(name) {
   return entry;
 }
 
-const kindOf = (c) => (c.strings ? 'text' : c.dict ? 'category' : 'number');
-const clean = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === 'number' && !Number.isFinite(v) ? null : v])));
+const kindOf = (c) => (c.strings ? 'text' : c.dict ? 'category' : c.date ? 'date' : 'number');
+const clean = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Date ? v.toISOString() : typeof v === 'number' && !Number.isFinite(v) ? null : v])));
 const columnsOf = (t) => Object.fromEntries([...t.cols].map(([n, c]) => [n, kindOf(c)]));
 
 // JSON lines with an array-of-numbers field: parse every line with JSON.parse
@@ -210,6 +210,11 @@ const handlers = {
         continue;
       }
       const a = table.filter(`${col} == ${col}`).agg({ n: 'count()', min: `min(${col})`, max: `max(${col})`, mean: `mean(${col})` });
+      if (c.date) { // ISO text; filter with ts >= '2024-01-01', year(ts), month(ts)...
+        const iso = (v) => (Number.isFinite(v) ? new Date(v).toISOString() : null);
+        out[col] = { kind: 'date', min: iso(a.min), max: iso(a.max), missing: table.length - a.n };
+        continue;
+      }
       out[col] = { kind: 'number', ...clean([a])[0], missing: table.length - a.n };
     }
     return { table: name, rows: table.length, columns: out };

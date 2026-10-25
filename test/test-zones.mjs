@@ -40,7 +40,7 @@ const ref = (keep) => {
   const sel = rows.filter(keep);
   const prices = sel.map((r) => r.price);
   return {
-    agg: { n: sel.length, rev: sel.reduce((a, r) => a + r.price * r.qty, 0), lo: Math.min(...sel.map((r) => r.qty), Infinity), hi: Math.max(...sel.map((r) => r.qty), -Infinity), avg: sel.length ? sel.reduce((a, r) => a + r.qty, 0) / sel.length : NaN },
+    agg: { n: sel.length, rev: sel.reduce((a, r) => a + (r.price * r.qty === r.price * r.qty ? r.price * r.qty : 0), 0), lo: sel.length ? Math.min(...sel.map((r) => r.qty)) : NaN, hi: sel.length ? Math.max(...sel.map((r) => r.qty)) : NaN, avg: sel.length ? sel.reduce((a, r) => a + r.qty, 0) / sel.length : NaN },
     groups: REG.map((g) => ({ region: g, n: sel.filter((r) => r.region === g).length })).filter((g) => g.n),
     first: sel.slice(0, 5).map((r) => r.ts),
     count: sel.length, prices,

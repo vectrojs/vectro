@@ -347,7 +347,7 @@ export class ArrowReader {
     if (fb.i16(h, 0) === 1) throw new Error('vectro: big-endian Arrow data is not supported');
     this.fields = fb.tables(h, 1).map((f) => readField(fb, f));
     const kinds = Object.fromEntries(this.fields.map((f) => [f.name, kindOf(f)]));
-    const info = this.fields.map((f) => ({ name: f.name, kind: kindOf(f), type: typeName(f) }));
+    const info = this.fields.map((f) => ({ name: f.name, kind: kindOf(f), type: typeName(f), date: !f.dict && (f.typeId === T.Date || f.typeId === T.Timestamp) }));
     const want = new Set(this.on.onSchema(kinds, info) ?? info.filter((f) => f.kind).map((f) => f.name));
     this.cols = this.fields.map((f) => (want.has(f.name) && kindOf(f) ? { labels: [], index: new Map(), lut: [], identity: true, version: -1 } : null));
     this.fields.forEach((f, k) => {
@@ -419,13 +419,14 @@ export class ArrowReader {
   }
 }
 
-// Read a whole Arrow stream or file. Returns { rows, columns } with columns
-// ready for engine.table(): { name: Float64Array | { codes, labels } }.
+// Read a whole Arrow stream or file. Returns { rows, columns, dates } with
+// columns ready for engine.table(): { name: Float64Array | { codes, labels } },
+// and the names of the date and timestamp columns (values in ms).
 // columns: the names to read (default: all; a type Vectro can't read is an
 // error unless left out).
 export function readArrow(bytes, { columns: pick } = {}) {
   if (!(bytes instanceof Uint8Array)) bytes = ArrayBuffer.isView(bytes) ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength) : new Uint8Array(bytes);
-  let names = null;
+  let names = null, dates = [];
   const parts = [];
   const reader = new ArrowReader({
     onSchema(kinds, info) {
@@ -436,6 +437,7 @@ export function readArrow(bytes, { columns: pick } = {}) {
         if (!f.kind) throw new Error(`vectro: column "${name}" has Arrow type ${f.type}, which Vectro can't read yet; leave it out with columns: [...]`);
       }
       names = info.map((x) => x.name);
+      dates = info.filter((x) => x.date && want.includes(x.name)).map((x) => x.name);
       return want;
     },
     onBatch(rows, cols) { parts.push([rows, cols]); }, // views stay valid: all bytes are pushed at once
@@ -458,7 +460,7 @@ export function readArrow(bytes, { columns: pick } = {}) {
       columns[name] = { codes, labels: pieces[pieces.length - 1].labels };
     }
   }
-  return { rows, columns };
+  return { rows, columns, dates };
 }
 
 function concatTyped(Type, list, n) {
@@ -595,13 +597,14 @@ class FlatWriter {
 
 // ---- writing --------------------------------------------------------------------------
 
-const KIND_TYPES = { number: [T.FloatingPoint, 2], float32: [T.FloatingPoint, 1], category: [T.Utf8] };
+const KIND_TYPES = { number: [T.FloatingPoint, 2], float32: [T.FloatingPoint, 1], category: [T.Utf8], date: [T.Timestamp] };
 
 function schemaTable(columns) {
   const fields = columns.map(([name, kind], k) => {
     const [typeId, precision] = KIND_TYPES[kind];
     const dict = kind === 'category' ? ['off', tbl(['i64', k], ['off', tbl(['i32', 32], ['bool', 1])], ['bool', 0])] : null;
-    return tbl(['off', name], ['bool', 1], ['u8', typeId], ['off', precision ? tbl(['i16', precision]) : tbl()], dict, ['off', { vec: [] }]);
+    const type = kind === 'date' ? tbl(['i16', 1], ['off', 'UTC']) : precision ? tbl(['i16', precision]) : tbl(); // date: Timestamp(ms, UTC)
+    return tbl(['off', name], ['bool', 1], ['u8', typeId], ['off', type], dict, ['off', { vec: [] }]);
   });
   return tbl(['i16', 0], ['off', { vec: fields }]);
 }
@@ -670,6 +673,20 @@ export class ArrowEncoder {
       const len = values.codes ? values.codes.length : values.length;
       if (rows === -1) rows = len;
       else if (len !== rows) throw new RangeError(`vectro: column "${name}" has ${len} values, expected ${rows}`);
+      if (kind === 'date') { // int64 ms, missing (NaN) as null
+        const words = new Int32Array(2 * len), valid = new Uint8Array((len + 7) >> 3);
+        let nulls = 0;
+        for (let i = 0; i < len; i++) {
+          const v = values[i];
+          if (v !== v || v == null) { nulls++; continue; }
+          const ms = Math.round(v), hi = Math.floor(ms / 4294967296);
+          words[2 * i] = ms - hi * 4294967296; words[2 * i + 1] = hi;
+          valid[i >> 3] |= 1 << (i & 7);
+        }
+        nodes.push([len, nulls]);
+        buffers.push(nulls ? valid : new Uint8Array(0), asBytes(words));
+        return;
+      }
       nodes.push([len, 0]);
       if (kind !== 'category') {
         const Type = kind === 'float32' ? Float32Array : Float64Array;
@@ -723,10 +740,11 @@ const isCoded = (v) => v != null && !ArrayBuffer.isView(v) && !Array.isArray(v) 
 // Write columns as Arrow IPC: the stream format, or with file: true the file
 // format (.arrow / .feather, what pandas.read_feather and pyarrow open).
 // columns: { name: Float64Array | Float32Array | number[] | string[] | { codes, labels } }.
-export function writeArrow(columns, { file = false } = {}) {
+// dates: names of columns holding dates (ms), written as Timestamp(ms, UTC).
+export function writeArrow(columns, { file = false, dates = [] } = {}) {
   const kinds = {};
   for (const [name, v] of Object.entries(columns)) {
-    kinds[name] = isCoded(v) || (Array.isArray(v) && typeof v[0] === 'string') ? 'category' : v instanceof Float32Array ? 'float32' : 'number';
+    kinds[name] = dates.includes(name) ? 'date' : isCoded(v) || (Array.isArray(v) && typeof v[0] === 'string') ? 'category' : v instanceof Float32Array ? 'float32' : 'number';
   }
   const e = new ArrowEncoder(kinds);
   const schema = e.schema(), parts = e.messages(columns);

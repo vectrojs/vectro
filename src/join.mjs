@@ -115,7 +115,7 @@ export function* joinTablesG(L, R, { on, how = 'inner', suffix = '_right' } = {}
       }
       let outName = name;
       while (out.has(outName)) outName += suffix;
-      out.set(outName, { data: yield* gather(src, ri), dict, codes, strings: c.strings, zones: undefined });
+      out.set(outName, { data: yield* gather(src, ri), dict, codes, strings: c.strings, date: c.date, zones: undefined });
     }
     for (const c of out.values()) c.data = engine.live(c.data);
     return makeTable(out, total);

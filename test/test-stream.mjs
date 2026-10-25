@@ -145,7 +145,7 @@ for (const workers of [1, 3, 8]) {
   {
     let msg = '';
     try { await split.streamAsync({ columns: { a: 'text' } }); } catch (err) { msg = err.message; }
-    expect(`w=${workers} bad kind refused`, msg.includes("'number' or 'category'"), true);
+    expect(`w=${workers} bad kind refused`, msg.includes("'number', 'category' or 'date'"), true);
     msg = '';
     try { await split.streamAsync({ columns: { a: 'number' }, keepMs: 10 }); } catch (err) { msg = err.message; }
     expect(`w=${workers} keepMs needs timeColumn`, msg.includes('timeColumn'), true);

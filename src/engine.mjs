@@ -698,7 +698,10 @@ export class Engine {
 
   // Load Arrow IPC bytes (stream or file format, e.g. a .arrow / .feather
   // file or what pyarrow, Polars or DuckDB send). columns: names to read.
-  fromArrow(bytes, { columns, type } = {}) { return Table.fromColumns(this, readArrow(bytes, { columns }).columns, { type }); }
+  fromArrow(bytes, { columns, type } = {}) {
+    const r = readArrow(bytes, { columns });
+    return Table.fromColumns(this, r.columns, { type, dates: r.dates });
+  }
 
   // Build a table from an array of objects (one-time conversion cost).
   tableFromRows(rows, opts) { return Table.fromRows(this, rows, opts); }

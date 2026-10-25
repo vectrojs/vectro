@@ -11,10 +11,11 @@
 
 import { Table } from './table.mjs';
 import { OP } from './kernels.mjs';
-import { parseNumber } from './csv-kernel.mjs';
+import { parseNumber, STR_SHIFT, STR_ESCAPED } from './csv-kernel.mjs';
+import { parseDateBytes, looksLikeDate } from './dates.mjs';
 import { decode, encode, indexOfByte } from './bytes.mjs';
 
-const KIND = { number: 0, category: 1, string: 2 };
+const KIND = { number: 0, category: 1, string: 2, date: 2 }; // dates are read as text, then parsed (see below)
 
 const NL = 10, CR = 13, QUOTE = 34;
 const CHUNK_BYTES = 2 << 20;
@@ -67,7 +68,7 @@ function* loadBytesG(engine, bytes, { delimiter = ',', header = true, types = {}
     names.forEach((nm, f) => {
       if (want && !want.has(nm)) { fieldMap[f] = -1; return; }
       fieldMap[f] = out.length;
-      out.push({ name: nm, kind: KIND[info.kinds[f]] });
+      out.push({ name: nm, kind: KIND[info.kinds[f]], date: info.kinds[f] === 'date' });
     });
 
     // Cut points at row boundaries.
@@ -146,12 +147,24 @@ function* loadBytesG(engine, bytes, { delimiter = ',', header = true, types = {}
       for (let r = rowStarts[m.unit], stop = r + rowsPer[m.unit]; r < stop; r++) col[r] = lut[col[r]];
     }
 
+    // Date columns: each value's text (still in the file's bytes) as ms.
+    out.forEach((c, o) => {
+      if (!c.date) return;
+      const col = cols[o];
+      for (let r = 0; r < total; r++) {
+        const v = col[r];
+        if (v !== v) continue;
+        const s = Math.floor(v / STR_SHIFT), len = (v - s * STR_SHIFT) % STR_ESCAPED;
+        col[r] = parseDateBytes(bytes, s, s + len);
+      }
+    });
+
     // Free-text columns point into the file's bytes, so the table keeps them.
-    const keepBytes = out.some((c) => c.kind === 2);
+    const keepBytes = out.some((c) => c.kind === 2 && !c.date);
     if (keepBytes) temp.shift(); // temp[0] is the bytes array
     const tableCols = new Map();
     out.forEach((c, o) => tableCols.set(c.name, {
-      data: cols[o], dict: dicts[o]?.dict ?? null, codes: dicts[o]?.codes ?? null, strings: c.kind === 2 ? bytes : null,
+      data: cols[o], dict: dicts[o]?.dict ?? null, codes: dicts[o]?.codes ?? null, strings: c.kind === 2 && !c.date ? bytes : null, date: c.date,
     }));
     return new Table(engine, tableCols, total, { owned: out.map((c) => c.name), ownedBuffers: keepBytes ? [bytes] : [] });
   } finally {
@@ -181,7 +194,7 @@ export function inspectCSV(bytes, { delimiter = ',', header = true, types = {}, 
   }
   const nFields = names.length;
 
-  const isNumber = names.map(() => true);
+  const isNumber = names.map(() => true), isDate = names.map(() => true);
   const distinct = names.map(() => new Set());
   const filled = names.map(() => 0);
   for (let i = start, r = 0; i < end && r < sampleRows; r++) {
@@ -192,16 +205,17 @@ export function inspectCSV(bytes, { delimiter = ',', header = true, types = {}, 
       filled[k]++;
       distinct[k].add(text);
       if (isNumber[k] && Number.isNaN(parseNumber(bytes, f.s, f.e)) && text.trim() !== 'NaN') isNumber[k] = false;
+      if (isDate[k] && !looksLikeDate(text)) isDate[k] = false;
     });
     i = row.next;
   }
   // Text where most sampled values differ (ids, notes, emails) is free text;
   // text that repeats (regions, statuses) is a category.
-  const guess = (k) => (isNumber[k] ? 'number' : filled[k] >= 50 && distinct[k].size > filled[k] / 2 ? 'string' : 'category');
+  const guess = (k) => (isNumber[k] ? 'number' : isDate[k] && filled[k] ? 'date' : filled[k] >= 50 && distinct[k].size > filled[k] / 2 ? 'string' : 'category');
   const kinds = names.map((nm, f) => {
     let kind = types[nm] ?? guess(f);
     if (kind === 'text') kind = guess(f) === 'string' ? 'string' : 'category';
-    if (!(kind in KIND)) throw new Error(`vectro: type for "${nm}" must be 'number', 'category', 'string' or 'text'`);
+    if (!(kind in KIND)) throw new Error(`vectro: type for "${nm}" must be 'number', 'category', 'string', 'text' or 'date'`);
     return kind;
   });
   return { delim, names, kinds, headerStart, start, end };

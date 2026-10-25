@@ -15,6 +15,7 @@ import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { joinTablesG } from './join.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
+import { DATE_FNS, DATE_RESULT, parseDateText, toMillis } from './dates.mjs';
 
 const IDENT = /^[A-Za-z_]\w*$/;
 const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count', 'countDistinct', 'approxDistinct']);
@@ -58,16 +59,22 @@ export class Table {
 
   // ---- building tables --------------------------------------------------------
 
-  static fromColumns(engine, columns, { type = Float64Array } = {}) {
+  // dates: names of columns holding dates as ms or ISO text (arrays of Date
+  // objects are dates anyway).
+  static fromColumns(engine, columns, { type = Float64Array, dates = [] } = {}) {
+    for (const [name, values] of Object.entries(columns)) {
+      if (dates.includes(name) || isDates(values)) columns = { ...columns, [name]: { dates: Float64Array.from(values, toMillis) } };
+    }
     const entries = Object.entries(columns);
     if (!entries.length) throw new TypeError('vectro: a table needs at least one column');
-    const len = (v) => (isCoded(v) ? v.codes.length : v.length);
+    const len = (v) => (isCoded(v) ? v.codes.length : v.dates ? v.dates.length : v.length);
     const n = len(entries[0][1]);
     const cols = new Map();
     for (const [name, values] of entries) {
       checkName(name);
       if (len(values) !== n) throw new RangeError(`vectro: column "${name}" has ${len(values)} rows, expected ${n}`);
-      cols.set(name, isCoded(values) ? codedText(engine, type, values) : isText(values) ? encodeText(engine, type, values) : { data: copyNumbers(engine, type, values), dict: null, codes: null });
+      cols.set(name, values.dates ? { data: copyNumbers(engine, type, values.dates), dict: null, codes: null, date: true }
+        : isCoded(values) ? codedText(engine, type, values) : isText(values) ? encodeText(engine, type, values) : { data: copyNumbers(engine, type, values), dict: null, codes: null });
     }
     return new Table(engine, cols, n, { owned: [...cols.keys()] });
   }
@@ -134,6 +141,7 @@ export class Table {
   }
 
   #mergeParams(params) {
+    params = Object.fromEntries(Object.entries(params).map(([k, v]) => [k, v instanceof Date ? v.getTime() : v])); // dates as ms
     for (const k of Object.keys(params)) {
       if (this.cols.has(k)) throw new Error(`vectro: param "${k}" has the same name as a column`);
       if (k in this.params && this.params[k] !== params[k]) throw new Error(`vectro: param "${k}" is already set to ${this.params[k]}`);
@@ -162,7 +170,9 @@ export class Table {
     const { src } = this.#bind(expr, merged);
     const out = this.engine.alloc(this.type, this.n);
     yield* this.engine.evalG(src, this.#vars(merged), out);
-    const cols = new Map(this.cols).set(name, { data: out, dict: null, codes: null });
+    const top = parse(expr);
+    const date = (top.t === 'call' && DATE_RESULT.has(top.fn)) || (top.t === 'var' && !!this.cols.get(top.name)?.date); // dayStart(ts), monthStart(ts)...: still dates
+    const cols = new Map(this.cols).set(name, { data: out, dict: null, codes: null, date });
     return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params, owned: [name] });
   }
 
@@ -190,13 +200,19 @@ export class Table {
     if (P && !this.engine.jit) {
       // interpreter: evaluate the filter once and aggregate only matching rows
       const truthy = (ast) => (isMask(ast) ? ast : { t: 'bin', op: '!=', l: ast, r: { t: 'num', v: 0 } });
-      const work = items.map((it) => ({
-        reduce: it.fn,
-        ast: it.arg === null ? null : it.fn === 'count' ? truthy(parse(it.arg)) : parse(it.arg),
-      }));
+      const work = items.flatMap((it) => (it.fn === 'mean' ? [{ reduce: 'sum', ast: parse(it.arg) }, { reduce: 'count', ast: truthy(parse(it.present)) }]
+        : it.fn === 'min' || it.fn === 'max' ? [{ reduce: it.fn, ast: parse(it.arg) }, { reduce: 'count', ast: truthy(parse(it.present)) }]
+        : [{ reduce: it.fn, ast: it.arg === null ? null : it.fn === 'count' ? truthy(parse(it.arg)) : parse(it.arg) }]));
       const t = this.type === Float32Array ? 'f32' : 'f64';
       const values = interpretFilteredReduce(this.engine, t, parse(P), work, this.#vars(merged), merged, this.n);
-      return done(Object.fromEntries(items.map((it, j) => [it.out, values[j]])));
+      let j = 0;
+      const out = {};
+      for (const it of items) {
+        if (it.fn === 'mean') out[it.out] = values[j++] / values[j++];
+        else if (it.fn === 'min' || it.fn === 'max') { const v = values[j++]; out[it.out] = values[j++] ? v : NaN; }
+        else out[it.out] = values[j++];
+      }
+      return done(out);
     }
     const reductions = [];
     const slot = (s) => reductions.push(s) - 1;
@@ -205,13 +221,18 @@ export class Table {
       if (it.fn === 'count' && !P && !e) it.value = this.n; // plain row count: nothing to compute
       else if (it.fn === 'count') it.slot = slot(P ? `count((${P}) && (${e ?? 1}))` : `count(${e ?? 1})`);
       else if (it.fn === 'sum') it.slot = slot(P ? `sum((${P}) ? (${e}) : 0)` : `sum(${e})`);
-      else if (it.fn === 'min') it.slot = slot(P ? `min((${P}) ? (${e}) : Infinity)` : `min(${e})`);
-      else if (it.fn === 'max') it.slot = slot(P ? `max((${P}) ? (${e}) : -Infinity)` : `max(${e})`);
-      else if (P) { it.slot = slot(`sum((${P}) ? (${e}) : 0)`); it.countSlot = slot(`count(${P})`); }
-      else it.slot = slot(`mean(${e})`);
+      else if (it.fn === 'min' || it.fn === 'max') { // NaN if no value is present
+        it.slot = slot(P ? `${it.fn}((${P}) ? (${e}) : ${it.fn === 'min' ? '' : '-'}Infinity)` : `${it.fn}(${e})`);
+        it.presentSlot = slot(P ? `count((${P}) && (${it.present}))` : `count(${it.present})`);
+      }
+      else { // mean: over the values present
+        it.slot = slot(P ? `sum((${P}) ? (${e}) : 0)` : `sum(${e})`);
+        it.countSlot = slot(P ? `count((${P}) && (${it.present}))` : `count(${it.present})`);
+      }
     }
-    const r = reductions.length ? yield* this.engine.evalG(reductions, this.#vars(merged)) : [];
-    const value = (it) => (it.value !== undefined ? it.value : it.countSlot === undefined ? r[it.slot] : r[it.slot] / r[it.countSlot]);
+    const r = []; // a kernel takes at most 8 reductions: run them in batches
+    for (let i = 0; i < reductions.length; i += 8) r.push(...[(yield* this.engine.evalG(reductions.slice(i, i + 8), this.#vars(merged)))].flat());
+    const value = (it) => (it.value !== undefined ? it.value : it.presentSlot !== undefined ? (r[it.presentSlot] ? r[it.slot] : NaN) : it.countSlot === undefined ? r[it.slot] : r[it.slot] / r[it.countSlot]);
     return done(Object.fromEntries(items.map((it) => [it.out, value(it)])));
   }
 
@@ -234,6 +255,7 @@ export class Table {
       throw new SyntaxError(`vectro: an aggregation must look like sum(expr), mean(expr), min(expr), max(expr), count([expr]) or countDistinct(expr), got "${src}"`);
     }
     if (!ast.args.length) return { fn: ast.fn, arg: null };
+    if (!DISTINCT.has(ast.fn)) return missingRules(ast.fn, this.#bind(toSource(ast.args[0]), params).src);
     if (DISTINCT.has(ast.fn) && ast.args[0].t === 'var' && this.cols.get(ast.args[0].name)?.strings) {
       throw new Error(`vectro: ${ast.fn} can't count a free-text column ("${ast.args[0].name}"); load it as a category`);
     }
@@ -448,7 +470,10 @@ export class Table {
     const { engine } = this;
     const { K } = groups;
     const items = allItems.filter((it) => !DISTINCT.has(it.fn));
-    const totals = yield* this.#groupTotalsG(groups, items, merged);
+    // means need the count of values present: one more kernel item each
+    const kernelItems = [...items, ...items.filter((it) => it.present).map((it) => ({ fn: 'count', arg: it.present, of: it }))]; // means, mins, maxes
+    const totals = yield* this.#groupTotalsG(groups, kernelItems, merged);
+    const presentOf = (it) => totals[1 + kernelItems.findIndex((k) => k.of === it)];
     // Keep groups that have rows, sorted by key (codes for text keys, so
     // dictionary order; NaN last), and build whole columns.
     const counts = totals[0];
@@ -485,15 +510,26 @@ export class Table {
     allItems.forEach((it) => {
       const i = items.indexOf(it);
       const v = i >= 0 ? totals[i + 1] : it.perGroup, out = new Float64Array(m);
-      if (it.fn === 'mean') for (let r = 0; r < m; r++) out[r] = v[keep[r]] / counts[keep[r]];
+      if (it.fn === 'mean') { const p = presentOf(it); for (let r = 0; r < m; r++) out[r] = v[keep[r]] / p[keep[r]]; }
+      else if (it.fn === 'min' || it.fn === 'max') { const p = presentOf(it); for (let r = 0; r < m; r++) out[r] = p[keep[r]] ? v[keep[r]] : NaN; }
       else for (let r = 0; r < m; r++) out[r] = v[keep[r]];
       columns[it.out] = out;
     });
-    return Table.fromColumns(engine, columns, { type: Float64Array });
+    return Table.fromColumns(engine, columns, { type: Float64Array, dates: keys.filter((k) => this.cols.get(k).date) });
   }
 
-  // Per group number (0..K-1): [row counts, then one array per item].
+  // Per group number (0..K-1): [row counts, then one array per item]. A
+  // kernel takes at most 8 reductions (the row count is one): more items run
+  // in several passes.
   *#groupTotalsG(groups, items, merged) {
+    if (items.length > 7) {
+      const totals = [];
+      for (let i = 0; i < items.length; i += 7) {
+        const part = yield* this.#groupTotalsG(groups, items.slice(i, i + 7), merged);
+        totals.push(...(i ? part.slice(1) : part));
+      }
+      return totals;
+    }
     const { engine } = this;
     const { K } = groups;
     const sources = ['count(1)', ...items.map((it) => `${it.fn === 'mean' ? 'sum' : it.fn}(${it.arg ?? 1})`)];
@@ -888,8 +924,9 @@ export class Table {
   // The rows (matching the filter) as Arrow IPC bytes: the stream format, or
   // with file: true the file format (.arrow / .feather for pandas, pyarrow,
   // Polars, DuckDB). Categories become dictionary-encoded strings.
-  toArrow({ file = false } = {}) { return writeArrow(this.toColumns(), { file }); }
-  async toArrowAsync({ file = false } = {}) { return writeArrow(await this.toColumnsAsync(), { file }); }
+  toArrow({ file = false } = {}) { return writeArrow(this.toColumns(), { file, dates: this.#dateNames() }); }
+  async toArrowAsync({ file = false } = {}) { return writeArrow(await this.toColumnsAsync(), { file, dates: this.#dateNames() }); }
+  #dateNames() { return [...this.cols].filter(([, c]) => c.date).map(([name]) => name); }
 
   toRows(limit = Infinity) { return this.engine._drive(this.#toRowsG(limit)); }
   toRowsAsync(limit = Infinity) { return this.engine._driveAsync(this.#toRowsG(limit)); }
@@ -901,7 +938,7 @@ export class Table {
     const cols = [...t.cols].map(([name, c]) => [name, c, engine.live(c.data), c.strings ? engine.live(c.strings) : null]);
     for (let i = 0; i < Math.min(t.n, limit); i++) {
       const row = {};
-      for (const [name, c, data, sbuf] of cols) row[name] = c.dict ? c.dict[data[i]] : sbuf ? decodeString(sbuf, data[i]) : data[i];
+      for (const [name, c, data, sbuf] of cols) row[name] = c.dict ? c.dict[data[i]] : sbuf ? decodeString(sbuf, data[i]) : c.date ? (data[i] === data[i] ? new Date(data[i]) : null) : data[i];
       rows.push(row);
     }
     if (t !== this) t.dispose();
@@ -947,6 +984,18 @@ function checkName(name) {
   if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _, not a function name)`);
 }
 
+// Missing values (NaN) in aggregations, as in SQL: sum and mean skip them
+// (mean divides by the values present), min and max skip them, count(x)
+// counts the values present (count(condition) still counts where it holds).
+// arg is the bound source; returns the aggregation item.
+function missingRules(fn, arg) {
+  const present = `(${arg}) == (${arg})`;
+  if (fn === 'count') return { fn, arg: isMask(parse(arg)) ? arg : present };
+  if (fn === 'min') return { fn, arg: `(${present} ? (${arg}) : Infinity)`, present }; // (present: NaN when nothing is)
+  if (fn === 'max') return { fn, arg: `(${present} ? (${arg}) : -Infinity)`, present };
+  return fn === 'mean' ? { fn, arg: `(${present} ? (${arg}) : 0)`, present } : { fn, arg: `(${present} ? (${arg}) : 0)` }; // sum, mean
+}
+
 // a category column given as codes into a labels array: { codes, labels }
 export const isCoded = (values) => values != null && !ArrayBuffer.isView(values) && !Array.isArray(values) && values.codes != null && Array.isArray(values.labels);
 
@@ -967,6 +1016,7 @@ function codedText(engine, type, { codes: src, labels }) {
   return { data, dict, codes };
 }
 
+const isDates = (values) => Array.isArray(values) && values.find((v) => v != null) instanceof Date;
 const isText = (values) => !ArrayBuffer.isView(values) && values.length > 0 && typeof values[0] === 'string';
 
 function copyNumbers(engine, type, values) {
@@ -1035,8 +1085,28 @@ function textCall(n, cols, src) {
 // `region == 'EU'` -> `region == 3` (the code for 'EU', or -1 if absent).
 function rewriteText(ast, cols, src) {
   const textCol = (n) => n.t === 'var' && cols.get(n.name)?.dict;
+  const dateCol = (n) => n.t === 'var' && cols.get(n.name)?.date;
+  const one = (n) => { if (n.args.length !== 1) throw new SyntaxError(`vectro: ${n.fn}() takes one value, in "${src}"`); return fix(n.args[0]); };
   const fix = (n) => {
     if (n.t === 'call' && TEXT_FNS[n.fn]) return textCall(n, cols, src);
+    if (n.t === 'call' && n.fn === 'date') { // date('2024-03-01'): the time in ms
+      const v = n.args.length === 1 && n.args[0].t === 'str' ? parseDateText(n.args[0].v) : NaN;
+      if (Number.isNaN(v)) throw new SyntaxError(`vectro: date() needs ISO text such as date('2024-03-01') or date('2024-03-01T12:00:00Z'), in "${src}"`);
+      return { t: 'num', v };
+    }
+    if (n.t === 'call' && DATE_FNS[n.fn]) return DATE_FNS[n.fn](one(n));
+    if (n.t === 'call' && n.fn === 'isMissing') { const x = one(n); return { t: 'bin', op: '!=', l: x, r: x }; }
+    if (n.t === 'call' && n.fn === 'coalesce') { // first value that isn't missing
+      if (n.args.length < 2) throw new SyntaxError(`vectro: coalesce() needs two values or more, in "${src}"`);
+      return n.args.map(fix).reduceRight((rest, x) => ({ t: 'cond', c: { t: 'bin', op: '==', l: x, r: x }, x, y: rest }));
+    }
+    if (n.t === 'bin' && (n.l.t === 'str' || n.r.t === 'str') && (dateCol(n.l) || dateCol(n.r))) { // ts >= '2024-03-01'
+      const [colNode, strNode] = n.l.t === 'str' ? [n.r, n.l] : [n.l, n.r];
+      const v = parseDateText(strNode.v);
+      if (Number.isNaN(v)) throw new SyntaxError(`vectro: ${JSON.stringify(strNode.v)} isn't a date (use ISO text such as '2024-03-01' or '2024-03-01T12:00:00Z'), in "${src}"`);
+      const lit = { t: 'num', v };
+      return n.l.t === 'str' ? { ...n, l: lit, r: colNode } : { ...n, l: colNode, r: lit };
+    }
     if (n.t === 'bin') {
       if ((n.op === '==' || n.op === '!=') && (n.l.t === 'str' || n.r.t === 'str')) {
         const [colNode, strNode] = n.l.t === 'str' ? [n.r, n.l] : [n.l, n.r];

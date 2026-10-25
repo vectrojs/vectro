@@ -67,7 +67,7 @@ export function serveSplitWorker(post, listen) {
     },
     // Columns already encoded by the page: numbers, plus text as codes into a
     // shared dictionary (so nothing needs renumbering afterwards).
-    loadEncoded({ id, order, numbers, text, float32 = false }) {
+    loadEncoded({ id, order, numbers, text, float32 = false, dates = [] }) {
       const T = float32 ? Float32Array : Float64Array; // one number type per table
       const base = Object.keys(numbers).length ? engine.table(numbers, { type: T }) : null;
       const cols = new Map();
@@ -82,6 +82,7 @@ export function serveSplitWorker(post, listen) {
         }
       }
       for (const c of cols.values()) c.data = engine.live(c.data); // later allocations may have moved memory
+      for (const name of dates) cols.get(name).date = true;
       const n = cols.values().next().value?.data.length ?? 0;
       const t = new Table(engine, cols, n, { owned: [...order] });
       tables.set(id, t);
@@ -93,7 +94,7 @@ export function serveSplitWorker(post, listen) {
       let segs = null;
       const t = engine.parseCSV(bytes, { ...opts, pieces, onPieceRows: (rows) => { segs = rows; } });
       tables.set(id, t);
-      return { n: t.length, segs, dicts: dictsOf(t), names: t.columnNames, strings: [...t.cols].filter(([, c]) => c.strings).map(([n]) => n) };
+      return { n: t.length, segs, dicts: dictsOf(t), names: t.columnNames, strings: [...t.cols].filter(([, c]) => c.strings).map(([n]) => n), dates: [...t.cols].filter(([, c]) => c.date).map(([n]) => n) };
     },
     // Switch text columns to the shared dictionary: code -> lut[code].
     remap({ id, maps }) {

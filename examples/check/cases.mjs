@@ -88,19 +88,24 @@ function evalRef(n, cols, k, i) {
   }
   throw new Error('bad node');
 }
+// SQL rules for missing values (NaN): sum, mean, min and max skip them, count(x)
+// counts values present, count(condition) the rows where it holds, and min /
+// max of nothing is NaN.
+const isCondition = (n) => (n.t === 'bin' && ['<', '>', '<=', '>=', '==', '!=', '&&', '||'].includes(n.op)) || (n.t === 'un' && n.op === '!');
 function refReduce(fn, ast, cols, k, n) {
   let s = 0, abs = 0, c = 0, m = fn === 'min' ? Infinity : -Infinity;
   for (let i = 0; i < n; i++) {
     const v = evalRef(ast, cols, k, i);
-    if (fn === 'count') { if (truthy(v)) c++; continue; }
+    if (fn === 'count') { if (isCondition(ast) ? truthy(v) : num(v) === num(v)) c++; continue; }
     const x = num(v);
-    s += x; abs += Math.abs(x);
+    if (x !== x) continue;
+    s += x; abs += Math.abs(x); c++;
     if (fn === 'min') m = Math.min(m, x);
     if (fn === 'max') m = Math.max(m, x);
   }
   if (fn === 'count') return { want: c, scale: 0 };
-  if (fn === 'min' || fn === 'max') return { want: m, scale: 0 };
-  return { want: fn === 'mean' ? s / n : s, scale: fn === 'mean' ? abs / n : abs };
+  if (fn === 'min' || fn === 'max') return { want: c ? m : NaN, scale: 0 };
+  return { want: fn === 'mean' ? s / c : s, scale: fn === 'mean' ? abs / c : abs };
 }
 const same = (got, want, scale) =>
   got === want || (Number.isNaN(got) && Number.isNaN(want)) || (Number.isFinite(scale) && Math.abs(got - want) <= 1e-9 * scale + 1e-300);

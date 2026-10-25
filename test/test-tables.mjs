@@ -44,8 +44,8 @@ for (const type of [Float64Array, Float32Array]) {
     expect(`${tag} filter count`, a.n, m.length);
     expect(`${tag} filter revenue`, a.revenue, m.reduce((s, r) => s + rev(r), 0), m.reduce((s, r) => s + Math.abs(rev(r)), 0));
     expect(`${tag} filter mean`, a.avg, m.length ? m.reduce((s, r) => s + r.price, 0) / m.length : NaN, 1e6);
-    expect(`${tag} filter min`, a.lo, m.reduce((x, r) => Math.min(x, r.price), Infinity));
-    expect(`${tag} filter max`, a.hi, m.reduce((x, r) => Math.max(x, r.qty), -Infinity));
+    expect(`${tag} filter min`, a.lo, m.length ? m.reduce((x, r) => Math.min(x, r.price), Infinity) : NaN); // min of nothing: NaN (SQL NULL)
+    expect(`${tag} filter max`, a.hi, m.length ? m.reduce((x, r) => Math.max(x, r.qty), -Infinity) : NaN);
     expect(`${tag} filter count(qty>5)`, a.big, m.filter((r) => r.qty > 5).length);
     expect(`${tag} unknown text matches nothing`, t.filter("region == 'MARS'").count(), 0);
     expect(`${tag} != text`, t.filter("region != 'EU'").count(), rows.filter((r) => r.region !== 'EU').length);

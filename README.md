@@ -47,6 +47,23 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
 
   With millions of groups, about half of Vectro's time is sorting the groups
   by key (DuckDB returns them unsorted) on one thread.
+- **Missing values** are NaN and follow SQL's rules: `sum`, `mean`, `min`
+  and `max` skip them (`mean` divides by the values present; `min`/`max` of
+  nothing is NaN), `count(x)` counts the values present and `count(x > 5)`
+  the rows where the condition holds. `isMissing(x)` and
+  `coalesce(x, y, 0)` (first value present) work in any expression. CSV
+  blanks, JSON `null` and Arrow nulls load as missing.
+- **Dates and times:** a date column holds milliseconds since 1970 (UTC).
+  Arrays of `Date` objects become date columns (or `table(cols, { dates:
+  ['ts'] })` for ms or ISO text); CSV columns of ISO dates are found by
+  themselves (or `types: { ts: 'date' }`); Arrow dates and timestamps load as
+  dates; streams take `columns: { ts: 'date' }` (ISO text or ms). Compare with
+  ISO text, `filter("ts >= '2024-03-01'")`, `date('2024-03-01T12:00:00Z')`, or
+  a `Date` param. `year(ts)`, `month(ts)`, `day(ts)`, `hour(ts)`, `minute(ts)`,
+  `second(ts)`, `weekday(ts)` (1 = Monday) and `dayStart(ts)`, `hourStart(ts)`,
+  `weekStart(ts)`, `monthStart(ts)` compile to plain arithmetic in the fused
+  kernels: `sum(year(ts))` over 10M rows takes 26 ms (a JS loop with `Date`:
+  800 ms). Rows come back with `Date` objects; Arrow writes `Timestamp(ms, UTC)`.
 - **Distinct counts:** `countDistinct(expr)` in `agg` and `groupBy().agg`
   (`{ customers: 'countDistinct(customer_id)' }`), exact; missing values (NaN)
   don't count, as in SQL. On split tables and streams the workers' distinct
@@ -383,7 +400,7 @@ answers.
 
 ## Not done yet
 
-Integer/date types, missing values and persistence. Joins are for normal
+64-bit integers beyond 2^53, time zones other than UTC, and persistence. Joins are for normal
 tables (not split tables or streams yet), inner and left only. Split tables
 have `topAsync` but no full sort.
 Binary streams have number and category columns only; Arrow ZSTD compression isn't supported.

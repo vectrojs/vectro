@@ -7,13 +7,15 @@
 // A line that isn't a JSON object is skipped and counted in `bad`.
 import { ByteDict, parseNumber } from './csv-kernel.mjs';
 import { encode } from './bytes.mjs';
+import { parseDateBytes } from './dates.mjs';
 
 const NL = 10, CR = 13, SPACE = 32, TAB = 9, QUOTE = 34, BACKSLASH = 92, COMMA = 44, COLON = 58;
 const LBRACE = 123, RBRACE = 125, LBRACKET = 91, RBRACKET = 93;
 const isSpace = (c) => c === SPACE || c === TAB || c === CR || c === NL;
 const unescapeJSON = (raw) => JSON.parse(`"${raw}"`);
 
-// names: column names; kinds: 'number' | 'category' for each.
+// names: column names; kinds: 'number' | 'category' | 'date' for each
+// (dates: ISO text or ms numbers, as ms).
 // Returns { rows, cols: Float64Array[], dicts: (string[] | null)[], bad }.
 export function parseNDJSON(bytes, start, end, names, kinds) {
   const k = names.length;
@@ -23,6 +25,7 @@ export function parseNDJSON(bytes, start, end, names, kinds) {
   const cols = names.map(() => new Float64Array(cap));
   const dicts = kinds.map((kind) => (kind === 'category' ? new ByteDict(bytes, unescapeJSON) : null));
   const empty = dicts.map((d) => (d ? -1 : NaN)); // code of "" per category column, made on first use
+  const isDate = kinds.map((kind) => kind === 'date');
   const seen = new Uint8Array(k);
   let guess = new Int32Array(64).fill(-1); // column of the j-th key on the previous line
   let rows = 0, bad = 0;
@@ -79,6 +82,7 @@ export function parseNDJSON(bytes, start, end, names, kinds) {
         if (p >= eol) { ok = false; break; }
         if (c >= 0) {
           if (dicts[c]) cols[c][row] = dicts[c].code(vs, p, esc);
+          else if (isDate[c]) cols[c][row] = parseDateBytes(bytes, vs, p);
           else cols[c][row] = esc ? Number(unescapeJSON(decodeLatin(bytes, vs, p))) || NaN : parseNumber(bytes, vs, p);
           seen[c] = 1;
         }

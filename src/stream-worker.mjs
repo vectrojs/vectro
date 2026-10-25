@@ -10,6 +10,7 @@ import { parseNDJSON } from './ndjson.mjs';
 import { ZONE_ROWS } from './zones.mjs';
 import { FrameReader } from './frames.mjs';
 import { ArrowReader } from './arrow.mjs';
+import { parse, isMask } from './fuse.mjs';
 import { SKETCH_SIZE, sketchAdd, sketchMerge, hashNumber, hashText } from './sketch.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
@@ -24,7 +25,7 @@ const nextTurn = globalThis.setImmediate ?? ((fn) => setTimeout(fn, 0));
 const HIGH = 4 << 20, LOW = 1 << 20;
 const NL = 10;
 const textEncoder = new TextEncoder();
-const KINDS = { number: 'number', category: 'category' };
+const KINDS = { number: 'number', category: 'category', date: 'date' }; // date: ms (ISO text in CSV / JSON lines)
 
 export function createStreams(getEngine) {
   const streams = new Map(); // id -> stream state
@@ -34,13 +35,14 @@ export function createStreams(getEngine) {
     const engine = getEngine();
     const names = Object.keys(columns);
     for (const [name, kind] of Object.entries(columns)) {
-      if (!KINDS[kind]) throw new Error(`vectro: stream column "${name}" must be 'number' or 'category', got "${kind}"`);
+      if (!KINDS[kind]) throw new Error(`vectro: stream column "${name}" must be 'number', 'category' or 'date', got "${kind}"`);
     }
     if (keepMs != null && !names.includes(timeColumn)) throw new Error('vectro: keepMs needs timeColumn, the name of a number column holding milliseconds');
     const cols = new Map(names.map((name) => [name, {
       data: engine.alloc(Float64Array, 1 << 16),
       dict: columns[name] === 'category' ? [] : null,
       codes: columns[name] === 'category' ? new Map() : null,
+      date: columns[name] === 'date',
     }]));
     streams.set(id, {
       id, names, format, badLines: 0, windows: new Map(),
@@ -248,7 +250,7 @@ export function createStreams(getEngine) {
     const engine = getEngine();
     const view = (extra) => {
       const cols = new Map();
-      for (const [name, c] of s.cols) cols.set(name, { data: engine.live(c.data).subarray(from, from + m), dict: c.dict, codes: c.codes, strings: null });
+      for (const [name, c] of s.cols) cols.set(name, { data: engine.live(c.data).subarray(from, from + m), dict: c.dict, codes: c.codes, strings: null, date: c.date });
       return new Table(engine, cols, m, { owned: [], zones: false });
     };
     const t = view();
@@ -262,9 +264,9 @@ export function createStreams(getEngine) {
       if (!b) w.buckets.set(slice, (b = new Map()));
       const acc = b.get(group);
       if (!acc) { b.set(group, values.slice()); return; }
-      for (let j = 0; j < values.length; j++) {
-        const f = w.fns[j];
-        acc[j] = f === 'min' ? Math.min(acc[j], values[j]) : f === 'max' ? Math.max(acc[j], values[j]) : acc[j] + values[j];
+      for (let j = 0; j < values.length; j++) { // (min / max of a part with no values is NaN: skip it)
+        const f = w.fns[j], v = values[j];
+        acc[j] = f === 'min' ? (v < acc[j] || acc[j] !== acc[j] ? v : acc[j]) : f === 'max' ? (v > acc[j] || acc[j] !== acc[j] ? v : acc[j]) : acc[j] + v;
       }
     };
     const askNames = Object.keys(w.ask);
@@ -297,6 +299,7 @@ export function createStreams(getEngine) {
         const src = w.ask[a], arg = src.slice(src.indexOf('(') + 1, -1).trim();
         return w.fns[askNames.indexOf(a)] === 'count' && !arg ? null : arg;
       });
+      const isCondition = argCols.map((arg) => arg && isMask(parse(arg)));
       const derived = argCols.map((arg, j) => (arg ? t.derive(`__np_a${j}`, arg) : null));
       try {
         const ts = engine.live(s.cols.get(w.time).data).subarray(from, from + m);
@@ -305,9 +308,10 @@ export function createStreams(getEngine) {
         const values = new Array(askNames.length);
         for (let i = 0; i < m; i++) {
           if (Number.isNaN(ts[i])) continue;
-          for (let j = 0; j < values.length; j++) {
-            const v = vals[j] ? vals[j][i] : 1;
-            values[j] = w.fns[j] === 'count' ? (v != 0 ? 1 : 0) : v; // same rules as the compiled count(x): x != 0
+          for (let j = 0; j < values.length; j++) { // the table rules: missing values are skipped
+            const v = vals[j] ? vals[j][i] : 1, f = w.fns[j];
+            values[j] = f === 'count' ? (isCondition[j] ? (v !== 0 ? 1 : 0) : v === v ? 1 : 0)
+              : v === v ? v : f === 'min' || f === 'max' ? NaN : 0;
           }
           add(Math.floor(ts[i] / w.every), label(codes ? codes[i] : 0), values);
         }
@@ -440,7 +444,7 @@ export function createStreams(getEngine) {
       for (const [name, c] of s.cols) {
         const data = engine.alloc(Float64Array, n);
         data.set(engine.live(c.data).subarray(s.start, s.n));
-        cols.set(name, { data, dict: c.dict && [...c.dict], codes: c.dict && new Map(c.codes), strings: null });
+        cols.set(name, { data, dict: c.dict && [...c.dict], codes: c.dict && new Map(c.codes), strings: null, date: c.date });
       }
       for (const c of cols.values()) c.data = engine.live(c.data);
       tables.set(newId, new Table(engine, cols, n, { owned: [...cols.keys()] }));
@@ -461,7 +465,7 @@ export function createStreams(getEngine) {
         map = s.names.map((name) => {
           const at = names.indexOf(name);
           if (at < 0) throw new Error(`vectro: the sender doesn't send column "${name}"`);
-          if (columns[name] !== s.types[name]) throw new Error(`vectro: column "${name}" is ${columns[name] ?? info?.[at]?.type} in the sender but ${s.types[name]} in this stream`);
+          if (columns[name] !== (s.types[name] === 'date' ? 'number' : s.types[name])) throw new Error(`vectro: column "${name}" is ${columns[name] ?? info?.[at]?.type} in the sender but ${s.types[name]} in this stream`);
           return at;
         });
         return s.names; // (Arrow) read only these
@@ -524,7 +528,7 @@ export function createStreams(getEngine) {
       const cols = new Map();
       for (const [name, c] of s.cols) {
         const z = s.zones.get(name);
-        cols.set(name, { data: engine.live(c.data).subarray(s.start, s.n), dict: c.dict, codes: c.codes, strings: null, zones: { block: ZONE_ROWS, shift: s.start, mins: z.mins, maxs: z.maxs } });
+        cols.set(name, { data: engine.live(c.data).subarray(s.start, s.n), dict: c.dict, codes: c.codes, strings: null, date: c.date, zones: { block: ZONE_ROWS, shift: s.start, mins: z.mins, maxs: z.maxs } });
       }
       return new Table(engine, cols, s.n - s.start, { owned: [] });
     },
