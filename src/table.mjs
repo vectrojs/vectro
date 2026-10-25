@@ -5,6 +5,7 @@
 // Filters are lazy: t.filter(p).sum(e) compiles to one fused pass computing
 // sum(p ? e : 0). No filtered copy is made unless you ask with collect().
 
+import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
 import { parse, toSource, walk, analyze, isMask } from './fuse.mjs';
 import { generateGroupBy, generateCompact } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
@@ -353,6 +354,116 @@ export class Table {
     }
     engine.free(offsets);
     return new Table(engine, out, total, { owned: names });
+  }
+
+  // ---- sorting ---------------------------------------------------------------
+  // sort(by): a new table in order of `by` (a column, an expression, or a list;
+  // "-" first means large to small; text sorts by label). Stable; NaN last.
+  // The order is computed on the calling thread (a radix sort); key
+  // expressions are computed on all threads.
+  sort(by) { return this.engine._drive(this.#sortG(by)); }
+  sortAsync(by) { return this.engine._driveAsync(this.#sortG(by)); }
+
+  // top(k, by): the first k rows of sort(by), e.g. top(10, '-revenue') for
+  // the 10 largest, without sorting everything: rows are kept only if their
+  // first key is at most a cutoff estimated from a sample (counted and
+  // collected on all threads), and only those are sorted.
+  top(k, by) { return this.engine._drive(this.#topG(k, by)); }
+  topAsync(k, by) { return this.engine._driveAsync(this.#topG(k, by)); }
+
+  // Sort key values for every row of this (unfiltered) table, as JS arrays.
+  *#keyArraysG(keys) {
+    const { engine } = this;
+    const out = [];
+    for (const key of keys) {
+      if (key.column) {
+        const c = this.cols.get(key.column), rank = labelRanks(c.dict, key.desc), codes = engine.live(c.data);
+        out.push(Float64Array.from(codes, (code) => rank[code]));
+        continue;
+      }
+      const d = yield* this.#deriveG('__np_sortkey', key.text, {});
+      try { out.push(Float64Array.from(engine.live(d.cols.get('__np_sortkey').data))); } finally { d.dispose(); }
+    }
+    return out;
+  }
+
+  *#sortG(by) {
+    const t = yield* this.#collectG();
+    try {
+      const keys = parseKeys(by, t.cols);
+      const perm = sortIndex(yield* t.#keyArraysG(keys), t.n);
+      return t.#gather(perm, perm.length);
+    } finally {
+      if (t !== this) t.dispose();
+    }
+  }
+
+  // A new table with rows perm[0..count) of this one (columns in `omit` left out).
+  #gather(perm, count, omit = null) {
+    const { engine } = this;
+    const out = new Map();
+    for (const [name, c] of this.cols) {
+      if (omit?.has(name)) continue;
+      const data = engine.alloc(c.data.constructor, count);
+      const src = engine.live(c.data);
+      for (let i = 0; i < count; i++) data[i] = src[perm[i]];
+      out.set(name, { ...c, data });
+    }
+    for (const c of out.values()) c.data = engine.live(c.data); // later allocations may have moved memory
+    return new Table(engine, out, count, { owned: [...out.keys()] });
+  }
+
+  *#topG(k, by) {
+    const { engine } = this;
+    k = Math.max(0, Math.floor(k));
+    const keys = parseKeys(by, this.cols);
+    const n = this.n;
+    const sortAll = function* (t) {
+      const sorted = yield* t.#sortG(by);
+      if (k >= sorted.n) return sorted;
+      const head = sorted.#gather(Uint32Array.from({ length: k }, (_, i) => i), k);
+      sorted.dispose();
+      return head;
+    };
+    // small tables, k close to n, or a text first key: just sort
+    if (keys[0].column || n <= 50_000 || k * 8 >= n) return yield* sortAll(this);
+
+    // A cutoff from an evenly spaced sample: the first key is computed for the
+    // sampled rows only. The full passes (count, then collect) are fused
+    // filters "first key <= cutoff" on all threads; nothing else is stored.
+    const S = 20_000, stride = Math.max(1, Math.floor(n / S));
+    const picked = Uint32Array.from({ length: Math.ceil(n / stride) }, (_, i) => i * stride);
+    const sampleTable = this.#gather(picked, picked.length);
+    let sample;
+    try {
+      const d = yield* sampleTable.#deriveG('__np_topkey', keys[0].text, {});
+      try {
+        sample = Float64Array.from(engine.live(d.cols.get('__np_topkey').data)).sort(); // native numeric sort; NaN goes last
+        let m = sample.length;
+        while (m > 0 && sample[m - 1] !== sample[m - 1]) m--;
+        sample = sample.subarray(0, m);
+      } finally { d.dispose(); }
+    } finally {
+      sampleTable.dispose();
+    }
+    const below = (cutoff) => this.filter(`(${keys[0].text}) <= __np_cutoff`, { __np_cutoff: cutoff });
+    let q = Math.min(1, (3 * k) / n), cutoff = Infinity, count = 0;
+    for (let tries = 0; tries < 8; tries++) {
+      const at = Math.min(sample.length - 1, Math.ceil(q * sample.length) + 8);
+      cutoff = q >= 1 || at < 0 ? Infinity : sample[at];
+      ({ c: count } = yield* below(cutoff).#aggG({ c: 'count()' }, {}));
+      if (count >= k || cutoff === Infinity) break;
+      q = Math.min(1, q * 4);
+    }
+    if (count < k) return yield* sortAll(this); // fewer than k rows with a value: NaN rows are needed
+    // every row that can be among the first k has a first key <= cutoff
+    const candidates = yield* below(cutoff).#collectG();
+    try {
+      const perm = sortIndex(yield* candidates.#keyArraysG(keys), candidates.n);
+      return candidates.#gather(perm, Math.min(k, perm.length));
+    } finally {
+      candidates.dispose();
+    }
   }
 
   // Plain JS objects (decodes text columns). Collects the filter first.

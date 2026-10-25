@@ -374,6 +374,35 @@ export class SplitTable {
     return new SplitTable(this.engine, newId, this.segs, { ...this.meta, names: [...this.meta.names, name] }, this.preds, this.params, true);
   }
 
+  // The first k rows by `by` (see Table.top), as a normal table on the page:
+  // every worker sends its own first k, and the page merges them. Rows that
+  // tie on every key come in worker order.
+  async topAsync(k, by) {
+    const parts = await this.#all('top', { k, by });
+    const keys = parts[0]?.keys ?? [];
+    const cand = [];
+    parts.forEach((p, w) => p.rows.forEach((row, i) => cand.push({ row, w, i, vals: p.values.map((v) => v && v[i]) })));
+    const cmp = (a, b) => {
+      for (let j = 0; j < keys.length; j++) {
+        if (keys[j]) { // text: by label
+          const x = a.row[keys[j].label], y = b.row[keys[j].label];
+          if (x !== y) return (x < y ? -1 : 1) * (keys[j].desc ? -1 : 1);
+          continue;
+        }
+        const x = a.vals[j], y = b.vals[j];
+        if (x !== y) {
+          if (x !== x) return 1; // NaN last
+          if (y !== y) return -1;
+          return x < y ? -1 : 1;
+        }
+      }
+      return a.w - b.w || a.i - b.i;
+    };
+    const rows = cand.sort(cmp).slice(0, k).map((c) => c.row);
+    const columns = Object.fromEntries(this.meta.names.map((name) => [name, rows.map((r) => r[name])]));
+    return this.engine.local.table(columns);
+  }
+
   // Each worker sends its first `limit` rows (in its order) and the matches
   // per block; walking the blocks in table order interleaves them back.
   async toRowsAsync(limit = Infinity) {

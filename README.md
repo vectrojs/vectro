@@ -29,6 +29,12 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
 - **Queries:** `filter(expr)` (lazy), `agg({ name: 'sum(expr)' | 'mean' | 'min' | 'max' | 'count()' })`,
   `sum/mean/min/max/count(expr)`, `groupBy(key).agg(...)`, `derive(name, expr)`,
   `collect()`, `toRows(limit)`.
+- **Sort and top-k:** `sort(by)` and `top(k, by)`, e.g. `top(10, '-revenue')`
+  for the 10 largest. Keys are columns or expressions (`'-(price * qty)'`),
+  several keys sort in order (`['region', '-price']`), text sorts by label,
+  ties keep table order and missing values come last. `top` doesn't sort
+  everything: it finds a cutoff from a sample, then collects only the rows
+  past it, on all cores. Split tables and streams have `topAsync`.
 - **Async API:** every query has an `…Async` version that runs on the worker
   threads while your server or page keeps working.
 - **Expressions** are a small, safe language: numbers, columns, `+ - * /`,
@@ -154,6 +160,8 @@ answers.
 
 ## Not done yet
 
-Sort, top-k, joins, integer/date types, missing values and persistence.
+Joins, integer/date types, missing values and persistence. Full `sort` runs
+on the calling thread (top-k is parallel), and split tables have `topAsync`
+but no full sort.
 Streams take flat records only (no nested JSON fields), and windows group by
 at most one category column. Memory is capped at 4 GB per engine and freed with `dispose()`.

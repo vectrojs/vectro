@@ -5,6 +5,7 @@ import { Engine } from './engine.mjs';
 import { Table } from './table.mjs';
 import { parse } from './fuse.mjs';
 import { createStreams } from './stream-worker.mjs';
+import { parseKeys } from './sort.mjs';
 
 export function serveSplitWorker(post, listen) {
   let engine;
@@ -131,6 +132,22 @@ export function serveSplitWorker(post, listen) {
       tables.set(newId, t);
       return t.length;
     },
+    // This worker's first k rows by `by`, with each expression key's values
+    // (text keys are compared by label on the page).
+    top({ id, preds, k, by }) {
+      const t = view(id, preds).top(k, by);
+      try {
+        const keys = parseKeys(by, t.cols);
+        const values = keys.map((key) => {
+          if (key.column) return null;
+          const d = t.derive('__np_k', key.text);
+          try { return Float64Array.from(engine.live(d.cols.get('__np_k').data)); } finally { d.dispose(); }
+        });
+        return { rows: t.toRows(), keys: keys.map((key) => (key.column ? { label: key.column, desc: key.desc } : null)), values };
+      } finally {
+        t.dispose();
+      }
+    },
     toRows({ id, preds, limit, segs }) {
       return { rows: view(id, preds).toRows(limit), segs: segmentCounts(id, preds, segs, limit ?? Infinity) };
     },
@@ -161,6 +178,7 @@ function transferList(value) {
     if (ArrayBuffer.isView(value.keys)) out.push(value.keys.buffer);
     if (value.cols) for (const c of Object.values(value.cols)) out.push(c.buffer);
     if (ArrayBuffer.isView(value.segs)) out.push(value.segs.buffer);
+    if (Array.isArray(value.values)) for (const v of value.values) if (ArrayBuffer.isView(v)) out.push(v.buffer);
   }
   return out;
 }
