@@ -238,6 +238,42 @@ query every 250 ms; the machine was busy, load average ~19, so CSV measured
 | Emitter alone, labels as text / as codes | 21M / 52M |
 | Receivers alone (pre-encoded frames): 1 / 4 / 7 workers | 29M / 88M / 100M |
 
+## Apache Arrow
+
+Vectro reads and writes Arrow IPC, the binary table format of pandas, Polars,
+DuckDB, pyarrow and Arrow Flight: the stream format and the file format
+(`.arrow` / `.feather`), including LZ4-compressed files. No dependencies.
+
+```js
+import { readFileSync, writeFileSync } from 'node:fs';
+import { Engine, readArrow, writeArrow } from 'vectrojs';
+
+const engine = new Engine();
+const sales = engine.fromArrow(readFileSync('sales.feather'));       // or columns: ['price', 'region']
+writeFileSync('eu.feather', sales.filter("region == 'EU'").toArrow({ file: true }));  // pandas.read_feather opens it
+// split tables: await engine.fromArrowAsync(bytes), await table.toArrowAsync()
+
+// streams: any Arrow IPC stream over TCP or WebSocket, e.g. from pyarrow
+const orders = await split.streamAsync({ format: 'arrow', columns: { ts: 'number', region: 'category' } });
+// ...or Vectro's Emitter speaking Arrow: Emitter.listen({ columns, format: 'arrow' })
+```
+
+- **Types:** ints, floats (16/32/64-bit), bools, dates, times, timestamps and
+  durations become number columns (times in milliseconds, nulls as NaN);
+  strings and dictionary-encoded strings become category columns (nulls as
+  `''`). Lists, structs, decimals and binary are refused unless left out with
+  `columns`. 64-bit integers are exact up to 2^53.
+- **Writing:** numbers as float64 (float32 tables as float32), categories as
+  dictionary-encoded strings, which pandas opens as `Categorical`.
+- **Checked against pyarrow 26:** files pyarrow writes (every type above, nulls,
+  delta and replaced dictionaries, LZ4, pandas `to_feather`) read back exactly
+  (`test/fixtures/arrow`, made by `scripts/make-arrow-fixtures.py`), and pyarrow
+  and pandas read Vectro's files back exactly.
+- **Speed** (M1 Pro, busy machine): a 10M-row, 5-column Feather file loads in
+  ~0.43 s uncompressed and ~1.1 s with LZ4 (pyarrow, with native threads:
+  0.16 s / 0.07 s). Arrow streams from the Emitter: 56–62M rows/s into 7
+  workers, the same as Vectro frames. ZSTD-compressed files aren't supported yet.
+
 ## Runtimes
 
 | Import | Where | How it runs |
@@ -295,6 +331,6 @@ answers.
 Joins, integer/date types, missing values and persistence. Full `sort` runs
 on the calling thread (top-k is parallel), and split tables have `topAsync`
 but no full sort.
-Binary streams have number and category columns only (no Arrow IPC yet).
+Binary streams have number and category columns only; Arrow ZSTD compression isn't supported.
 Streams take flat records only (no nested JSON fields), and windows group by
 at most one category column. Memory is capped at 4 GB per engine and freed with `dispose()`.

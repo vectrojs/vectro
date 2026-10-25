@@ -8,6 +8,7 @@ import { analyze, generate } from './fuse.mjs';
 import { interpretReduce, interpretMap } from './interp.mjs';
 import { Table } from './table.mjs';
 import { parseCSV, parseCSVAsync } from './csv.mjs';
+import { readArrow } from './arrow.mjs';
 import { encode } from './bytes.mjs';
 
 // Below these sizes the work is done on the calling thread: waking other
@@ -660,6 +661,10 @@ export class Engine {
 
   // Build a table from columns: { price: Float64Array | number[], region: string[] }
   table(columns, opts) { return Table.fromColumns(this, columns, opts); }
+
+  // Load Arrow IPC bytes (stream or file format, e.g. a .arrow / .feather
+  // file or what pyarrow, Polars or DuckDB send). columns: names to read.
+  fromArrow(bytes, { columns, type } = {}) { return Table.fromColumns(this, readArrow(bytes, { columns }).columns, { type }); }
 
   // Build a table from an array of objects (one-time conversion cost).
   tableFromRows(rows, opts) { return Table.fromRows(this, rows, opts); }

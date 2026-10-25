@@ -9,6 +9,7 @@ import { Table } from './table.mjs';
 import { parseNDJSON } from './ndjson.mjs';
 import { ZONE_ROWS } from './zones.mjs';
 import { FrameReader } from './frames.mjs';
+import { ArrowReader } from './arrow.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
@@ -28,7 +29,7 @@ export function createStreams(getEngine) {
   const streams = new Map(); // id -> stream state
 
   function open({ id, columns, format = 'csv', keepRows = Infinity, keepMs = null, timeColumn = null }) {
-    if (format !== 'csv' && format !== 'ndjson' && format !== 'vectro') throw new Error(`vectro: stream format must be 'csv', 'ndjson' or 'vectro', got "${format}"`);
+    if (!['csv', 'ndjson', 'vectro', 'arrow'].includes(format)) throw new Error(`vectro: stream format must be 'csv', 'ndjson', 'vectro' or 'arrow', got "${format}"`);
     const engine = getEngine();
     const names = Object.keys(columns);
     for (const [name, kind] of Object.entries(columns)) {
@@ -332,7 +333,7 @@ export function createStreams(getEngine) {
     // The reply waits while the backlog is high, so the page slows down too.
     streamPush({ id, bytes }) {
       const s = get(id);
-      if (s.format === 'vectro') throw new Error("vectro: binary streams take frames over connections: connect each worker to the emitter (push() is for 'csv' and 'ndjson')");
+      if (s.format === 'vectro' || s.format === 'arrow') throw new Error("vectro: binary streams take frames over connections: connect each worker to the sender (push() is for 'csv' and 'ndjson')");
       queue(s, bytes);
       return s.pendingBytes > HIGH ? new Promise((resolve) => s.waiters.push(resolve)) : true;
     },
@@ -345,7 +346,7 @@ export function createStreams(getEngine) {
       const net = await import('node:net');
       return new Promise((resolve, reject) => {
         const socket = net.connect({ host, port }, () => resolve(true));
-        if (s.format === 'vectro') { const reader = frameReceiver(s); socket.on('data', (chunk) => receiveFrames(s, reader, chunk)); } else
+        if (s.format === 'vectro' || s.format === 'arrow') { const reader = frameReceiver(s); socket.on('data', (chunk) => receiveFrames(s, reader, chunk)); } else
         socket.on('data', (chunk) => receive(s, chunk));
         socket.on('end', () => { if (s.partial) { queue(s, concat([s.partial, Uint8Array.of(NL)])); s.partial = null; } flush(s); });
         socket.on('error', (err) => { s.error ??= err.message; reject(err); });
@@ -382,15 +383,17 @@ export function createStreams(getEngine) {
   function frameReceiver(s) {
     let map = null; // stream column k -> index in the connection's schema
     const luts = s.names.map(() => []);
-    return new FrameReader({
-      onSchema(columns) {
+    const Reader = s.format === 'arrow' ? ArrowReader : FrameReader;
+    return new Reader({
+      onSchema(columns, info) {
         const names = Object.keys(columns);
         map = s.names.map((name) => {
           const at = names.indexOf(name);
-          if (at < 0) throw new Error(`vectro: the emitter doesn't send column "${name}"`);
-          if (columns[name] !== s.types[name]) throw new Error(`vectro: column "${name}" is ${columns[name]} in the emitter but ${s.types[name]} in this stream`);
+          if (at < 0) throw new Error(`vectro: the sender doesn't send column "${name}"`);
+          if (columns[name] !== s.types[name]) throw new Error(`vectro: column "${name}" is ${columns[name] ?? info?.[at]?.type} in the sender but ${s.types[name]} in this stream`);
           return at;
         });
+        return s.names; // (Arrow) read only these
       },
       onBatch(rows, columns) {
         const bytes = columns.reduce((a, c) => a + (c.values ? c.values.byteLength : c.codes.byteLength), 0);
@@ -424,7 +427,7 @@ export function createStreams(getEngine) {
       ws.binaryType = 'arraybuffer';
       let opened = false;
       ws.onopen = () => { opened = true; resolve(true); };
-      const reader = s.format === 'vectro' ? frameReceiver(s) : null;
+      const reader = s.format === 'vectro' || s.format === 'arrow' ? frameReceiver(s) : null;
       ws.onmessage = (ev) => {
         if (reader) { if (typeof ev.data !== 'string') receiveFrames(s, reader, new Uint8Array(ev.data)); return; }
         const bytes = typeof ev.data === 'string' ? textEncoder.encode(ev.data) : new Uint8Array(ev.data);

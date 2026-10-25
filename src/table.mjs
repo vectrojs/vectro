@@ -10,6 +10,7 @@ import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
 import { parse, toSource, walk, analyze, isMask } from './fuse.mjs';
 import { generateGroupBy, generateCompact } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
+import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
 
 const IDENT = /^[A-Za-z_]\w*$/;
@@ -55,12 +56,13 @@ export class Table {
   static fromColumns(engine, columns, { type = Float64Array } = {}) {
     const entries = Object.entries(columns);
     if (!entries.length) throw new TypeError('vectro: a table needs at least one column');
-    const n = entries[0][1].length;
+    const len = (v) => (isCoded(v) ? v.codes.length : v.length);
+    const n = len(entries[0][1]);
     const cols = new Map();
     for (const [name, values] of entries) {
       checkName(name);
-      if (values.length !== n) throw new RangeError(`vectro: column "${name}" has ${values.length} rows, expected ${n}`);
-      cols.set(name, isText(values) ? encodeText(engine, type, values) : { data: copyNumbers(engine, type, values), dict: null, codes: null });
+      if (len(values) !== n) throw new RangeError(`vectro: column "${name}" has ${len(values)} rows, expected ${n}`);
+      cols.set(name, isCoded(values) ? codedText(engine, type, values) : isText(values) ? encodeText(engine, type, values) : { data: copyNumbers(engine, type, values), dict: null, codes: null });
     }
     return new Table(engine, cols, n, { owned: [...cols.keys()] });
   }
@@ -508,6 +510,31 @@ export class Table {
   }
 
   // Plain JS objects (decodes text columns). Collects the filter first.
+  // The rows (matching the filter) as plain columns: Float64Array (Float32Array
+  // for float32 tables) per number column, { codes, labels } per category
+  // column, string[] per free-text column. Copies, safe to keep.
+  toColumns() { return this.engine._drive(this.#toColumnsG()); }
+  toColumnsAsync() { return this.engine._driveAsync(this.#toColumnsG()); }
+
+  *#toColumnsG() {
+    const t = yield* this.#collectG();
+    const out = {};
+    for (const [name, c] of t.cols) {
+      const data = this.engine.live(c.data).subarray(0, t.n);
+      if (c.dict) { const codes = new Uint32Array(t.n); codes.set(data); out[name] = { codes, labels: c.dict.slice() }; }
+      else if (c.strings) { const sbuf = this.engine.live(c.strings); out[name] = Array.from(data, (v) => decodeString(sbuf, v)); }
+      else out[name] = data.slice();
+    }
+    if (t !== this) t.dispose();
+    return out;
+  }
+
+  // The rows (matching the filter) as Arrow IPC bytes: the stream format, or
+  // with file: true the file format (.arrow / .feather for pandas, pyarrow,
+  // Polars, DuckDB). Categories become dictionary-encoded strings.
+  toArrow({ file = false } = {}) { return writeArrow(this.toColumns(), { file }); }
+  async toArrowAsync({ file = false } = {}) { return writeArrow(await this.toColumnsAsync(), { file }); }
+
   toRows(limit = Infinity) { return this.engine._drive(this.#toRowsG(limit)); }
   toRowsAsync(limit = Infinity) { return this.engine._driveAsync(this.#toRowsG(limit)); }
 
@@ -542,6 +569,26 @@ export class Table {
 const RESERVED = new Set(['Infinity', 'NaN', 'sum', 'mean', 'min', 'max', 'count', 'abs', 'sqrt', 'floor', 'ceil']);
 function checkName(name) {
   if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _, not a function name)`);
+}
+
+// a category column given as codes into a labels array: { codes, labels }
+export const isCoded = (values) => values != null && !ArrayBuffer.isView(values) && !Array.isArray(values) && values.codes != null && Array.isArray(values.labels);
+
+// Codes + labels as a category column. Repeated labels share one code.
+function codedText(engine, type, { codes: src, labels }) {
+  const data = engine.alloc(type, src.length);
+  const codes = new Map(), dict = [], lut = new Float64Array(labels.length);
+  labels.forEach((s, j) => {
+    let c = codes.get(s);
+    if (c === undefined) { c = dict.length; dict.push(s); codes.set(s, c); }
+    lut[j] = c;
+  });
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (!(c >= 0 && c < labels.length)) throw new RangeError(`vectro: code ${c} at row ${i} has no label (${labels.length} labels)`);
+    data[i] = lut[c];
+  }
+  return { data, dict, codes };
 }
 
 const isText = (values) => !ArrayBuffer.isView(values) && values.length > 0 && typeof values[0] === 'string';

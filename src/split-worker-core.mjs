@@ -155,6 +155,9 @@ export function serveSplitWorker(post, listen) {
     vectorTop({ id, preds, query, opts }) {
       return searchTable(view(id, preds), query, opts);
     },
+    columns({ id, preds, segs }) {
+      return { columns: view(id, preds).toColumns(), segs: segmentCounts(id, preds, segs) };
+    },
     toRows({ id, preds, limit, segs }) {
       return { rows: view(id, preds).toRows(limit), segs: segmentCounts(id, preds, segs, limit ?? Infinity) };
     },
@@ -185,6 +188,7 @@ function transferList(value) {
     if (ArrayBuffer.isView(value.keys)) out.push(value.keys.buffer);
     if (value.cols) for (const c of Object.values(value.cols)) out.push(c.buffer);
     if (ArrayBuffer.isView(value.segs)) out.push(value.segs.buffer);
+    if (value.columns) for (const c of Object.values(value.columns)) if (ArrayBuffer.isView(c) || ArrayBuffer.isView(c.codes)) out.push((c.codes ?? c).buffer);
     if (Array.isArray(value.values)) for (const v of value.values) if (ArrayBuffer.isView(v)) out.push(v.buffer);
   }
   return out;

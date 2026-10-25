@@ -20,6 +20,8 @@ import { inspectCSV } from './csv.mjs';
 import { encode, countByte } from './bytes.mjs';
 import { parse, toSource } from './fuse.mjs';
 import { mergeHits } from './vectors.mjs';
+import { isCoded } from './table.mjs';
+import { readArrow, writeArrow } from './arrow.mjs';
 
 const NL = 10, QUOTE = 34;
 const BLOCK_ROWS = 4096; // rows per block when dealing out arrays
@@ -92,9 +94,26 @@ export class SplitEngine {
   async tableAsync(columns, { type = Float64Array } = {}) {
     await this.ready;
     const entries = Object.entries(columns);
-    const n = entries[0]?.[1].length ?? 0;
+    const len = (v) => (isCoded(v) ? v.codes.length : v.length);
+    const n = entries[0] ? len(entries[0][1]) : 0;
     const text = {};
     for (const [name, v] of entries) {
+      if (len(v) !== n) throw new RangeError(`vectro: column "${name}" has ${len(v)} rows, expected ${n}`);
+      if (isCoded(v)) { // codes + labels: repeated labels share one code
+        const dict = [], index = new Map(), lut = v.labels.map((s) => {
+          let c = index.get(s);
+          if (c === undefined) { c = dict.length; dict.push(s); index.set(s, c); }
+          return c;
+        });
+        const codes = new Float64Array(n);
+        for (let i = 0; i < n; i++) {
+          const c = lut[v.codes[i]];
+          if (c === undefined) throw new RangeError(`vectro: code ${v.codes[i]} at row ${i} has no label (${v.labels.length} labels)`);
+          codes[i] = c;
+        }
+        text[name] = { codes, dict };
+        continue;
+      }
       if (ArrayBuffer.isView(v) || !v.length || typeof v[0] !== 'string') continue;
       const codes = new Float64Array(v.length), dict = [], index = new Map();
       for (let i = 0; i < v.length; i++) {
@@ -158,6 +177,9 @@ export class SplitEngine {
 
   // Parse CSV text or bytes: the page cuts it at row boundaries (quote-aware)
   // and every worker parses its piece in parallel.
+  // Load Arrow IPC bytes (stream or file format) as a split table.
+  async fromArrowAsync(bytes, { columns, type } = {}) { return this.tableAsync(readArrow(bytes, { columns }).columns, { type }); }
+
   async parseCSVAsync(text, opts = {}) {
     await this.ready;
     const bytes = typeof text === 'string' ? encode(text) : text;
@@ -275,6 +297,41 @@ function inOrder(segs, fn) {
   for (let r = 0; r < rounds; r++) {
     for (let w = 0; w < segs.length; w++) if (r < segs[w].length && fn(w, r, segs[w][r]) === false) return;
   }
+}
+
+// Workers' columns, interleaved back into table order by their segments.
+// Category labels are merged (stream workers each have their own).
+function mergeColumns(parts) {
+  const total = parts.reduce((a, p) => a + p.segs.reduce((x, y) => x + y, 0), 0);
+  const names = Object.keys(parts[0]?.columns ?? {});
+  const out = {}, luts = {};
+  for (const name of names) {
+    const first = parts[0].columns[name];
+    if (ArrayBuffer.isView(first)) out[name] = new first.constructor(total);
+    else if (first.codes) {
+      const labels = [], index = new Map();
+      luts[name] = parts.map((p) => Uint32Array.from(p.columns[name].labels, (s) => {
+        let g = index.get(s);
+        if (g === undefined) { g = labels.length; labels.push(s); index.set(s, g); }
+        return g;
+      }));
+      out[name] = { codes: new Uint32Array(total), labels };
+    } else out[name] = [];
+  }
+  let at = 0;
+  const next = parts.map(() => 0);
+  inOrder(parts.map((p) => p.segs), (w, _, k) => {
+    const from = next[w];
+    for (const name of names) {
+      const src = parts[w].columns[name], dst = out[name];
+      if (ArrayBuffer.isView(dst)) dst.set(src.subarray(from, from + k), at);
+      else if (dst.codes) { const lut = luts[name][w]; for (let i = 0; i < k; i++) dst.codes[at + i] = lut[src.codes[from + i]]; }
+      else for (let i = 0; i < k; i++) dst.push(src[from + i]);
+    }
+    next[w] += k;
+    at += k;
+  });
+  return out;
 }
 
 export class SplitTable {
@@ -428,6 +485,15 @@ export class SplitTable {
     return rows;
   }
 
+  // The rows (matching the filters) as plain columns on the page, in table
+  // order (see Table.toColumns).
+  async toColumnsAsync() {
+    return mergeColumns(await this.#all('columns', {}, true));
+  }
+
+  // The rows (matching the filters) as Arrow IPC bytes (see Table.toArrow).
+  async toArrowAsync({ file = false } = {}) { return writeArrow(await this.toColumnsAsync(), { file }); }
+
   async dispose() {
     if (!this.owned) return;
     this.owned = false;
@@ -459,7 +525,7 @@ export class StreamTable extends SplitTable {
   // Bytes of CSV lines (no header), cut anywhere. Whole lines go to the
   // workers in turn; the promise resolves once the worker has queued them.
   push(chunk) {
-    if (this.format === 'vectro') return Promise.reject(new Error("vectro: binary streams take frames over connections: connect each worker to the emitter (push() is for 'csv' and 'ndjson')"));
+    if (this.format === 'vectro' || this.format === 'arrow') return Promise.reject(new Error("vectro: binary streams take frames over connections: connect each worker to the sender (push() is for 'csv' and 'ndjson')"));
     const bytes = typeof chunk === 'string' ? encode(chunk) : chunk;
     const last = bytes.lastIndexOf(NL);
     if (last === -1) { this.partial = this.partial ? join(this.partial, bytes) : Uint8Array.prototype.slice.call(bytes); return Promise.resolve(); }
@@ -497,6 +563,11 @@ export class StreamTable extends SplitTable {
   }
 
   async collectAsync() { return this.snapshotAsync(); }
+
+  async toColumnsAsync() {
+    const snap = await this.snapshotAsync();
+    try { return await snap.toColumnsAsync(); } finally { await snap.dispose(); }
+  }
 
   async toRowsAsync(limit = Infinity) {
     const parts = await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'toRows', { id: this.id, preds: this.preds, limit: Number.isFinite(limit) ? limit : undefined, segs: [Infinity] })));
