@@ -201,6 +201,43 @@ The producer runs on the same machine, so all 8 cores are busy. JSON lines
 (`FORMAT=ndjson`): Vectro took in 9.3–10.3M rows/s against 2.45M for plain Node
 using `JSON.parse` per line, with live queries at 12–14 ms (plain: 18.5 ms).
 
+### Binary streams: Emitter and `format: 'vectro'`
+
+When you control both ends, skip text. An `Emitter` (Node) sends column
+batches as **Vectro frames**: numbers as raw float64, categories as u32 codes
+with each label sent once per connection, every section 8-byte aligned. The
+receiving worker copies number columns straight into memory with no parsing.
+
+```js
+import { Emitter, SplitEngine } from 'vectrojs';
+
+// sender
+const feed = await Emitter.listen({ port: 9000, columns: { ts: 'number', price: 'number', region: 'category' } });
+await feed.write({ ts, price, region: ['EU', 'US', ...] });         // Float64Array / arrays, same length
+await feed.write({ ts, price, region: { codes, labels: REGIONS } }); // faster: codes into a labels array
+
+// receiver: one connection per worker; the emitter deals batches round-robin
+const engine = new SplitEngine();
+const orders = await engine.streamAsync({ format: 'vectro', columns: { ts: 'number', price: 'number', region: 'category' } });
+await Promise.all(engine.workers.map((_, w) => orders.connect(w, { host: 'feed.local', port: 9000 })));
+```
+
+`write()` waits when every connection has 8 MB unsent (TCP backpressure), and
+large batches go out in frames of at most 65,536 rows. Over WebSockets, send
+each frame as one binary message. The frame layout is documented at the top of
+`src/frames.mjs` (`BatchEncoder` / `FrameReader` work without the Emitter too).
+
+**Measured** (`FORMAT=vectro npm run bench:stream`, M1 Pro, localhost, a live
+query every 250 ms; the machine was busy, load average ~19, so CSV measured
+5.4–6.1M rows/s at the same time instead of its usual 17M):
+
+| | Rows/s |
+|---|---|
+| CSV lines, 7 workers (same busy machine) | 5.4–6.1M |
+| Emitter → 7 workers, end to end | 46–52M (the one-thread emitter is the limit) |
+| Emitter alone, labels as text / as codes | 21M / 52M |
+| Receivers alone (pre-encoded frames): 1 / 4 / 7 workers | 29M / 88M / 100M |
+
 ## Runtimes
 
 | Import | Where | How it runs |
@@ -258,5 +295,6 @@ answers.
 Joins, integer/date types, missing values and persistence. Full `sort` runs
 on the calling thread (top-k is parallel), and split tables have `topAsync`
 but no full sort.
+Binary streams have number and category columns only (no Arrow IPC yet).
 Streams take flat records only (no nested JSON fields), and windows group by
 at most one category column. Memory is capped at 4 GB per engine and freed with `dispose()`.

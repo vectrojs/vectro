@@ -106,7 +106,7 @@ for (const workers of [1, 4]) {
   for (const k of Object.keys(want)) { checks++; if (!close(got[k], want[k])) fail(`w=${workers} stream ${k}: ${JSON.stringify(got[k])} vs ${JSON.stringify(want[k])}`); }
   let msg = '';
   try { await engine.streamAsync({ format: 'xml', columns: { a: 'number' } }); } catch (err) { msg = err.message; }
-  checks++; if (!msg.includes("'csv' or 'ndjson'")) fail(`w=${workers} bad format accepted: ${msg}`);
+  checks++; if (!msg.includes("'ndjson' or 'vectro'")) fail(`w=${workers} bad format accepted: ${msg}`);
   await engine.close();
 }
 await ref.close();

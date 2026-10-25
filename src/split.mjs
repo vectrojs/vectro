@@ -187,9 +187,10 @@ export class SplitEngine {
     return new SplitTable(this, id, segs, { names: loaded[0].names, dicts, strings: new Set(loaded[0].strings) }, [], {}, true);
   }
 
-  // A live table fed by a stream of lines, spread over the workers. format:
-  // 'csv' (no header; columns in the order of the fields in each line) or
-  // 'ndjson' (one flat JSON object per line; columns pick the keys).
+  // A live table fed by a stream, spread over the workers. format: 'csv'
+  // (lines, no header; columns in the order of the fields), 'ndjson' (one
+  // flat JSON object per line; columns pick the keys) or 'vectro' (binary
+  // column frames from an Emitter; connect each worker, no parsing).
   // columns: { name: 'number' | 'category' }. keepRows: rows kept in total (the oldest are
   // dropped); keepMs + timeColumn: keep rows newer than the newest time minus
   // keepMs. Feed it with push() from here, or connect() each worker to its own
@@ -200,7 +201,9 @@ export class SplitEngine {
     const id = ++this.nextTable;
     const perWorker = Number.isFinite(keepRows) ? Math.ceil(keepRows / this.size) : Infinity;
     await Promise.all(this.workers.map((_, w) => this._call(w, 'streamOpen', { id, columns, format, keepRows: perWorker, keepMs, timeColumn })));
-    return new StreamTable(this, id, Object.keys(columns));
+    const t = new StreamTable(this, id, Object.keys(columns));
+    t.format = format;
+    return t;
   }
 
   async close() {
@@ -456,6 +459,7 @@ export class StreamTable extends SplitTable {
   // Bytes of CSV lines (no header), cut anywhere. Whole lines go to the
   // workers in turn; the promise resolves once the worker has queued them.
   push(chunk) {
+    if (this.format === 'vectro') return Promise.reject(new Error("vectro: binary streams take frames over connections: connect each worker to the emitter (push() is for 'csv' and 'ndjson')"));
     const bytes = typeof chunk === 'string' ? encode(chunk) : chunk;
     const last = bytes.lastIndexOf(NL);
     if (last === -1) { this.partial = this.partial ? join(this.partial, bytes) : Uint8Array.prototype.slice.call(bytes); return Promise.resolve(); }

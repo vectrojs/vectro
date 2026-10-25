@@ -8,6 +8,7 @@
 import { Table } from './table.mjs';
 import { parseNDJSON } from './ndjson.mjs';
 import { ZONE_ROWS } from './zones.mjs';
+import { FrameReader } from './frames.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
@@ -27,7 +28,7 @@ export function createStreams(getEngine) {
   const streams = new Map(); // id -> stream state
 
   function open({ id, columns, format = 'csv', keepRows = Infinity, keepMs = null, timeColumn = null }) {
-    if (format !== 'csv' && format !== 'ndjson') throw new Error(`vectro: stream format must be 'csv' or 'ndjson', got "${format}"`);
+    if (format !== 'csv' && format !== 'ndjson' && format !== 'vectro') throw new Error(`vectro: stream format must be 'csv', 'ndjson' or 'vectro', got "${format}"`);
     const engine = getEngine();
     const names = Object.keys(columns);
     for (const [name, kind] of Object.entries(columns)) {
@@ -66,8 +67,10 @@ export function createStreams(getEngine) {
       for (const z of s.zones.values()) { z.mins.length = 0; z.maxs.length = 0; }
       updateZones(s, 0, s.n); // rows moved: rebuild the zone maps
     }
-    if (need <= s.cap) return;
-    const cap = Math.max(need, s.cap * 2);
+    // keep at least as much free room as kept rows, so rows move at most once
+    // per row added (compaction copies every kept row)
+    if (need <= s.cap && s.cap - need >= Math.min(need, s.n)) return;
+    const cap = Math.max(need * 2, s.cap * 2);
     for (const c of s.cols.values()) {
       const bigger = engine.alloc(Float64Array, cap);
       bigger.set(engine.live(c.data).subarray(0, s.n));
@@ -106,7 +109,7 @@ export function createStreams(getEngine) {
     reserve(s, s.n + m);
     s.names.forEach((name, k) => {
       const c = s.cols.get(name), { data: src, dict } = part(k), dst = engine.live(c.data);
-      if (!c.dict) { dst.set(src, s.n); return; }
+      if (!c.dict || !dict) { dst.set(src, s.n); return; } // numbers, or codes already in this stream's numbering
       // the batch has its own dictionary; renumber into the stream's
       const lut = dict.map((str) => {
         let g = c.codes.get(str);
@@ -194,15 +197,26 @@ export function createStreams(getEngine) {
   // Zone maps for rows [from, from + m): min and max per block of ZONE_ROWS
   // buffer rows, kept up to date as batches arrive, so filtered queries on
   // live data (usually time-ordered) skip old blocks. See zones.mjs.
+  // Min and max skip NaN (x == x is false only for NaN). Long runs use one
+  // compiled SIMD pass per block; short ones a plain loop.
+  const ZONE_SPEC = ['min(x == x ? x : Infinity)', 'max(x == x ? x : -Infinity)'];
   function updateZones(s, from, m) {
     const engine = getEngine();
     for (const [name, z] of s.zones) {
-      const d = engine.live(s.cols.get(name).data);
+      const col = s.cols.get(name);
       for (let i = from, end = from + m; i < end; ) {
         const b = Math.floor(i / ZONE_ROWS), stop = Math.min(end, (b + 1) * ZONE_ROWS);
         let lo = z.mins[b] ?? Infinity, hi = z.maxs[b] ?? -Infinity;
-        for (; i < stop; i++) { const v = d[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+        if (stop - i >= 1024 && engine.jit) {
+          const [a, c] = engine.eval(ZONE_SPEC, { x: engine.live(col.data).subarray(i, stop) });
+          if (a < lo) lo = a;
+          if (c > hi) hi = c;
+        } else {
+          const d = engine.live(col.data);
+          for (let j = i; j < stop; j++) { const v = d[j]; if (v < lo) lo = v; if (v > hi) hi = v; }
+        }
         z.mins[b] = lo; z.maxs[b] = hi;
+        i = stop;
       }
     }
   }
@@ -318,6 +332,7 @@ export function createStreams(getEngine) {
     // The reply waits while the backlog is high, so the page slows down too.
     streamPush({ id, bytes }) {
       const s = get(id);
+      if (s.format === 'vectro') throw new Error("vectro: binary streams take frames over connections: connect each worker to the emitter (push() is for 'csv' and 'ndjson')");
       queue(s, bytes);
       return s.pendingBytes > HIGH ? new Promise((resolve) => s.waiters.push(resolve)) : true;
     },
@@ -330,6 +345,7 @@ export function createStreams(getEngine) {
       const net = await import('node:net');
       return new Promise((resolve, reject) => {
         const socket = net.connect({ host, port }, () => resolve(true));
+        if (s.format === 'vectro') { const reader = frameReceiver(s); socket.on('data', (chunk) => receiveFrames(s, reader, chunk)); } else
         socket.on('data', (chunk) => receive(s, chunk));
         socket.on('end', () => { if (s.partial) { queue(s, concat([s.partial, Uint8Array.of(NL)])); s.partial = null; } flush(s); });
         socket.on('error', (err) => { s.error ??= err.message; reject(err); });
@@ -360,6 +376,45 @@ export function createStreams(getEngine) {
     },
   };
 
+  // Binary Vectro frames (see frames.mjs) from one connection: number columns
+  // are copied straight in; category codes go through a small table from
+  // this connection's label numbers to the stream's.
+  function frameReceiver(s) {
+    let map = null; // stream column k -> index in the connection's schema
+    const luts = s.names.map(() => []);
+    return new FrameReader({
+      onSchema(columns) {
+        const names = Object.keys(columns);
+        map = s.names.map((name) => {
+          const at = names.indexOf(name);
+          if (at < 0) throw new Error(`vectro: the emitter doesn't send column "${name}"`);
+          if (columns[name] !== s.types[name]) throw new Error(`vectro: column "${name}" is ${columns[name]} in the emitter but ${s.types[name]} in this stream`);
+          return at;
+        });
+      },
+      onBatch(rows, columns) {
+        const bytes = columns.reduce((a, c) => a + (c.values ? c.values.byteLength : c.codes.byteLength), 0);
+        append(s, rows, (k) => {
+          const col = columns[map[k]];
+          if (col.values) return { data: col.values, dict: null };
+          const c = s.cols.get(s.names[k]), lut = luts[k];
+          for (let i = lut.length; i < col.labels.length; i++) { // labels new on this connection
+            const label = col.labels[i];
+            let g = c.codes.get(label);
+            if (g === undefined) { g = c.dict.length; c.dict.push(label); c.codes.set(label, g); }
+            lut.push(g);
+          }
+          const out = new Float64Array(rows);
+          for (let i = 0; i < rows; i++) out[i] = lut[col.codes[i]];
+          return { data: out, dict: null };
+        }, bytes);
+      },
+    });
+  }
+  const receiveFrames = (s, reader, chunk) => {
+    try { reader.push(chunk); } catch (err) { s.error ??= err.message; }
+  };
+
   // WebSockets can't be paused (in browsers or Node), so there is no
   // backpressure here: a feed faster than the workers grows the backlog.
   function connectWebSocket(s, url) {
@@ -369,7 +424,9 @@ export function createStreams(getEngine) {
       ws.binaryType = 'arraybuffer';
       let opened = false;
       ws.onopen = () => { opened = true; resolve(true); };
+      const reader = s.format === 'vectro' ? frameReceiver(s) : null;
       ws.onmessage = (ev) => {
+        if (reader) { if (typeof ev.data !== 'string') receiveFrames(s, reader, new Uint8Array(ev.data)); return; }
         const bytes = typeof ev.data === 'string' ? textEncoder.encode(ev.data) : new Uint8Array(ev.data);
         if (!bytes.length) return;
         queue(s, bytes[bytes.length - 1] === NL ? bytes : concat([bytes, Uint8Array.of(NL)]));

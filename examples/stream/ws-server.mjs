@@ -17,16 +17,17 @@ export function acceptWebSocket(req, socket) {
     get open() { return open; },
     // returns false when the socket's buffer is full (wait for 'drain')
     send: (data) => open && socket.write(frame(Buffer.from(data))),
+    sendBinary: (bytes) => open && socket.write(frame(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength), 0x82)),
     close: () => { if (open) { open = false; socket.end(Buffer.from([0x88, 0])); } },
     socket,
   };
 }
 
-function frame(payload) {
+function frame(payload, first = 0x81) { // 0x81: text, 0x82: binary (final frame)
   const n = payload.length;
   let header;
-  if (n < 126) header = Buffer.from([0x81, n]);
-  else if (n < 65536) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 126; header.writeUInt16BE(n, 2); }
-  else { header = Buffer.alloc(10); header[0] = 0x81; header[1] = 127; header.writeBigUInt64BE(BigInt(n), 2); }
+  if (n < 126) header = Buffer.from([first, n]);
+  else if (n < 65536) { header = Buffer.alloc(4); header[0] = first; header[1] = 126; header.writeUInt16BE(n, 2); }
+  else { header = Buffer.alloc(10); header[0] = first; header[1] = 127; header.writeBigUInt64BE(BigInt(n), 2); }
   return Buffer.concat([header, payload]);
 }

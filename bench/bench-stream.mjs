@@ -24,7 +24,19 @@ const REG = ['EU', 'US', 'APAC', 'LATAM', 'MEA', 'UK', 'CA', 'ANZ'];
 const role = process.argv[2];
 
 // ---- producer: one prebuilt buffer of lines, written again and again --------
-if (role === 'producer') {
+// (FORMAT=vectro: an Emitter writing one prebuilt 65,536-row batch again and again)
+if (role === 'producer' && FORMAT === 'vectro') {
+  const { Emitter } = await import('../src/node.mjs');
+  let seed = 5;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const B = 65_536;
+  const batch = { ts: new Float64Array(B), price: new Float64Array(B), qty: new Float64Array(B), region: { codes: new Uint32Array(B), labels: REG } };
+  for (let i = 0; i < B; i++) { batch.ts[i] = 1_700_000_000_000 + i; batch.price[i] = Math.round(rnd() * 1e5) / 100; batch.qty[i] = 1 + Math.floor(rnd() * 9); batch.region.codes[i] = Math.floor(rnd() * 8); }
+  const feed = await Emitter.listen({ columns: { ts: 'number', price: 'number', qty: 'number', region: 'category' } });
+  process.send({ port: feed.port, rowsPerBuffer: B, bytesPerBuffer: B * 28 });
+  for (;;) await feed.write(batch); // waits while no collector is connected or all are full
+}
+if (role === 'producer' && FORMAT !== 'vectro') {
   let seed = 5;
   const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
   const lines = [];
@@ -146,10 +158,10 @@ if (!role) {
   const producer = fork(self, ['producer']);
   const info = await new Promise((r) => producer.once('message', r));
   const avgRowBytes = info.bytesPerBuffer / info.rowsPerBuffer;
-  console.log(`Streaming orders as ${FORMAT === 'ndjson' ? 'JSON lines' : 'CSV lines'} over TCP (localhost), ${avgRowBytes.toFixed(1)} bytes per row; ${WORKERS} workers; keep the newest ${(KEEP_ROWS / 1e6).toFixed(0)}M rows; ${DURATION_MS / 1000} s per run`);
+  console.log(`Streaming orders as ${FORMAT === 'vectro' ? 'binary Vectro frames' : FORMAT === 'ndjson' ? 'JSON lines' : 'CSV lines'} over TCP (localhost), ${avgRowBytes.toFixed(1)} bytes per row; ${WORKERS} workers; keep the newest ${(KEEP_ROWS / 1e6).toFixed(0)}M rows; ${DURATION_MS / 1000} s per run`);
   console.log('Live query every 250 ms: orders + revenue per region, and a filtered aggregate, over every row kept.\n');
   const rows = [];
-  for (const mode of (process.env.MODES ?? 'plain,push,connect').split(',')) {
+  for (const mode of (process.env.MODES ?? (FORMAT === 'vectro' ? 'connect' : 'plain,push,connect')).split(',')) {
     const child = fork(self, [mode, String(info.port)], { execArgv: ['--max-old-space-size=8192'] });
     const r = await new Promise((res, rej) => { child.once('message', res); child.once('exit', (code) => code && rej(new Error(`${mode} exited with ${code}`))); });
     rows.push(r);
