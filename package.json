@@ -1,0 +1,35 @@
+{
+  "name": "vectro",
+  "version": "0.1.0",
+  "description": "Multi-core analytics engine for JavaScript: columnar tables and fused SIMD WebAssembly kernels for Node, browsers and edge runtimes, with no native code.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/vectrojs/vectro" },
+  "keywords": ["analytics", "dataframe", "columnar", "simd", "webassembly", "wasm", "multithreading", "worker-threads", "csv", "olap"],
+  "engines": { "node": ">=20" },
+  "main": "src/node.mjs",
+  "exports": {
+    ".": "./src/node.mjs",
+    "./portable": "./src/portable.mjs",
+    "./browser": "./src/browser.mjs",
+    "./dist/vectro.wasm": "./dist/vectro.wasm"
+  },
+  "files": ["src", "dist", "README.md"],
+  "scripts": {
+    "build": "node scripts/build-wasm.mjs",
+    "test": "node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs && node test/test-async.mjs && node test/test-split.mjs && node test/test-balance.mjs && node test/test-check-cases.mjs",
+    "test:single": "VECTRO_MODE=single sh -c 'node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs'",
+    "test:interp": "VECTRO_MODE=interp sh -c 'node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs'",
+    "test:edge": "npm run build && VECTRO_MODE=edge sh -c 'node --disallow-code-generation-from-strings test/test-ops.mjs && node --disallow-code-generation-from-strings test/test-fusion.mjs && node --disallow-code-generation-from-strings test/test-tables.mjs && node --disallow-code-generation-from-strings test/test-csv.mjs'",
+    "test:browser-sim": "VECTRO_MODE=browser-sim sh -c 'node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs && node test/test-async.mjs'",
+    "test:all": "npm test && npm run test:single && npm run test:interp && npm run test:edge && npm run test:browser-sim",
+    "check:expected": "node scripts/make-check-expected.mjs",
+    "bench": "node --max-old-space-size=8192 bench/bench.mjs",
+    "bench:async": "node --max-old-space-size=8192 bench/bench-async.mjs",
+    "bench:skew": "node --max-old-space-size=8192 bench/bench-skew.mjs",
+    "bench:split-csv": "node --max-old-space-size=8192 bench/bench-split-csv.mjs",
+    "serve:browser": "node examples/browser-threads/serve.mjs 8766",
+    "serve:split": "node examples/browser-threads/serve.mjs 8767 --no-isolation",
+    "serve:phone": "node examples/browser-threads/serve.mjs 8772 --no-isolation --lan"
+  }
+}

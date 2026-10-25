@@ -1,0 +1,4 @@
+# Self-test Worker: npx wrangler dev -c wrangler.selftest.toml
+name = "vectro-selftest"
+main = "src/selftest.js"
+compatibility_date = "2026-10-01"

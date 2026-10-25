@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vectro phone test</title>
+<style>
+  :root { --ink: #1b2430; --muted: #5b6573; --line: #d9dee5; --ok: #0f766e; --bad: #b45309; --bg: #fff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ink: #e6edf3; --muted: #9aa3ae; --line: #30363d; --ok: #3fb9a8; --bad: #f0a35e; --bg: #0d1117; } }
+  body { font: 16px/1.5 -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); background: var(--bg); max-width: 720px; margin: 16px auto; padding: 0 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 18px; font-size: 14px; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); font-weight: 600; } .bad { color: var(--bad); font-weight: 600; } .muted { color: var(--muted); font-size: 14px; }
+  #status { font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>vectro on this phone</h1>
+<p class="muted">Keep this tab open and <b>tap the screen every few seconds so it never turns off</b>, until it says Done (about a minute). If the screen locks, the timings don't count. The page reloads itself between steps. Results are sent to the Mac running the test server.</p>
+<p id="status">Starting…</p>
+<div id="out"></div>
+<script type="module">
+// Phone test, one step per page load so every step starts with fresh memory:
+// checks (same cases as /examples/check/), speed at 1M..10M rows, CSV.
+// Each step reports to the server as <report>-<step>.json, and the page then
+// loads the next step. If the phone stops the tab (too much memory), Safari
+// reloads it; the unfinished step is then recorded as crashed and skipped.
+import { SplitEngine } from '../../src/browser.mjs';
+import { Engine as SingleEngine } from '../../src/portable.mjs';
+import { asyncEngine, queryCases, fuzzCases } from '../check/cases.mjs';
+
+const params = new URLSearchParams(location.search);
+const name = params.get('report') || 'phone';
+const STEPS = ['checks', ...(params.get('sizes') ?? '1000000,2000000,5000000,10000000').split(','), 'csv'];
+const index = Number(params.get('step') ?? 0);
+const step = STEPS[index];
+const status = document.getElementById('status'), out = document.getElementById('out');
+const R = { userAgent: navigator.userAgent, cores: navigator.hardwareConcurrency, crossOriginIsolated: self.crossOriginIsolated, step, stage: 'start' };
+const report = (r = R, suffix = step) => fetch(`/report?name=${encodeURIComponent(`${name}-${suffix}`)}`, { method: 'POST', body: JSON.stringify(r), keepalive: true }).catch(() => {});
+const stage = async (s) => { R.stage = s; R.stageAt = performance.now(); status.textContent = `Step ${index + 1} of ${STEPS.length}: ${s}`; await report(); await new Promise((r) => setTimeout(r, 0)); };
+const fmt = (ms) => (ms < 10 ? ms.toFixed(1) : ms.toFixed(0)) + ' ms';
+const close = (a, b) => (Array.isArray(a) ? a.every((x, i) => close(x, b[i])) : Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(b)));
+async function best(f, reps = 3) { await f(); let m = Infinity; for (let i = 0; i < reps; i++) { const s = performance.now(); await f(); m = Math.min(m, performance.now() - s); } return m; }
+const next = () => {
+  try { sessionStorage.removeItem('vectro-running'); } catch {}
+  if (index + 1 < STEPS.length) location.replace(`?${new URLSearchParams({ ...Object.fromEntries(params), step: index + 1 })}`);
+  else { status.textContent = 'Done. Thank you! You can close this tab.'; report({ done: true, steps: STEPS }, 'done'); }
+};
+
+// Heartbeat: if a step hangs, the server still learns what is waiting on which worker.
+let watched = null;
+setInterval(() => {
+  R.stageSeconds = Math.round((performance.now() - (R.stageAt ?? 0)) / 1000);
+  R.waiting = watched ? [...watched.pending.values()].map((p) => `${p.op} on worker ${p.worker}`) : [];
+  if (!R.finished) report();
+}, 3000);
+// Timings only count if the page stayed visible: a locked or dimmed phone
+// suspends or slows the tab. Record every time it was hidden.
+R.hidden = 0;
+document.addEventListener('visibilitychange', () => { if (document.hidden) { R.hidden++; report(); } });
+// Ask the phone to keep the screen on (needs https on most browsers, so this may be refused here).
+navigator.wakeLock?.request('screen').then(() => { R.wakeLock = true; }, () => { R.wakeLock = false; });
+addEventListener('error', (ev) => { R.pageError = String(ev.message); report(); });
+addEventListener('unhandledrejection', (ev) => { R.pageError = String(ev.reason?.message ?? ev.reason); report(); });
+
+async function checks() {
+  const expected = await (await fetch('../check/expected.json')).json();
+  R.checks = [];
+  for (const [label, make, isSplit] of [['1 thread', () => new SingleEngine(), false], [`split tables, ${navigator.hardwareConcurrency || 4} workers`, () => new SplitEngine(), true]]) {
+    await stage(`checking answers on ${label}`);
+    const e = make(), eng = isSplit ? e : asyncEngine(e);
+    if (isSplit) watched = e;
+    const row = { name: label, checks: 0, failures: [] };
+    try {
+      const got = await queryCases(eng);
+      for (const k in expected) { row.checks++; if (got[k] !== expected[k]) row.failures.push(`${k}: ${String(got[k]).slice(0, 120)}`); }
+      const fz = await fuzzCases(eng);
+      row.checks += fz.checks; row.failures.push(...fz.failures);
+    } catch (err) { row.failures.push(`threw: ${err?.message ?? err}`); }
+    await e.close();
+    R.checks.push(row);
+  }
+  out.innerHTML = R.checks.map((c) => `<p>${c.name}: <b class="${c.failures.length ? 'bad' : 'ok'}">${c.checks - c.failures.length} of ${c.checks} correct</b></p>`).join('');
+}
+
+async function speed(N) {
+  const split = new SplitEngine(), single = new SingleEngine();
+  watched = split;
+  const REG = ['EU', 'US', 'APAC', 'LATAM', 'MEA', 'UK', 'CA', 'ANZ'];
+  await stage(`${N / 1e6}M rows: generating`);
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const price = new Float64Array(N), qty = new Float64Array(N), reg = new Uint8Array(N);
+  for (let i = 0; i < N; i++) { price[i] = Math.round(rnd() * 1e5) / 100; qty[i] = 1 + Math.floor(rnd() * 9); reg[i] = Math.floor(rnd() * 8); }
+  let region = Array.from(reg, (r) => REG[r]);
+  R.rows = N; R.workers = split.size; R.queries = [];
+  await stage(`${N / 1e6}M rows: loading into ${split.size} workers`);
+  let s = performance.now();
+  const tP = await split.tableAsync({ price, qty, region });
+  R.loadSplit = performance.now() - s;
+  await stage(`${N / 1e6}M rows: loading into 1 thread`);
+  s = performance.now();
+  const tS = single.table({ price, qty, region });
+  R.loadSingle = performance.now() - s;
+  region = null;
+
+  const js = {
+    revenue: () => { let t = 0; for (let i = 0; i < N; i++) if (price[i] > 100 && qty[i] < 5) t += price[i] * qty[i]; return t; },
+    dashboard: () => { let n = 0, t = 0, r = 0; for (let i = 0; i < N; i++) if (reg[i] === 0) { n++; t += price[i]; r += price[i] * qty[i]; } return [n, t / n, r]; },
+    group: () => { const r = new Float64Array(8); for (let i = 0; i < N; i++) r[reg[i]] += price[i] * qty[i]; return Array.from(r); },
+    derive: () => { const o = new Float64Array(N); for (let i = 0; i < N; i++) o[i] = price[i] * qty[i]; return o.length; },
+  };
+  const groupRows = (rows) => REG.map((g) => rows.find((x) => x.region === g)?.rev ?? 0);
+  const Q = {
+    revenue: { p: () => tP.filter('price > 100 && qty < 5').sumAsync('price * qty'), s: () => tS.filter('price > 100 && qty < 5').sum('price * qty') },
+    dashboard: { p: async () => Object.values(await tP.filter("region == 'EU'").aggAsync({ n: 'count()', avg: 'mean(price)', rev: 'sum(price * qty)' })), s: () => Object.values(tS.filter("region == 'EU'").agg({ n: 'count()', avg: 'mean(price)', rev: 'sum(price * qty)' })) },
+    group: { p: async () => groupRows((await tP.groupBy('region').aggAsync({ rev: 'sum(price * qty)' })).toRows()), s: () => { const g = tS.groupBy('region').agg({ rev: 'sum(price * qty)' }); const r = groupRows(g.toRows()); g.dispose(); return r; } },
+    derive: { p: async () => { const d = await tP.deriveAsync('rev', 'price * qty'); const n = d.length; await d.dispose(); return n; }, s: () => { const d = tS.derive('rev', 'price * qty'); const n = d.length; d.dispose(); return n; } },
+  };
+  for (const [q, f] of Object.entries(Q)) {
+    await stage(`${N / 1e6}M rows: ${q}`);
+    const want = js[q]();
+    const same = close(await f.p(), want) && close(f.s(), want);
+    R.queries.push({ query: q, split: await best(f.p), single: await best(f.s), js: await best(js[q]), same });
+  }
+  await split.close(); await single.close();
+  const yes = (v) => `<span class="${v ? 'ok' : 'bad'}">${v ? 'yes' : 'NO'}</span>`;
+  out.innerHTML = `<table><tr><th>${N / 1e6}M rows</th><th class="n">split, ${R.workers} workers</th><th class="n">1 thread</th><th class="n">JS loop</th><th>same</th></tr>
+    ${R.queries.map((q) => `<tr><td>${q.query}</td><td class="n">${fmt(q.split)}</td><td class="n">${fmt(q.single)}</td><td class="n">${fmt(q.js)}</td><td>${yes(q.same)}</td></tr>`).join('')}
+    <tr><td>load</td><td class="n">${fmt(R.loadSplit)}</td><td class="n">${fmt(R.loadSingle)}</td><td></td><td></td></tr></table>`;
+}
+
+async function csvStep() {
+  const split = new SplitEngine(), single = new SingleEngine();
+  watched = split;
+  await stage('CSV: building 2M rows');
+  const lines = ['price,qty,region'];
+  let seed = 9;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const REG2 = ['EU', 'US', 'APAC', 'LATAM'];
+  for (let i = 0; i < 2_000_000; i++) lines.push(`${(rnd() * 1000).toFixed(2)},${1 + Math.floor(rnd() * 9)},${REG2[Math.floor(rnd() * 4)]}`);
+  const csv = new TextEncoder().encode(lines.join('\n'));
+  lines.length = 0;
+  await stage('CSV: parsing');
+  let a, b;
+  const csvSplit = await best(async () => { await a?.dispose(); a = await split.parseCSVAsync(csv); }, 2);
+  const csvSingle = await best(async () => { b?.dispose(); b = single.parseCSV(csv); }, 2);
+  R.csv = { mb: csv.length / 1e6, split: csvSplit, single: csvSingle, same: a.length === b.length && close(await a.sumAsync('price'), b.sum('price')) };
+  await split.close(); await single.close();
+  out.innerHTML = `<p>CSV, ${R.csv.mb.toFixed(0)} MB: ${fmt(R.csv.split)} on ${split.size} workers, ${fmt(R.csv.single)} on 1 thread</p>`;
+}
+
+// Did the previous attempt at this step get the tab killed?
+let crashed = false;
+try {
+  crashed = sessionStorage.getItem('vectro-running') === step;
+  sessionStorage.setItem('vectro-running', step);
+} catch {}
+if (crashed) {
+  R.crashed = true;
+  R.stage = 'the tab was stopped during this step (probably out of memory)';
+  R.finished = true;
+  await report();
+  out.innerHTML = `<p class="bad">The phone stopped the tab during "${step}". Skipping it.</p>`;
+  setTimeout(next, 1500);
+} else {
+  try {
+    if (step === 'checks') await checks();
+    else if (step === 'csv') await csvStep();
+    else await speed(Number(step));
+    R.finished = true;
+    await stage('finished');
+  } catch (err) {
+    R.error = String(err?.stack ?? err);
+    R.finished = true;
+    out.insertAdjacentHTML('beforeend', `<pre class="bad">${R.error}</pre>`);
+    await stage('failed');
+  }
+  setTimeout(next, 800);
+}
+</script>
+</body>
+</html>

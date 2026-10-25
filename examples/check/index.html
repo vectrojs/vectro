@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vectro browser check</title>
+<style>
+  :root { --ink: #1b2430; --muted: #5b6573; --line: #d9dee5; --ok: #0f766e; --bad: #b45309; --bg: #fff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ink: #e6edf3; --muted: #9aa3ae; --line: #30363d; --ok: #3fb9a8; --bad: #f0a35e; --bg: #0d1117; } }
+  body { font: 15px/1.5 -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); background: var(--bg); max-width: 920px; margin: 24px auto; padding: 0 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 20px; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  pre { white-space: pre-wrap; font-size: 12px; }
+  .ok { color: var(--ok); font-weight: 600; } .bad { color: var(--bad); font-weight: 600; } .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>vectro: browser check</h1>
+<p class="muted">Runs the same queries on every engine this browser supports and compares each answer with Node's (expected.json). Random expressions are also checked against a plain JavaScript interpreter.</p>
+<p id="status">Running…</p>
+<div id="out"></div>
+<script type="module">
+import { Engine as ThreadedEngine, SplitEngine, threadsAvailable, canCompileWasm } from '../../src/browser.mjs';
+import { Engine as SingleEngine } from '../../src/portable.mjs';
+import { asyncEngine, queryCases, fuzzCases } from './cases.mjs';
+
+const status = document.getElementById('status'), out = document.getElementById('out');
+const R = { env: {}, engines: [] };
+window.__results = R;
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+
+try {
+  const simd = WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]));
+  R.env = {
+    userAgent: navigator.userAgent,
+    cores: navigator.hardwareConcurrency,
+    crossOriginIsolated: self.crossOriginIsolated,
+    SharedArrayBuffer: typeof SharedArrayBuffer === 'function',
+    'Atomics.waitAsync': typeof Atomics?.waitAsync === 'function',
+    'WebAssembly SIMD': simd,
+    'compile WebAssembly at runtime': canCompileWasm(),
+    'module workers': await new Promise((resolve) => {
+      try {
+        const w = new Worker(URL.createObjectURL(new Blob(['export {}; postMessage(1)'], { type: 'text/javascript' })), { type: 'module' });
+        w.onmessage = () => { w.terminate(); resolve(true); };
+        w.onerror = () => resolve(false);
+        setTimeout(() => resolve(false), 3000);
+      } catch { resolve(false); }
+    }),
+  };
+  const expected = await (await fetch('./expected.json')).json();
+
+  const engines = [['1 thread', () => new SingleEngine(), false]];
+  if (threadsAvailable()) engines.push(['shared threads', () => new ThreadedEngine(), false]);
+  engines.push([`split tables, ${navigator.hardwareConcurrency || 4} workers`, () => new SplitEngine(), true]);
+  engines.push(['split tables, 3 workers', () => new SplitEngine({ workers: 3 }), true]);
+
+  for (const [name, make, isSplit] of engines) {
+    const row = { name, checks: 0, failures: [] };
+    R.engines.push(row);
+    const t0 = performance.now();
+    let e;
+    try {
+      e = make();
+      row.threads = e.size ?? (e.workers?.length ?? 0) + 1;
+      const eng = isSplit ? e : asyncEngine(e);
+      const got = await queryCases(eng, (label) => { status.textContent = `${name}: ${label}`; });
+      for (const k in expected) {
+        row.checks++;
+        if (got[k] !== expected[k]) row.failures.push(`${k}: got ${String(got[k]).slice(0, 160)} want ${expected[k].slice(0, 160)}`);
+      }
+      const fz = await fuzzCases(eng, { onProgress: (label) => { status.textContent = `${name}: ${label}`; } });
+      row.checks += fz.checks;
+      row.failures.push(...fz.failures);
+    } catch (err) {
+      row.failures.push(`threw: ${err?.stack ?? err}`);
+    }
+    row.ms = performance.now() - t0;
+    try { await e?.close(); } catch {}
+  }
+
+  const yes = (v) => `<span class="${v ? 'ok' : 'bad'}">${v ? 'yes' : 'no'}</span>`;
+  out.innerHTML = `
+    <table><tr><th>Feature</th><th></th></tr>
+      ${Object.entries(R.env).map(([k, v]) => `<tr><td>${k}</td><td>${typeof v === 'boolean' ? yes(v) : esc(v)}</td></tr>`).join('')}</table>
+    <table><tr><th>Engine</th><th class="n">checks</th><th class="n">failures</th><th class="n">time</th></tr>
+      ${R.engines.map((r) => `<tr><td>${esc(r.name)}</td><td class="n">${r.checks}</td><td class="n ${r.failures.length ? 'bad' : 'ok'}">${r.failures.length}</td><td class="n">${(r.ms / 1000).toFixed(1)} s</td></tr>`).join('')}</table>
+    ${R.engines.filter((r) => r.failures.length).map((r) => `<h3>${esc(r.name)}</h3><pre class="bad">${esc(r.failures.join('\n'))}</pre>`).join('')}`;
+  R.ok = R.engines.every((r) => !r.failures.length && r.checks > 0);
+  status.innerHTML = R.ok ? '<span class="ok">All engines match Node.</span>' : '<span class="bad">Some engines failed.</span>';
+} catch (err) {
+  R.error = String(err?.stack ?? err);
+  out.innerHTML = `<pre class="bad">${esc(R.error)}</pre>`;
+  status.textContent = 'Failed.';
+}
+R.done = true;
+const reportName = new URLSearchParams(location.search).get('report');
+if (reportName) fetch(`/report?name=${encodeURIComponent(reportName)}`, { method: 'POST', body: JSON.stringify(R) });
+</script>
+</body>
+</html>

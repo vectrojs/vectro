@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vectro browser threads</title>
+<style>
+  :root { --ink: #1b2430; --muted: #5b6573; --line: #d9dee5; --ok: #0f766e; --bad: #b45309; --bg: #fff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ink: #e6edf3; --muted: #9aa3ae; --line: #30363d; --ok: #3fb9a8; --bad: #f0a35e; --bg: #0d1117; } }
+  body { font: 15px/1.5 -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); background: var(--bg); max-width: 920px; margin: 24px auto; padding: 0 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 20px; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); font-weight: 600; } .bad { color: var(--bad); font-weight: 600; } .muted { color: var(--muted); }
+  #spinner { display: inline-block; width: 14px; height: 14px; border: 3px solid var(--line); border-top-color: var(--ok); border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -2px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<h1>vectro: browser threads</h1>
+<p class="muted">Served with cross-origin isolation headers, so the page has SharedArrayBuffer and the engine runs Web Workers on every core.</p>
+<p><span id="spinner"></span> <span id="status">Running…</span></p>
+<div id="out"></div>
+<script type="module">
+import { Engine, threadsAvailable } from '../../src/browser.mjs';
+import { Engine as SingleEngine } from '../../src/portable.mjs';
+
+const out = document.getElementById('out'), status = document.getElementById('status');
+const R = { env: {}, checks: {}, timings: [], frames: [] };
+window.__results = R;
+const fmt = (ms) => (ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : `${ms.toFixed(1)} ms`);
+const tick = () => new Promise((r) => setTimeout(r, 0));
+async function best(f, reps = 5) { await f(); let m = Infinity; for (let i = 0; i < reps; i++) { const s = performance.now(); await f(); m = Math.min(m, performance.now() - s); } return m; }
+const close = (a, b) => (Array.isArray(a) ? a.every((x, i) => close(x, b[i])) : Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(b)));
+
+try {
+  const threaded = new Engine();
+  const single = new SingleEngine();
+  R.env = { crossOriginIsolated: self.crossOriginIsolated, SharedArrayBuffer: typeof SharedArrayBuffer, threadsAvailable: threadsAvailable(), workers: threaded.W, cores: navigator.hardwareConcurrency };
+  status.textContent = `Generating 10,000,000 rows… (${threaded.W} workers)`;
+  await tick();
+
+  const N = 10_000_000, REG = ['EU', 'US', 'APAC', 'LATAM', 'MEA', 'UK', 'CA', 'ANZ'];
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const price = new Float64Array(N), qty = new Float64Array(N), cust = new Float64Array(N), reg = new Uint8Array(N);
+  for (let i = 0; i < N; i++) { price[i] = Math.round(rnd() * 1e5) / 100; qty[i] = 1 + Math.floor(rnd() * 9); cust[i] = Math.floor(rnd() * 100_000); reg[i] = Math.floor(rnd() * 8); }
+  const region = Array.from(reg, (r) => REG[r]);
+  const tT = threaded.table({ price, qty, cust, region });
+  const tS = single.table({ price, qty, cust, region });
+
+  // plain JavaScript reference answers
+  const js = {
+    revenue: () => { let s = 0; for (let i = 0; i < N; i++) if (price[i] > 100 && qty[i] < 5) s += price[i] * qty[i]; return s; },
+    dashboard: () => { let n = 0, s = 0, r = 0; for (let i = 0; i < N; i++) if (reg[i] === 0) { n++; s += price[i]; r += price[i] * qty[i]; } return [n, s / n, r]; },
+    group: () => { const r = new Float64Array(8); for (let i = 0; i < N; i++) r[reg[i]] += price[i] * qty[i]; return REG.map((_, k) => r[k]); },
+    derive: () => { const o = new Float64Array(N); for (let i = 0; i < N; i++) o[i] = price[i] * qty[i]; return o.length; },
+  };
+  const groupRows = (rows) => REG.map((g) => rows.find((x) => x.region === g)?.rev ?? 0);
+  const Q = {
+    revenue: { a: () => tT.filter('price > 100 && qty < 5').sumAsync('price * qty'), s: () => tS.filter('price > 100 && qty < 5').sum('price * qty') },
+    dashboard: { a: async () => Object.values(await tT.filter("region == 'EU'").aggAsync({ n: 'count()', avg: 'mean(price)', rev: 'sum(price * qty)' })), s: () => Object.values(tS.filter("region == 'EU'").agg({ n: 'count()', avg: 'mean(price)', rev: 'sum(price * qty)' })) },
+    group: { a: async () => { const g = await tT.groupBy('region').aggAsync({ rev: 'sum(price * qty)' }); const r = groupRows(await g.toRowsAsync()); g.dispose(); return r; }, s: () => { const g = tS.groupBy('region').agg({ rev: 'sum(price * qty)' }); const r = groupRows(g.toRows()); g.dispose(); return r; } },
+    derive: { a: async () => { const d = await tT.deriveAsync('rev', 'price * qty'); const n = d.length; d.dispose(); return n; }, s: () => { const d = tS.derive('rev', 'price * qty'); const n = d.length; d.dispose(); return n; } },
+  };
+
+  status.textContent = 'Checking answers…';
+  await tick();
+  for (const [name, q] of Object.entries(Q)) {
+    const want = js[name](), threads = await q.a(), one = q.s();
+    R.checks[name] = close(threads, want) && close(one, want);
+  }
+  // the sync API on the threaded engine runs on the page's thread only
+  R.checks.syncOnThreadedEngine = close(tT.filter('price > 100 && qty < 5').sum('price * qty'), js.revenue());
+
+  status.textContent = 'Timing…';
+  await tick();
+  for (const [name, q] of Object.entries(Q)) {
+    R.timings.push({ query: name, threads: await best(q.a), single: await best(q.s), js: await best(js[name]) });
+  }
+
+  // Responsiveness: how often the page's main thread got a turn during a
+  // batch of 40 heavy queries. A MessageChannel ping-pong counts event-loop
+  // turns (unlike animation frames, it isn't paused when the tab is hidden);
+  // the longest gap is how long a click or scroll would have waited.
+  async function framesDuring(work) {
+    const ch = new MessageChannel();
+    let turns = 0, running = true, last = performance.now(), worst = 0;
+    ch.port1.onmessage = () => {
+      const now = performance.now();
+      worst = Math.max(worst, now - last);
+      last = now;
+      turns++;
+      if (running) ch.port2.postMessage(0);
+    };
+    ch.port2.postMessage(0);
+    const s = performance.now();
+    await work();
+    const ms = performance.now() - s;
+    running = false;
+    worst = Math.max(worst, performance.now() - last);
+    ch.port1.close();
+    return { ms, frames: turns, fps: worst };
+  }
+  const batch = 10;
+  status.textContent = 'Measuring responsiveness…';
+  await tick();
+  R.frames.push({ mode: `async API, ${threaded.W} workers`, ...(await framesDuring(async () => { for (let i = 0; i < batch; i++) for (const q of Object.values(Q)) await q.a(); })) });
+  R.frames.push({ mode: 'sync API, 1 thread', ...(await framesDuring(async () => { for (let i = 0; i < batch; i++) for (const q of Object.values(Q)) q.s(); })) });
+
+  // CSV: parse 2M rows with workers vs one thread
+  const lines = ['price,qty,region'];
+  for (let i = 0; i < 2_000_000; i++) lines.push(`${price[i]},${qty[i]},${region[i]}`);
+  const csv = new TextEncoder().encode(lines.join('\n'));
+  let a, b;
+  const csvThreads = await best(async () => { a?.dispose(); a = await threaded.parseCSVAsync(csv); }, 2);
+  const csvSingle = await best(async () => { b?.dispose(); b = single.parseCSV(csv); }, 2);
+  R.csv = { mb: csv.length / 1e6, threads: csvThreads, single: csvSingle, same: a.length === b.length && close(await a.sumAsync('price'), b.sum('price')) };
+
+  const ok = (v) => `<span class="${v ? 'ok' : 'bad'}">${v ? 'yes' : 'NO'}</span>`;
+  out.innerHTML = `
+    <table><tr><th>Environment</th><th></th></tr>
+      <tr><td>crossOriginIsolated</td><td>${R.env.crossOriginIsolated}</td></tr>
+      <tr><td>SharedArrayBuffer</td><td>${R.env.SharedArrayBuffer}</td></tr>
+      <tr><td>Web Workers running the engine</td><td>${R.env.workers} (${R.env.cores} cores)</td></tr></table>
+    <table><tr><th>10M rows</th><th class="n">async, ${R.env.workers} workers</th><th class="n">1 thread</th><th class="n">plain JS loop</th><th>correct</th></tr>
+      ${R.timings.map((t) => `<tr><td>${t.query}</td><td class="n">${fmt(t.threads)}</td><td class="n">${fmt(t.single)}</td><td class="n">${fmt(t.js)}</td><td>${ok(R.checks[t.query])}</td></tr>`).join('')}
+      <tr><td>parse CSV (${R.csv.mb.toFixed(0)} MB, 2M rows)</td><td class="n">${fmt(R.csv.threads)}</td><td class="n">${fmt(R.csv.single)}</td><td class="n">–</td><td>${ok(R.csv.same)}</td></tr></table>
+    <table><tr><th>40 heavy queries</th><th class="n">time</th><th class="n">page got a turn</th><th class="n">longest wait for the page</th></tr>
+      ${R.frames.map((f) => `<tr><td>${f.mode}</td><td class="n">${fmt(f.ms)}</td><td class="n">${f.frames.toLocaleString()} times</td><td class="n">${fmt(f.fps)}</td></tr>`).join('')}</table>
+    <p class="muted">Sync API on the threaded engine (runs on the page's thread): ${ok(R.checks.syncOnThreadedEngine)}</p>`;
+  status.textContent = 'Done.';
+} catch (err) {
+  R.error = String(err?.stack ?? err);
+  out.innerHTML = `<pre class="bad">${R.error}</pre>`;
+  status.textContent = 'Failed.';
+}
+R.done = true;
+R.userAgent = navigator.userAgent;
+const reportName = new URLSearchParams(location.search).get('report');
+if (reportName) fetch(`/report?name=${encodeURIComponent(reportName)}`, { method: 'POST', body: JSON.stringify(R) });
+</script>
+</body>
+</html>

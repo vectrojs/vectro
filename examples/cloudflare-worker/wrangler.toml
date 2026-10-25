@@ -1,0 +1,4 @@
+name = "vectro-demo"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+# No nodejs_compat needed: the portable engine uses no Node APIs.

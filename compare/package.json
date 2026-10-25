@@ -1,0 +1,16 @@
+{
+  "name": "vectro-compare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Benchmarks Vectro against Arquero, DuckDB and SQLite (node:sqlite)",
+  "scripts": {
+    "bench": "node --max-old-space-size=8192 bench.mjs",
+    "bench:csv": "node --max-old-space-size=12000 bench-csv.mjs",
+    "bench:sqlite": "node --max-old-space-size=12000 bench-sqlite.mjs"
+  },
+  "devDependencies": {
+    "@duckdb/node-api": "2.0.0-r.1",
+    "arquero": "8.0.3"
+  }
+}

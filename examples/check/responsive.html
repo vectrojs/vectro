@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vectro responsiveness</title>
+<style>
+  body { font: 15px/1.5 -apple-system, Helvetica, Arial, sans-serif; max-width: 920px; margin: 24px auto; padding: 0 16px; }
+  pre { font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>vectro: where does the page wait?</h1>
+<p id="status">Running…</p>
+<pre id="out"></pre>
+<script type="module">
+// Measures, per query, how long the page's event loop is kept waiting while
+// the async API runs. A MessageChannel ping-pong counts turns; the worst gap
+// between two turns is the longest the page could not respond.
+import { Engine, SplitEngine, threadsAvailable } from '../../src/browser.mjs';
+
+const params = new URLSearchParams(location.search);
+const R = { userAgent: navigator.userAgent, mode: threadsAvailable() ? 'shared threads' : 'split tables', rows: [] };
+const status = document.getElementById('status'), out = document.getElementById('out');
+const N = Number(params.get('rows') ?? 2_000_000);
+
+async function turnsDuring(work, probe = 'message') {
+  const ch = new MessageChannel();
+  let turns = 0, running = true, last = performance.now(), worst = 0;
+  const gaps = [];
+  const beat = () => { const now = performance.now(); gaps.push(now - last); worst = Math.max(worst, now - last); last = now; turns++; if (running) next(); };
+  const next = probe === 'timeout' ? () => setTimeout(beat, 0) : probe === 'raf' ? () => requestAnimationFrame(beat) : () => ch.port2.postMessage(0);
+  ch.port1.onmessage = beat;
+  next();
+  const s = performance.now();
+  await work();
+  const ms = performance.now() - s;
+  running = false;
+  worst = Math.max(worst, performance.now() - last);
+  ch.port1.close();
+  gaps.sort((a, b) => b - a);
+  return { ms: +ms.toFixed(2), turns, worst: +worst.toFixed(2), top: gaps.slice(0, 5).map((g) => +g.toFixed(2)) };
+}
+
+try {
+  const opts = {};
+  if (params.get('spin')) opts.spin = Number(params.get('spin'));
+  if (params.get('threads')) opts.threads = Number(params.get('threads'));
+  R.opts = opts;
+  const engine = threadsAvailable() ? new Engine(opts) : new SplitEngine();
+  const REG = ['EU', 'US', 'APAC', 'LATAM', 'MEA', 'UK', 'CA', 'ANZ'];
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const price = new Float64Array(N), qty = new Float64Array(N), region = [];
+  for (let i = 0; i < N; i++) { price[i] = Math.round(rnd() * 1e5) / 100; qty[i] = 1 + Math.floor(rnd() * 9); region.push(REG[Math.floor(rnd() * 8)]); }
+  const t = engine instanceof SplitEngine ? await engine.tableAsync({ price, qty, region }) : engine.table({ price, qty, region });
+
+  const Q = {
+    'idle (setTimeout 20 ms)': () => new Promise((r) => setTimeout(r, 20)),
+    'idle (10 awaited worker round trips)': null,
+    revenue: () => t.filter('price > 100 && qty < 5').sumAsync('price * qty'),
+    dashboard: () => t.filter("region == 'EU'").aggAsync({ n: 'count()', avg: 'mean(price)', rev: 'sum(price * qty)' }),
+    group: async () => (await t.groupBy('region').aggAsync({ rev: 'sum(price * qty)' })).dispose?.(),
+    derive: async () => { const d = await t.deriveAsync('rev', 'price * qty'); await d.dispose(); },
+  };
+  // a tiny query: measures the cost of one async round trip to the workers
+  Q['idle (10 awaited worker round trips)'] = async () => { for (let i = 0; i < 10; i++) await t.filter('price < 0').countAsync(); };
+  if (params.get('more')) {
+    Q['sum(price)'] = () => t.sumAsync('price');
+    Q['filter matches none: count'] = () => t.filter('price < 0').countAsync();
+    Q['filter matches all: count'] = () => t.filter('price > -1').countAsync();
+    Q['filter matches none: sum'] = () => t.filter('price < 0').sumAsync('price');
+    if (typeof SharedArrayBuffer === 'function') {
+      // bare Atomics.waitAsync: a worker bumps a counter and notifies after ~1 ms
+      const sab = new Int32Array(new SharedArrayBuffer(8));
+      const src = `onmessage = (e) => { const a = e.data; for (;;) { Atomics.wait(a, 1, Atomics.load(a, 1)); const t = performance.now(); while (performance.now() - t < 1); Atomics.add(a, 0, 1); Atomics.notify(a, 0); } };`;
+      const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      w.postMessage(sab);
+      await new Promise((r) => setTimeout(r, 50));
+      Q['bare waitAsync round trip (worker busy 1 ms)'] = async () => {
+        const d = Atomics.load(sab, 0);
+        Atomics.add(sab, 1, 1); Atomics.notify(sab, 1);
+        while (Atomics.load(sab, 0) === d) { const r = Atomics.waitAsync(sab, 0, d); if (r.async) await r.value; }
+      };
+    }
+  }
+
+  const yieldTask = () => new Promise((r) => { const c = new MessageChannel(); c.port1.onmessage = () => { c.port1.close(); r(); }; c.port2.postMessage(0); });
+  const plans = params.get('probes')
+    ? Object.keys(Q).filter((k) => !k.startsWith('idle')).flatMap((k) => [[k, 'message', false], [k, 'timeout', false], [k, 'raf', false], [k, 'message', true]])
+    : Object.keys(Q).map((k) => [k, 'message', false]);
+  for (const [name, probe, yielding] of plans) {
+    const q = Q[name];
+    status.textContent = name;
+    await q(); await q(); // compile + warm up
+    const r = await turnsDuring(async () => { for (let i = 0; i < 10; i++) { await q(); if (yielding) await yieldTask(); } }, probe);
+    R.rows.push({ name: `${name} [${probe}${yielding ? ', yield between' : ''}]`, ...r });
+    out.textContent = JSON.stringify(R, null, 1);
+  }
+  status.textContent = 'Done.';
+} catch (err) {
+  R.error = String(err?.stack ?? err);
+  out.textContent = R.error;
+}
+R.done = true;
+if (params.get('report')) fetch(`/report?name=${encodeURIComponent(params.get('report'))}`, { method: 'POST', body: JSON.stringify(R) });
+</script>
+</body>
+</html>
