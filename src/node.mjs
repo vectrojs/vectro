@@ -65,3 +65,26 @@ export class Engine extends CoreEngine {
 
 export { canCompileWasm } from './engine.mjs';
 export { Table } from './table.mjs';
+
+// ---- split tables and streams: each worker thread owns its rows --------------
+//   import { SplitEngine } from 'vectro';
+//   const engine = new SplitEngine();               // one worker per core
+//   const live = await engine.streamAsync({ columns: { ts: 'number', region: 'category' } });
+import { SplitEngine as BaseSplitEngine } from './split.mjs';
+
+export function spawnSplitWorker() {
+  const w = new Worker(new URL('./split-worker-node.mjs', import.meta.url));
+  w.unref();
+  return {
+    post: (msg, transfer) => w.postMessage(msg, transfer ?? []),
+    onMessage: (fn) => w.on('message', fn),
+    onError: (fn) => { w.on('error', fn); w.on('exit', (code) => fn(new Error(`exited with code ${code}`))); },
+    terminate: () => w.terminate(),
+  };
+}
+
+export class SplitEngine extends BaseSplitEngine {
+  constructor(opts = {}) {
+    super({ workers: availableParallelism(), spawn: spawnSplitWorker, ...opts });
+  }
+}

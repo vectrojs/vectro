@@ -4,13 +4,15 @@
 import { Engine } from './engine.mjs';
 import { Table } from './table.mjs';
 import { parse } from './fuse.mjs';
+import { createStreams } from './stream-worker.mjs';
 
 export function serveSplitWorker(post, listen) {
   let engine;
   const tables = new Map(); // table id -> Table (this worker's slice)
+  const streams = createStreams(() => engine); // live streams (see stream-worker.mjs)
 
   const table = (id) => {
-    const t = tables.get(id);
+    const t = tables.get(id) ?? streams.view(id);
     if (!t) throw new Error(`vectro: no table ${id} in this worker`);
     return t;
   };
@@ -132,7 +134,10 @@ export function serveSplitWorker(post, listen) {
     toRows({ id, preds, limit, segs }) {
       return { rows: view(id, preds).toRows(limit), segs: segmentCounts(id, preds, segs, limit ?? Infinity) };
     },
+    ...streams.handlers,
+    streamSnapshot: (args) => streams.handlers.streamSnapshot({ ...args, tables }),
     dispose({ id }) {
+      if (streams.close(id)) return true;
       tables.get(id)?.dispose();
       tables.delete(id);
       return true;

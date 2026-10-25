@@ -185,6 +185,21 @@ export class SplitEngine {
     return new SplitTable(this, id, segs, { names: loaded[0].names, dicts, strings: new Set(loaded[0].strings) }, [], {}, true);
   }
 
+  // A live table fed by a stream of CSV lines (no header), spread over the
+  // workers. columns: { name: 'number' | 'category' } in the order of the
+  // fields in each line. keepRows: rows kept in total (the oldest are
+  // dropped); keepMs + timeColumn: keep rows newer than the newest time minus
+  // keepMs. Feed it with push() from here, or connect() each worker to its own
+  // TCP stream (Node), so the data never passes through this thread.
+  async streamAsync({ columns, keepRows = Infinity, keepMs = null, timeColumn = null } = {}) {
+    await this.ready;
+    if (!columns || !Object.keys(columns).length) throw new Error('vectro: streamAsync needs columns, e.g. { ts: "number", region: "category" }');
+    const id = ++this.nextTable;
+    const perWorker = Number.isFinite(keepRows) ? Math.ceil(keepRows / this.size) : Infinity;
+    await Promise.all(this.workers.map((_, w) => this._call(w, 'streamOpen', { id, columns, keepRows: perWorker, keepMs, timeColumn })));
+    return new StreamTable(this, id, Object.keys(columns));
+  }
+
   async close() {
     for (const w of this.workers) w.terminate();
     this.workers = [];
@@ -326,10 +341,12 @@ export class SplitTable {
         askKeys.forEach((k, j) => { acc[j][g] = COMBINE[fnOf[j]](acc[j][g], cols[k][r]); });
       }
     }
-    // Same group order as a normal table: dictionary order for text, ascending numbers.
+    // Same group order as a normal table: dictionary order for text, ascending
+    // numbers. Streams have no shared dictionary: their labels sort A to Z.
     const dict = this.meta.dicts[key];
     const rank = dict ? new Map(dict.map((s, i) => [s, i])) : null;
-    const order = keys.map((_, g) => g).sort((a, b) => (rank ? rank.get(keys[a]) - rank.get(keys[b]) : keys[a] - keys[b]));
+    const byLabel = !rank && typeof keys[0] === 'string';
+    const order = keys.map((_, g) => g).sort((a, b) => (rank ? rank.get(keys[a]) - rank.get(keys[b]) : byLabel ? (keys[a] < keys[b] ? -1 : keys[a] > keys[b] ? 1 : 0) : keys[a] - keys[b]));
     const col = (k) => order.map((g) => acc[askKeys.indexOf(k)][g]);
     const columns = { [key]: order.map((g) => keys[g]) };
     for (const { out, fn } of outs) {
@@ -373,4 +390,83 @@ export class SplitTable {
     this.owned = false;
     await this.#all('dispose', {});
   }
+}
+
+// A stream: queries see the rows each worker has parsed so far (call
+// flushAsync() first to include rows still waiting in a batch). Rows have no
+// global order across workers, so toRowsAsync returns worker 0's rows first.
+export class StreamTable extends SplitTable {
+  constructor(engine, id, names, preds = [], params = {}, owned = true) {
+    super(engine, id, engine.workers.map(() => Float64Array.of(Infinity)), { names, dicts: {}, strings: new Set() }, preds, params, owned);
+    this.partial = null;
+    this.next = 0; // worker for the next pushed chunk
+  }
+
+  get length() { return NaN; } // changes all the time: use countAsync()
+
+  // A filtered view of the live stream (still live).
+  filter(expr, params = {}) {
+    return new StreamTable(this.engine, this.id, this.meta.names, [...this.preds, { expr, params }], { ...this.params, ...params }, false);
+  }
+
+  async deriveAsync() {
+    throw new Error('vectro: deriveAsync needs fixed rows; call snapshotAsync() (or collectAsync()) on the stream first');
+  }
+
+  // Bytes of CSV lines (no header), cut anywhere. Whole lines go to the
+  // workers in turn; the promise resolves once the worker has queued them.
+  push(chunk) {
+    const bytes = typeof chunk === 'string' ? encode(chunk) : chunk;
+    const last = bytes.lastIndexOf(NL);
+    if (last === -1) { this.partial = this.partial ? join(this.partial, bytes) : Uint8Array.prototype.slice.call(bytes); return Promise.resolve(); }
+    const lines = this.partial ? join(this.partial, bytes.subarray(0, last + 1)) : Uint8Array.prototype.slice.call(bytes, 0, last + 1);
+    this.partial = last + 1 < bytes.length ? Uint8Array.prototype.slice.call(bytes, last + 1) : null;
+    const w = this.next;
+    this.next = (this.next + 1) % this.counts.length;
+    return this.engine._call(w, 'streamPush', { id: this.id, bytes: lines }, [lines.buffer]);
+  }
+
+  // Worker `worker` opens its own TCP connection and reads CSV lines from it.
+  connect(worker, { host = '127.0.0.1', port }) {
+    return this.engine._call(worker, 'streamConnect', { id: this.id, host, port });
+  }
+
+  // Parse whatever every worker has received; returns totals.
+  async flushAsync() {
+    if (this.partial) { const p = join(this.partial, Uint8Array.of(NL)); this.partial = null; await this.push(p); }
+    return total(await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamFlush', { id: this.id }))));
+  }
+
+  async statsAsync() {
+    return total(await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamStats', { id: this.id }))));
+  }
+
+  // A fixed copy of the rows kept right now (matching the filters, if any),
+  // as a normal split table.
+  async snapshotAsync() {
+    if (this.preds.length) return super.collectAsync();
+    const newId = ++this.engine.nextTable;
+    const counts = await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamSnapshot', { id: this.id, newId })));
+    return new SplitTable(this.engine, newId, counts.map((n) => Float64Array.of(n)), this.meta, [], {}, true);
+  }
+
+  async collectAsync() { return this.snapshotAsync(); }
+
+  async toRowsAsync(limit = Infinity) {
+    const parts = await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'toRows', { id: this.id, preds: this.preds, limit: Number.isFinite(limit) ? limit : undefined, segs: [Infinity] })));
+    return parts.flatMap((p) => p.rows).slice(0, limit);
+  }
+}
+
+function join(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+function total(list) {
+  const out = { rows: 0, rowsIn: 0, bytesIn: 0, batches: 0, unparsedBytes: 0, perWorker: list.map((s) => s.rows), errors: list.map((s) => s.error).filter(Boolean) };
+  for (const s of list) for (const k of ['rows', 'rowsIn', 'bytesIn', 'batches', 'unparsedBytes']) out[k] += s[k];
+  return out;
 }

@@ -35,6 +35,50 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   comparisons, `&& || !`, `? :`, `abs sqrt floor ceil min max`. There is no
   `eval`, so formulas typed by users or AI models are safe to run.
 
+## Streaming (prototype)
+
+A stream is a live table spread over split-table workers. Rows arrive as CSV
+lines and are parsed in 256 KB batches into growing columns. Queries are the
+same as for any split table.
+
+```js
+import { SplitEngine } from 'vectro';
+
+const engine = new SplitEngine({ workers: 7 });     // default: one worker per core
+const orders = await engine.streamAsync({
+  columns: { ts: 'number', price: 'number', qty: 'number', region: 'category' },
+  keepRows: 10_000_000,                              // or keepMs: 60_000, timeColumn: 'ts'
+});
+
+await Promise.all(engine.workers.map((_, w) =>      // each worker reads its own TCP stream...
+  orders.connect(w, { host: 'feed.internal', port: 9000 + w })));
+socket.on('data', (chunk) => orders.push(chunk));    // ...or push chunks from one connection
+
+await orders.groupBy('region').aggAsync({ revenue: 'sum(price * qty)' });
+const fixed = await orders.snapshotAsync();          // a fixed copy, for derive and toRows
+```
+
+- **Backpressure:** when a worker has more than 4 MB waiting to be parsed, it
+  pauses its socket (or delays its reply to `push`) until it's down to 1 MB.
+  TCP then slows the sender, so memory stays bounded.
+- **Queries go first:** parsing runs one batch per event-loop turn, so a query
+  waits for at most one batch.
+- **Kept rows:** `keepRows` (newest rows, split evenly over workers) or
+  `keepMs` with `timeColumn` (rows newer than the newest time minus `keepMs`).
+
+`npm run bench:stream` (M1 Pro, 7 workers, 10M rows kept, localhost TCP, a live
+query every 250 ms over every kept row):
+
+| Receiver | Rows/s taken in | Query median / max | Main thread stalled up to |
+|---|---|---|---|
+| Plain Node, 1 connection (split/Number parsing, a loop per query) | 3.2–3.3M | 19–20 / 23 ms | 40–41 ms |
+| Vectro, 1 connection, chunks pushed to workers | 17.0–17.5M | 13–14 / 22–32 ms | 6–9 ms |
+| Vectro, 1 connection per worker | 16.7–18.5M | 12–13 / 31–62 ms | 19–47 ms |
+
+The producer runs on the same machine, so all 8 cores are busy. With one
+connection per worker the main thread does almost nothing, yet the OS
+sometimes pauses it (the 19–47 ms stalls).
+
 ## Runtimes
 
 | Import | Where | How it runs |
@@ -89,5 +133,7 @@ answers.
 
 ## Not done yet
 
-Sort, top-k, joins, integer/date types, missing values, persistence and
-streaming. Memory is capped at 4 GB per engine and freed with `dispose()`.
+Sort, top-k, joins, integer/date types, missing values and persistence.
+Streams take CSV lines only (no JSON lines yet), connect over TCP in Node
+only (no WebSocket in browsers yet), and have no running totals or sliding
+windows beyond `keepRows`/`keepMs`. Memory is capped at 4 GB per engine and freed with `dispose()`.
