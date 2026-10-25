@@ -11,3 +11,5 @@
 //   const engine = new Engine({ wasmModule });
 export { Engine, canCompileWasm } from './engine.mjs';
 export { Table } from './table.mjs';
+
+export { VectorIndex } from './vectors.mjs';

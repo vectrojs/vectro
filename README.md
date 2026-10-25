@@ -41,6 +41,41 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   comparisons, `&& || !`, `? :`, `abs sqrt floor ceil min max`. There is no
   `eval`, so formulas typed by users or AI models are safe to run.
 
+## Vector search
+
+Exact nearest-neighbour search over embeddings, on every core, in any
+runtime (Node, browsers, edge), with filters on any other column:
+
+```js
+import { Engine, VectorIndex } from 'vectrojs';
+
+const index = await VectorIndex.create(new Engine(), {
+  vectors: embeddings,          // number[][] or one flat Float32Array
+  dim: 384,
+  metric: 'cosine',             // or 'dot', 'l2'
+  columns: { id: ids, title: titles, year: years },
+});
+await index.searchAsync(queryEmbedding, { k: 10, filter: 'year >= 2020' });
+// -> [{ id, title, year, score }, ...] best first
+```
+
+Embeddings are stored as float32 columns, the score is a fused expression
+computed 24 dimensions per pass with the query as scalars, and `top(k)` picks
+the best, so it reuses the compiled kernels, filters and split tables (pass a
+`SplitEngine` to use Web Workers on any page). It is exact, not approximate:
+no index to build or tune, results identical to brute force.
+
+`npm run bench:vectors` (M1 Pro, 384 dimensions, top 10, cosine; the machine
+was short of memory, so treat these as provisional):
+
+| Embeddings | Vectro | Plain JS loop (Float32Array) |
+|---|---|---|
+| 100,000 (154 MB) | 11.4 ms | 36.9 ms |
+| 200,000 (307 MB) | 16.2 ms | 75.4 ms |
+
+`table.select(...columns)` (a narrow view, no copy) and
+`splitTable.topAsync(k, by, { columns })` keep top-k cheap on wide tables.
+
 ## Streaming (prototype)
 
 A stream is a live table spread over split-table workers. Rows arrive as CSV

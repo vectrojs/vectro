@@ -90,3 +90,5 @@ export class SplitEngine extends BaseSplitEngine {
 
 export { canCompileWasm } from './engine.mjs';
 export { Table } from './table.mjs';
+
+export { VectorIndex } from './vectors.mjs';

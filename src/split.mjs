@@ -85,9 +85,10 @@ export class SplitEngine {
   }
 
   // Build a table from columns: { price: Float64Array | number[], region: string[] }.
+  // type: Float32Array stores every column as float32 (half the memory).
   // Text is encoded here once (codes + one dictionary), so only numbers travel
   // to the workers, moved without copying.
-  async tableAsync(columns) {
+  async tableAsync(columns, { type = Float64Array } = {}) {
     await this.ready;
     const entries = Object.entries(columns);
     const n = entries[0]?.[1].length ?? 0;
@@ -123,7 +124,7 @@ export class SplitEngine {
         }
         transfer.push(part.buffer);
       }
-      return this._call(w, 'loadEncoded', { id, order: entries.map(([name]) => name), numbers, text: textPart }, transfer);
+      return this._call(w, 'loadEncoded', { id, order: entries.map(([name]) => name), numbers, text: textPart, float32: type === Float32Array }, transfer);
     }));
     const dicts = Object.fromEntries(Object.entries(text).map(([name, t]) => [name, t.dict]));
     const names = entries.map(([name]) => name);
@@ -377,8 +378,9 @@ export class SplitTable {
   // The first k rows by `by` (see Table.top), as a normal table on the page:
   // every worker sends its own first k, and the page merges them. Rows that
   // tie on every key come in worker order.
-  async topAsync(k, by) {
-    const parts = await this.#all('top', { k, by });
+  // columns: return only these (and read only these), e.g. for wide tables.
+  async topAsync(k, by, { columns = null } = {}) {
+    const parts = await this.#all('top', { k, by, columns });
     const keys = parts[0]?.keys ?? [];
     const cand = [];
     parts.forEach((p, w) => p.rows.forEach((row, i) => cand.push({ row, w, i, vals: p.values.map((v) => v && v[i]) })));
@@ -399,8 +401,8 @@ export class SplitTable {
       return a.w - b.w || a.i - b.i;
     };
     const rows = cand.sort(cmp).slice(0, k).map((c) => c.row);
-    const columns = Object.fromEntries(this.meta.names.map((name) => [name, rows.map((r) => r[name])]));
-    return this.engine.local.table(columns);
+    const names = rows.length ? Object.keys(rows[0]) : (columns ?? this.meta.names);
+    return this.engine.local.table(Object.fromEntries(names.map((name) => [name, rows.map((r) => r[name])])));
   }
 
   // Each worker sends its first `limit` rows (in its order) and the matches

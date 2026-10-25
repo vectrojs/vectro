@@ -65,13 +65,14 @@ export function serveSplitWorker(post, listen) {
     },
     // Columns already encoded by the page: numbers, plus text as codes into a
     // shared dictionary (so nothing needs renumbering afterwards).
-    loadEncoded({ id, order, numbers, text }) {
-      const base = Object.keys(numbers).length ? engine.table(numbers) : null;
+    loadEncoded({ id, order, numbers, text, float32 = false }) {
+      const T = float32 ? Float32Array : Float64Array; // one number type per table
+      const base = Object.keys(numbers).length ? engine.table(numbers, { type: T }) : null;
       const cols = new Map();
       for (const name of order) {
         if (text[name]) {
           const { codes, dict } = text[name];
-          const data = engine.alloc(Float64Array, codes.length);
+          const data = engine.alloc(T, codes.length);
           data.set(codes);
           cols.set(name, { data, dict, codes: new Map(dict.map((v, i) => [v, i])), strings: null });
         } else {
@@ -134,8 +135,9 @@ export function serveSplitWorker(post, listen) {
     },
     // This worker's first k rows by `by`, with each expression key's values
     // (text keys are compared by label on the page).
-    top({ id, preds, k, by }) {
-      const t = view(id, preds).top(k, by);
+    top({ id, preds, k, by, columns = null }) {
+      const v = view(id, preds);
+      const t = (columns ? v.select(columns) : v).top(k, by);
       try {
         const keys = parseKeys(by, t.cols);
         const values = keys.map((key) => {

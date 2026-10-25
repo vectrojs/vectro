@@ -88,3 +88,5 @@ export class SplitEngine extends BaseSplitEngine {
     super({ workers: availableParallelism(), spawn: spawnSplitWorker, ...opts });
   }
 }
+
+export { VectorIndex } from './vectors.mjs';

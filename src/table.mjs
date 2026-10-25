@@ -356,6 +356,16 @@ export class Table {
     return new Table(engine, out, total, { owned: names });
   }
 
+  // A view with only some columns (no copy). Columns the filter reads stay
+  // available to it.
+  select(...names) {
+    const keep = new Set(names.flat());
+    for (const nm of keep) if (!this.cols.has(nm)) throw new Error(`vectro: no column "${nm}"`);
+    if (this.pred) walk(parse(this.pred), (m) => { if (m.t === 'var' && this.cols.has(m.name)) keep.add(m.name); });
+    const cols = new Map([...this.cols].filter(([nm]) => keep.has(nm)));
+    return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params });
+  }
+
   // ---- sorting ---------------------------------------------------------------
   // sort(by): a new table in order of `by` (a column, an expression, or a list;
   // "-" first means large to small; text sorts by label). Stable; NaN last.
@@ -433,7 +443,10 @@ export class Table {
     // filters "first key <= cutoff" on all threads; nothing else is stored.
     const S = 20_000, stride = Math.max(1, Math.floor(n / S));
     const picked = Uint32Array.from({ length: Math.ceil(n / stride) }, (_, i) => i * stride);
-    const sampleTable = this.#gather(picked, picked.length);
+    // copy only the columns the first key reads (a table can be very wide)
+    const used = new Set();
+    walk(parse(keys[0].text), (m) => { if (m.t === 'var' && this.cols.has(m.name)) used.add(m.name); });
+    const sampleTable = this.#gather(picked, picked.length, new Set(this.columnNames.filter((nm) => !used.has(nm))));
     let sample;
     try {
       const d = yield* sampleTable.#deriveG('__np_topkey', keys[0].text, {});
