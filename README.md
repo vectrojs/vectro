@@ -8,7 +8,7 @@ Cloudflare Workers, with no native addon, compiler or server.
 > Status: prototype (0.1.0). Not published yet. Formerly "nodeplus". MIT license.
 
 ```js
-import { Engine } from 'vectro';
+import { Engine } from 'vectrojs';
 
 const engine = new Engine();                         // all cores
 const orders = engine.readCSV('orders.csv');         // parsed in parallel
@@ -42,7 +42,7 @@ lines and are parsed in 256 KB batches into growing columns. Queries are the
 same as for any split table.
 
 ```js
-import { SplitEngine } from 'vectro';
+import { SplitEngine } from 'vectrojs';
 
 const engine = new SplitEngine({ workers: 7 });     // default: one worker per core
 const orders = await engine.streamAsync({
@@ -83,10 +83,10 @@ sometimes pauses it (the 19–47 ms stalls).
 
 | Import | Where | How it runs |
 |---|---|---|
-| `vectro` | Node | Worker threads on all cores, shared memory |
-| `vectro/browser` → `Engine` | Pages with COOP/COEP headers | Web Workers, shared memory (async API) |
-| `vectro/browser` → `SplitEngine` | Any page | Each Web Worker owns a share of the rows; async API |
-| `vectro/portable` | Cloudflare Workers and other edge runtimes | One thread; a precompiled 11 KB module plus a vectorized interpreter |
+| `vectrojs` | Node | Worker threads on all cores, shared memory |
+| `vectrojs/browser` → `Engine` | Pages with COOP/COEP headers | Web Workers, shared memory (async API) |
+| `vectrojs/browser` → `SplitEngine` | Any page | Each Web Worker owns a share of the rows; async API |
+| `vectrojs/portable` | Cloudflare Workers and other edge runtimes | One thread; a precompiled 11 KB module plus a vectorized interpreter |
 
 Tested in Node 25, Chrome, Safari 26.5, Firefox 158, Safari on iOS (real
 iPhone) and Cloudflare Workers.

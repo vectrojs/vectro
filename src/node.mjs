@@ -1,5 +1,5 @@
 // Node.js entry: the engine with worker threads on all cores, plus file reading.
-//   import { Engine } from 'vectro';   ->   new Engine()  (all cores)
+//   import { Engine } from 'vectrojs';   ->   new Engine()  (all cores)
 import { Worker, MessageChannel, receiveMessageOnPort } from 'node:worker_threads';
 import { availableParallelism } from 'node:os';
 import { openSync, fstatSync, readSync, closeSync } from 'node:fs';
@@ -67,7 +67,7 @@ export { canCompileWasm } from './engine.mjs';
 export { Table } from './table.mjs';
 
 // ---- split tables and streams: each worker thread owns its rows --------------
-//   import { SplitEngine } from 'vectro';
+//   import { SplitEngine } from 'vectrojs';
 //   const engine = new SplitEngine();               // one worker per core
 //   const live = await engine.streamAsync({ columns: { ts: 'number', region: 'category' } });
 import { SplitEngine as BaseSplitEngine } from './split.mjs';

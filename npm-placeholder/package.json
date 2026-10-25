@@ -1,10 +1,10 @@
 {
-  "name": "vectro",
+  "name": "vectrojs",
   "version": "0.0.1",
   "description": "Multi-core analytics engine for JavaScript (Node, browsers, edge). Coming soon.",
   "repository": {
     "type": "git",
-    "url": "https://github.com/vectrojs/vectro"
+    "url": "git+https://github.com/vectrojs/vectro.git"
   },
   "homepage": "https://github.com/vectrojs",
   "license": "MIT",

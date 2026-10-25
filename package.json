@@ -1,12 +1,12 @@
 {
-  "name": "vectro",
+  "name": "vectrojs",
   "version": "0.1.0",
   "description": "Multi-core analytics engine for JavaScript: columnar tables and fused SIMD WebAssembly kernels for Node, browsers and edge runtimes, with no native code.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/vectrojs/vectro"
+    "url": "git+https://github.com/vectrojs/vectro.git"
   },
   "keywords": [
     "analytics",

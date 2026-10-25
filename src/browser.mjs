@@ -7,7 +7,7 @@
 // (the page's main thread is not allowed to block and wait for workers).
 // Other pages get the single-thread engine, which needs no headers.
 //
-//   import { Engine } from 'vectro/browser';
+//   import { Engine } from 'vectrojs/browser';
 //   const engine = new Engine();
 //   const orders = await engine.loadCSV('/orders.csv');
 //   await orders.filter("region == 'EU'").sumAsync('price * qty');
@@ -57,7 +57,7 @@ export class Engine extends CoreEngine {
 // No shared memory: each Web Worker owns a slice of every table and answers
 // for it; the page combines the partial results (see split.mjs). Async API only.
 //
-//   import { SplitEngine } from 'vectro/browser';
+//   import { SplitEngine } from 'vectrojs/browser';
 //   const engine = new SplitEngine();                 // one worker per core
 //   const orders = await engine.loadCSV('/orders.csv');
 //   await orders.filter("region == 'EU'").sumAsync('price * qty');
