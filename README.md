@@ -234,9 +234,14 @@ query every 250 ms; the machine was busy, load average ~19, so CSV measured
 | | Rows/s |
 |---|---|
 | CSV lines, 7 workers (same busy machine) | 5.4–6.1M |
-| Emitter → 7 workers, end to end | 46–52M (the one-thread emitter is the limit) |
-| Emitter alone, labels as text / as codes | 21M / 52M |
-| Receivers alone (pre-encoded frames): 1 / 4 / 7 workers | 29M / 88M / 100M |
+| Emitter → 7 workers, end to end (Vectro frames or Arrow) | 63–78M |
+| Emitter alone (one thread, to a process that discards), labels as text / as codes | 22M / 113–117M |
+| Receivers alone (pre-encoded frames from one test thread): 1 / 4 / 7 workers | 29M / 88M / 100M+ |
+
+One sender thread is enough on one machine: frames are built without zero-filling
+and category codes pass straight through, so it outruns the receivers. Sender
+threads behind one redirecting port were tried (branch `experiment/threaded-emitter`)
+and measured no gain.
 
 ## Apache Arrow
 
@@ -271,7 +276,7 @@ const orders = await split.streamAsync({ format: 'arrow', columns: { ts: 'number
   and pandas read Vectro's files back exactly.
 - **Speed** (M1 Pro, busy machine): a 10M-row, 5-column Feather file loads in
   ~0.43 s uncompressed and ~1.1 s with LZ4 (pyarrow, with native threads:
-  0.16 s / 0.07 s). Arrow streams from the Emitter: 56–62M rows/s into 7
+  0.16 s / 0.07 s). Arrow streams from the Emitter: 71–75M rows/s into 7
   workers, the same as Vectro frames. ZSTD-compressed files aren't supported yet.
 
 ## Runtimes

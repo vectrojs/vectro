@@ -111,6 +111,17 @@ for (let trial = 0; trial < 40; trial++) {
   }
 }
 
+// output comes from memory that isn't zero-filled: the bytes must not depend
+// on what that memory held before (padding is written, not left over)
+{
+  const cols = { x: Float64Array.of(1, 2, 3), r: ['a', 'bb', 'ccc'], f: Float32Array.of(1, 2, 3) };
+  const outs = [0xab, 0xcd, 0x5a].map((junk) => {
+    for (let i = 0; i < 20; i++) globalThis.Buffer.allocUnsafeSlow(4096).fill(junk);
+    return Buffer.from(writeArrow(cols, { file: true })).toString('hex');
+  });
+  checks++; if (outs[0] !== outs[1] || outs[1] !== outs[2]) fail('Arrow output depends on leftover memory');
+}
+
 // an encoder sends labels once, as delta dictionaries, batch after batch
 {
   const e = new ArrowEncoder({ region: 'category', x: 'number' });
