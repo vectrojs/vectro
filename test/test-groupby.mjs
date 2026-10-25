@@ -101,5 +101,51 @@ for (const [label, make] of engines) {
   await t.dispose?.();
   await e.close();
 }
+// Big tables: every thread inserts into one shared hash table at once.
+// Few keys (threads race for the same slots), many keys, a table that starts
+// too small (grows and runs again), two keys, float32.
+{
+  const M = 400_000;
+  const few = Float64Array.from({ length: M }, (_, i) => [1.5, -0, 0, NaN, 2 ** 40][i % 5]);
+  const many = Float64Array.from({ length: M }, (_, i) => 1e12 + ((i * 7919) % 300_007) * 0.5);
+  const other = Float64Array.from({ length: M }, (_, i) => (i * 31) % 17);
+  const val = Float64Array.from({ length: M }, (_, i) => (i % 101) - 50);
+  const ref = (keyOf) => {
+    const m = new Map();
+    for (let i = 0; i < M; i++) { const k = keyOf(i); const g = m.get(k) ?? m.set(k, [0, 0]).get(k); g[0]++; g[1] += val[i]; }
+    return m;
+  };
+  const norm = (x) => (Object.is(x, -0) ? 0 : Number.isNaN(x) ? 'NaN' : x);
+  const cases = [
+    ['few keys, contention', ['few'], (i) => String(norm(few[i])), (r) => String(norm(r.few))],
+    ['300K keys', ['many'], (i) => String(many[i]), (r) => String(r.many)],
+    ['300K keys, table starts tiny', ['many'], (i) => String(many[i]), (r) => String(r.many), 16],
+    ['two keys', ['other', 'many'], (i) => `${other[i]}|${many[i]}`, (r) => `${r.other}|${r.many}`],
+  ];
+  for (const [label, make] of [['threads', () => new Engine()], ['threads, float32', () => new Engine()], ['single thread', () => new Engine({ threads: 1 })]]) {
+    const e = make();
+    const f32 = label.includes('float32');
+    const t = e.table({ few, many: f32 ? many.map((x) => (x - 1e12) * 2) : many, other, val }, f32 ? { type: Float32Array } : {});
+    for (const ranged of [false, true]) {
+      e._bigGroupSlots = ranged ? 1 : undefined; // ranged: each thread adds up its own range of groups
+      for (const [name, keys, keyOf, rowKey, start] of cases) {
+        const want = ref(f32 && keys.includes('many') ? (i) => keyOf(i).replace(String(many[i]), String((many[i] - 1e12) * 2)) : keyOf);
+        e._hashLimit = start;
+        const g = t.groupBy(keys.length === 1 ? keys[0] : keys).agg({ n: 'count()', s: 'sum(val)' }).toRows();
+        e._hashLimit = undefined;
+        checks++;
+        const bad = g.length !== want.size ? `${g.length} groups, want ${want.size}` : g.find((r) => { const w = want.get(rowKey(r)); return !w || w[0] !== r.n || w[1] !== r.s; });
+        if (bad) fail(`${label}${ranged ? ' (ranged)' : ''} ${name}: ${typeof bad === 'string' ? bad : JSON.stringify(bad)}`);
+      }
+      // a filter on the direct path with many groups, ranged too
+      const g = t.filter('val > 0').groupBy('other').agg({ n: 'count()' }).toRows();
+      let want = 0;
+      for (let i = 0; i < M; i++) if (val[i] > 0) want++;
+      checks++; if (g.reduce((a, r) => a + r.n, 0) !== want) fail(`${label}${ranged ? ' (ranged)' : ''} filtered direct groups`);
+    }
+    e._bigGroupSlots = undefined;
+    await e.close();
+  }
+}
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} group-by checks passed`);
 process.exit(failures ? 1 : 0);

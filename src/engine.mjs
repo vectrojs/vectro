@@ -607,6 +607,27 @@ export class Engine {
     };
   }
 
+  // Group-by kernel split by group ranges (see runGroupRange): one set of
+  // accumulators at accBase, J blocks of K slots.
+  *_groupRangeG(v, n, arrays, scalars, accBase, K) {
+    arrays = arrays.map((a) => this.live(a));
+    if (this.#serial(OP.FUSED, n, this.kernels)) {
+      v.fn(...arrays.map((a) => a.byteOffset), n, accBase, K, 0, K, ...scalars);
+      return;
+    }
+    yield {
+      op: OP.GROUP_RANGE, n, arrays, F: v.fn,
+      setup: () => {
+        const ns = scalars.length;
+        for (let j = 0; j < ns; j++) this.sc[j] = scalars[j];
+        this.sc[ns] = accBase;
+        this.sc[ns + 1] = K;
+        this.ctrl[C.KERNEL] = v.id;
+        this.ctrl[C.NSCAL] = ns;
+      },
+    };
+  }
+
   // Compact kernel; offsets[u] is where unit u starts writing. units must
   // match the counting pass (1 = it ran on the calling thread alone).
   *_compactG(v, n, src, dst, offsets, scalars, units) {

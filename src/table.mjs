@@ -8,7 +8,7 @@
 import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
 import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
 import { parse, toSource, walk, analyze, isMask } from './fuse.mjs';
-import { generateGroupBy, generateCompact } from './table-kernels.mjs';
+import { generateGroupBy, generateCompact, generateHashGroups } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
@@ -253,7 +253,7 @@ export class Table {
     // Hash path: keep the matching rows, number their distinct keys 0..K-1
     // (in order of first appearance), then group by that number.
     const t = yield* this.#collectG();
-    const ids = t.#hashGroups(keys);
+    const ids = this.engine.jit && t.n >= 4096 ? yield* t.#hashGroupsParallelG(keys) : t.#hashGroups(keys);
     try {
       return yield* t.#runGroupsG(keys, ids, items, merged);
     } finally {
@@ -289,12 +289,14 @@ export class Table {
       }
       return out;
     };
-    if (keys.length === 1) return { K, data: this.cols.get(keys[0]).data, values, owned: false, sorted: true };
+    const below = sizes.map((_, k) => sizes.slice(k + 1).reduce((a, b) => a * b, 1));
+    const sortKey = (g, k) => Math.floor(g / below[k]) % sizes[k];
+    if (keys.length === 1) return { K, data: this.cols.get(keys[0]).data, values, sortKey, owned: false, sorted: true };
     let expr = keys[0];
     for (let k = 1; k < keys.length; k++) expr = `(${expr}) * ${sizes[k]} + ${keys[k]}`;
     const data = engine.alloc(this.type, this.n);
     yield* engine.evalG(expr, this.#vars({}), data);
-    return { K, data, values, owned: true, sorted: true };
+    return { K, data, values, sortKey, owned: true, sorted: true };
   }
 
   // Number each row's distinct key (tuple) with a hash table: { K, data
@@ -359,6 +361,65 @@ export class Table {
     return { K, data, values, sortKey, owned: true, sorted: false };
   }
 
+  // The same numbering on every thread at once (see generateHashGroups): one
+  // shared table, sized from an estimate of the number of groups (Chao1 on a
+  // sample of rows); if more groups turn up, again with a bigger table.
+  // Group numbers follow first arrival, not row order (any order is fine:
+  // the groups are sorted by key afterwards).
+  *#hashGroupsParallelG(keys) {
+    const { engine, n } = this;
+    const nk = keys.length, t = this.type === Float32Array ? 'f32' : 'f64';
+    const cols = keys.map((k) => this.cols.get(k).data);
+    let limit = Math.min(n, engine._hashLimit ?? this.#estimateGroups(cols)); // (_hashLimit: tests)
+    if (t === 'f32') limit = Math.min(limit, 2 ** 24);
+    const cacheKey = `hashgroups|${t}|${nk}`;
+    engine._tableKernels ??= new Map();
+    let v = engine._tableKernels.get(cacheKey);
+    if (!v) { v = engine._register(generateHashGroups(t, nk, engine.isShared)); engine._tableKernels.set(cacheKey, v); }
+    for (;;) {
+      let cap = 1024;
+      while (cap < limit * 2) cap *= 2;
+      const slots = engine.alloc(Int32Array, cap), keyBits = engine.alloc(Float64Array, limit * nk), counter = engine.alloc(Int32Array, 4);
+      const data = engine.alloc(this.type, n);
+      engine.live(slots).fill(-1);
+      engine.live(counter)[0] = 0;
+      let overflow, K;
+      try {
+        const { parts } = yield* engine._fusedG(v, n, [...cols, data], [engine.live(slots).byteOffset, cap - 1, engine.live(keyBits).byteOffset, limit, engine.live(counter).byteOffset], 1);
+        K = engine.live(counter)[0];
+        overflow = parts.some((x) => x !== 0) || K > limit;
+      } catch (err) { engine.free(data); engine.free(keyBits); throw err; } finally { engine.free(slots); engine.free(counter); }
+      if (overflow) {
+        engine.free(keyBits); engine.free(data);
+        if (limit >= n || (t === 'f32' && limit >= 2 ** 24)) throw new Error('vectro: groupBy hash table overflowed'); // can't happen: at most n groups
+        limit = Math.min(n, limit * 4);
+        continue;
+      }
+      const kv = Float64Array.from(engine.live(keyBits).subarray(0, K * nk));
+      engine.free(keyBits);
+      const dicts = keys.map((k) => this.cols.get(k).dict);
+      const values = (g) => keys.map((_, k) => (dicts[k] ? dicts[k][kv[g * nk + k]] : kv[g * nk + k]));
+      return { K, data, values, sortKey: (g, k) => kv[g * nk + k], owned: true, sorted: false };
+    }
+  }
+
+  // Estimated number of distinct keys (tuples), from up to 65,536 sampled
+  // rows: Chao1 = seen + once^2 / (2 * twice); plenty of room is cheap.
+  #estimateGroups(cols) {
+    const live = cols.map((c) => this.engine.live(c));
+    const m = Math.min(this.n, 65_536), step = this.n / m;
+    const counts = new Map();
+    for (let j = 0; j < m; j++) {
+      const i = Math.floor(j * step);
+      const key = live.length === 1 ? live[0][i] : live.map((c) => c[i]).join(',');
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    let once = 0, twice = 0;
+    for (const c of counts.values()) { if (c === 1) once++; else if (c === 2) twice++; }
+    const est = counts.size + (twice ? (once * once) / (2 * twice) : once * (this.n / m));
+    return Math.ceil(est * 1.5) + 1024;
+  }
+
   // Run the group kernel over group numbers `groups.data` (0..K-1).
   *#runGroupsG(keys, groups, items, merged) {
     const { engine } = this;
@@ -378,7 +439,28 @@ export class Table {
     // interpreter's precompiled scatter kernels use one slot per group.
     const C = engine.jit && K <= 1024 ? 4 : 1;
     let totals;
-    if (T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS)) {
+    // Per-thread accumulators pay off while they stay small; past that (or
+    // past the memory cap) one thread adds up rows that were already
+    // filtered (the hash path collects them first).
+    const slotsNeeded = T * J * K * C;
+    const big = T > 1 && slotsNeeded > (engine._bigGroupSlots ?? 2 ** 23);
+    if (big && engine.jit && J * K <= (engine._maxGroupSlots ?? MAX_GROUP_SLOTS)) {
+      // many groups: each thread adds up its own range of groups, all rows
+      const acc = engine.alloc(Float64Array, J * K);
+      analysis.items.forEach((it, j) => engine.live(acc).fill(IDENTITY[it.reduce], j * K, (j + 1) * K));
+      const cacheKey = `grouprange|${t}|${sources.join(';')}|${this.pred}|${arrayNames}|${scalarNames}`;
+      engine._tableKernels ??= new Map();
+      let v = engine._tableKernels.get(cacheKey);
+      if (!v) {
+        v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, 1, engine.isShared, true));
+        engine._tableKernels.set(cacheKey, v);
+      }
+      const arrays = [...arrayNames.map((nm) => this.cols.get(nm).data), groups.data];
+      yield* engine._groupRangeG(v, this.n, arrays, scalarNames.map((nm) => merged[nm]), engine.live(acc).byteOffset, K);
+      const a = engine.live(acc);
+      totals = analysis.items.map((_, j) => a.slice(j * K, (j + 1) * K));
+      engine.free(acc);
+    } else if (slotsNeeded > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (!this.pred && big)) {
       totals = yield* this.#scatterG(groups.data, K, analysis.items, sources, merged); // too many groups for per-thread accumulators
     } else {
       // Accumulators: one block per thread, padded to 256 bytes so two threads
@@ -432,31 +514,32 @@ export class Table {
       engine.free(acc);
     }
 
-    // Keep groups that have rows, sorted by key.
+    // Keep groups that have rows, sorted by key (codes for text keys, so
+    // dictionary order; NaN last), and build whole columns.
     const counts = totals[0];
-    const keep = [];
-    for (let g = 0; g < K; g++) if (counts[g] > 0) keep.push(g);
+    let m = 0;
+    for (let g = 0; g < K; g++) if (counts[g] > 0) m++;
+    let keep = new Float64Array(m);
+    for (let g = 0, r = 0; g < K; g++) if (counts[g] > 0) keep[r++] = g;
+    let codes = keys.map((_, k) => { const a = new Float64Array(m); for (let i = 0; i < m; i++) a[i] = groups.sortKey(keep[i], k); return a; });
     if (!groups.sorted) {
-      const nk = keys.length;
-      keep.sort((a, b) => {
-        for (let k = 0; k < nk; k++) {
-          const x = groups.sortKey(a, k), y = groups.sortKey(b, k);
-          if (x === y) continue;
-          if (x !== x) { if (y !== y) continue; return 1; }
-          if (y !== y) return -1;
-          return x < y ? -1 : 1;
-        }
-        return 0;
-      });
+      const idx = sortIndex(codes, m);
+      const order = new Float64Array(m);
+      for (let r = 0; r < m; r++) order[r] = keep[idx[r]];
+      keep = order;
+      codes = codes.map((a) => { const out = new Float64Array(m); for (let r = 0; r < m; r++) out[r] = a[idx[r]]; return out; });
     }
-    const vals = keep.map((g) => groups.values(g));
     const columns = {};
-    keys.forEach((key, k) => { columns[key] = vals.map((v) => v[k]); });
-    items.forEach((it, i) => {
-      const v = totals[i + 1];
-      columns[it.out] = it.fn === 'mean' ? keep.map((g) => v[g] / counts[g]) : keep.map((g) => v[g]);
+    keys.forEach((key, k) => {
+      const dict = this.cols.get(key).dict;
+      columns[key] = dict ? { codes: new Uint32Array(codes[k]), labels: dict } : codes[k];
     });
-    if (!keep.length) for (const key of keys) if (this.cols.get(key).dict) columns[key] = []; // (no rows)
+    items.forEach((it, i) => {
+      const v = totals[i + 1], out = new Float64Array(m);
+      if (it.fn === 'mean') for (let r = 0; r < m; r++) out[r] = v[keep[r]] / counts[keep[r]];
+      else for (let r = 0; r < m; r++) out[r] = v[keep[r]];
+      columns[it.out] = out;
+    });
     return Table.fromColumns(engine, columns, { type: Float64Array });
   }
 
@@ -465,7 +548,6 @@ export class Table {
   // group on this thread. `groups` has no filter here (rows were collected).
   *#scatterG(groupData, K, kernelItems, sources, merged) {
     const { engine } = this;
-    const ids = Float64Array.from(engine.live(groupData).subarray(0, this.n));
     const totals = [];
     for (const [j, it] of kernelItems.entries()) {
       const out = new Float64Array(K).fill(IDENTITY[it.reduce]);
@@ -479,7 +561,7 @@ export class Table {
         vals = Float64Array.from(engine.live(col));
         engine.free(col);
       }
-      const n = this.n;
+      const n = this.n, ids = engine.live(groupData); // (after any allocation above)
       if (!vals) for (let i = 0; i < n; i++) out[ids[i]]++;
       else if (it.reduce === 'min') for (let i = 0; i < n; i++) out[ids[i]] = Math.min(out[ids[i]], vals[i]);
       else if (it.reduce === 'max') for (let i = 0; i < n; i++) out[ids[i]] = Math.max(out[ids[i]], vals[i]);

@@ -6,7 +6,7 @@ import { countPattern } from './bytes.mjs';
 
 export const OP = {
   EXIT: 0, SUM: 1, MIN: 2, MAX: 3, ADD: 4, SCALE: 5, DOT: 6, HEAVY: 7,
-  COUNT_GT: 8, SORT_CHUNK: 9, MERGE: 10, COUNT_BYTES: 11, COPY: 12, FUSED: 13, GROUP: 14, COMPACT: 15, CSV_SCAN: 16, CSV_PARSE: 17,
+  COUNT_GT: 8, SORT_CHUNK: 9, MERGE: 10, COUNT_BYTES: 11, COPY: 12, FUSED: 13, GROUP: 14, COMPACT: 15, CSV_SCAN: 16, CSV_PARSE: 17, GROUP_RANGE: 18,
 };
 
 // Layout of the shared control block (Int32 slots).
@@ -54,6 +54,7 @@ export const tagOf = (seq) => seq & 0xfff;
 export function unitCount(op, T, n, sc) {
   if (op === OP.CSV_SCAN || op === OP.CSV_PARSE) return n; // n = number of chunks
   if (op === OP.SORT_CHUNK) return sc[1];
+  if (op === OP.GROUP_RANGE) return T; // a range of groups per thread
   if (op === OP.MERGE) return Math.ceil(sc[1] / (2 * sc[0]));
   return blockCount(n, T);
 }
@@ -97,6 +98,8 @@ function runUnit(op, u, units, T, n, A, sc, ctrl, W, res, F, self) {
       runFused(F, u, units, n, A, sc, ctrl, res);
     } else if (op === OP.GROUP) {
       runGroup(F, u, units, n, A, sc, ctrl, self);
+    } else if (op === OP.GROUP_RANGE) {
+      runGroupRange(F, u, units, n, A, sc, ctrl);
     } else if (op === OP.COMPACT) {
       runCompact(F, u, units, n, A, sc, ctrl);
     } else if (op === OP.CSV_SCAN) {
@@ -135,6 +138,20 @@ function runGroup(F, u, units, n, A, sc, ctrl, self) {
   const args = [];
   for (const ta of A) if (ta) args.push(ta.byteOffset + start * ta.BYTES_PER_ELEMENT);
   args.push(chunkStart(u + 1, units, n) - start, sc[ns] + self * sc[ns + 1], sc[ns + 2]);
+  for (let j = 0; j < ns; j++) args.push(sc[j]);
+  F(...args);
+}
+
+// Group-by over a range of groups: (column ptrs..., key ptr, length, accBase,
+// K, lo, hi, scalars...). Every unit reads all rows but only adds those whose
+// group is in its range [lo, hi), into ONE set of accumulators: no copies per
+// thread (they would be huge with millions of groups) and no two threads
+// writing the same slot.
+function runGroupRange(F, u, units, n, A, sc, ctrl) {
+  const ns = ctrl[C.NSCAL], K = sc[ns + 1];
+  const args = [];
+  for (const ta of A) if (ta) args.push(ta.byteOffset);
+  args.push(n, sc[ns], K, Math.floor((u * K) / units), Math.floor(((u + 1) * K) / units));
   for (let j = 0; j < ns; j++) args.push(sc[j]);
   F(...args);
 }

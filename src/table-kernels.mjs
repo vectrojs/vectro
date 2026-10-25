@@ -2,7 +2,7 @@
 // to a different place, which SIMD can't do), but they still fuse the filter
 // and every aggregation into one pass over memory.
 
-import { I32, F64, TY, Fn, buildModule, get, set, i32c, block, loop, end, br, brIf, i32add, i32geu } from './wasm.mjs';
+import { I32, F64, TY, Fn, buildModule, get, set, i32c, block, loop, end, br, brIf, i32add, i32mul, i32and, i32geu } from './wasm.mjs';
 import { Emitter } from './fuse.mjs';
 
 const F64_LOAD = [0x2b, 3, 0], F64_STORE = [0x39, 3, 0];
@@ -36,14 +36,17 @@ function advance(f, ty, ptrs) {
 // slots: each group has C copies that consecutive rows rotate through, so a
 // run of rows in the same group doesn't wait on its own previous update.
 // Signature: (array ptrs..., key ptr, n, accBase, K, scalars...)
-export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, shared = true) {
+// ranged: two more params (lo, hi) after K; only rows whose group is in
+// [lo, hi) are added (see runGroupRange).
+export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, shared = true, ranged = false) {
   const log2C = Math.log2(C);
   if (!Number.isInteger(log2C)) throw new Error('copies must be a power of two');
   const ty = TY[t];
   const A = arrayNames.length;
-  const [key, n, accBase, K] = [A, A + 1, A + 2, A + 3];
-  const f = new Fn('k', [...Array(A).fill(I32), I32, I32, I32, I32, ...Array(scalarNames.length).fill(F64)], []);
-  const env = bindValues(f, t, arrayNames, A + 4, scalarNames);
+  const [key, n, accBase, K, lo, hi] = [A, A + 1, A + 2, A + 3, A + 4, A + 5];
+  const extra = ranged ? 2 : 0;
+  const f = new Fn('k', [...Array(A).fill(I32), I32, I32, I32, I32, ...Array(extra).fill(I32), ...Array(scalarNames.length).fill(F64)], []);
+  const env = bindValues(f, t, arrayNames, A + 4 + extra, scalarNames);
   const em = new Emitter(f, t, env);
   const stop = f.local(I32), idx = f.local(I32), addr = f.local(I32), copy = f.local(I32);
   const bases = items.map(() => f.local(I32));
@@ -57,6 +60,7 @@ export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, 
   // slot = key * C + copy
   f.emit(get(key), ty.load, TRUNC_SAT_U[t], i32c(log2C), I32_SHL, get(copy), i32add, set(idx));
   f.emit(block);
+  if (ranged) f.emit(get(idx), get(lo), [0x6b], get(hi), get(lo), [0x6b], i32geu, brIf(0)); // (idx - lo) >= (hi - lo), unsigned: not ours
   if (pred) { em.scaMask(pred); f.emit(I32_EQZ, brIf(0)); }
   items.forEach((it, j) => {
     const op = it.reduce === 'min' ? 'min' : it.reduce === 'max' ? 'max' : 'add';
@@ -100,4 +104,84 @@ export function generateCompact(pred, t, arrayNames, copyFrom, scalarNames, shar
   advance(f, ty, srcLocals.map((a) => a.ptr));
   f.emit(br(0), end, end);
   return buildModule([f], shared);
+}
+
+// Hash numbering for group-by on any keys: every thread runs this over its
+// own rows, all inserting into ONE table in shared memory. A slot holds -1
+// (empty), -2 (being filled), -3 (the table ran out of room) or a group
+// number. A new key claims an empty slot with compare-and-swap, takes the next
+// group number from a shared counter, stores its key bits and then publishes
+// the number; a thread that meets a slot being filled waits for it. Keys are
+// compared as bits after -0 becomes 0 and every NaN the same NaN.
+// Signature: (key ptrs..., ids ptr, n, slotsBase, mask, keysBase, limit,
+// counterAddr) -> 0, or 1 if more than `limit` groups showed up.
+const I64 = 0x7e;
+const op = (...b) => b;
+const ATOMIC = { load: [0xfe, 0x10, 2, 0], store: [0xfe, 0x17, 2, 0], add: [0xfe, 0x1e, 2, 0], cmpxchg: [0xfe, 0x48, 2, 0] };
+const i64c = (v) => { // signed LEB128 of a BigInt
+  const out = [0x42];
+  for (;;) {
+    const b = Number(v & 0x7fn);
+    v >>= 7n;
+    if ((v === 0n && !(b & 0x40)) || (v === -1n && b & 0x40)) { out.push(b); return out; }
+    out.push(b | 0x80);
+  }
+};
+const f64c = (v) => [0x44, ...new Uint8Array(Float64Array.of(v).buffer)];
+const CANON_NAN = 0x7ff8000000000000n, MIX = -0x61c8864680b583ebn; // 0x9E3779B97F4A7C15 as signed
+
+export function generateHashGroups(t, nk, shared = true) {
+  const ty = TY[t];
+  const ids = nk, n = nk + 1, S = nk + 2; // S..S+4: slotsBase, mask, keysBase, limit, counter (f64)
+  const f = new Fn('k', [...Array(nk).fill(I32), I32, I32, F64, F64, F64, F64, F64], [F64]);
+  const [sb, mk, kb, lim, ctr] = [0, 1, 2, 3, 4].map(() => f.local(I32));
+  const stop = f.local(I32), slot = f.local(I32), s = f.local(I32), g = f.local(I32), addr = f.local(I32), kaddr = f.local(I32);
+  const v = f.local(F64), h = f.local(I64);
+  const bits = Array.from({ length: nk }, () => f.local(I64));
+  const IF = [0x04, 0x40], RETURN = [0x0f];
+
+  [sb, mk, kb, lim, ctr].forEach((l, i) => f.emit(get(S + i), [0xfc, 0x03], set(l))); // i32.trunc_sat_f64_u
+  f.emit(get(n), i32c(ty.bytes), i32mul, get(ids), i32add, set(stop));
+  f.emit(block, loop, get(ids), get(stop), i32geu, brIf(1));
+  // key bits and hash
+  f.emit(i64c(MIX), set(h));
+  for (let k = 0; k < nk; k++) {
+    f.emit(get(k), ty.load, t === 'f32' ? [0xbb] : [], f64c(0), op(0xa0), set(v)); // v = key + 0 (-0 -> 0)
+    f.emit(get(v), op(0xbd), i64c(CANON_NAN), get(v), get(v), op(0x61), op(0x1b), set(bits[k])); // NaN -> one NaN
+    f.emit(get(h), get(bits[k]), op(0x85), i64c(MIX), op(0x7e), set(h));
+  }
+  f.emit(get(h), get(h), i64c(32n), op(0x88), op(0x85), i64c(MIX), op(0x7e), set(h));
+  f.emit(get(h), get(h), i64c(29n), op(0x88), op(0x85), op(0xa7), get(mk), i32and, set(slot));
+  // probe
+  f.emit(block, loop);
+  f.emit(get(slot), i32c(2), op(0x74), get(sb), i32add, set(addr));
+  f.emit(get(addr), ATOMIC.load, set(s));
+  f.emit(get(s), i32c(-1), op(0x46), IF); // empty: try to claim it
+  f.emit(get(addr), i32c(-1), i32c(-2), ATOMIC.cmpxchg, i32c(-1), op(0x46), IF);
+  f.emit(get(ctr), i32c(1), ATOMIC.add, set(g));
+  f.emit(get(g), get(lim), i32geu, IF, get(addr), i32c(-3), ATOMIC.store, f64c(1), RETURN, end);
+  f.emit(get(g), i32c(nk * 8), i32mul, get(kb), i32add, set(kaddr));
+  for (let k = 0; k < nk; k++) f.emit(get(kaddr), get(bits[k]), [0x37, 3, ...uleb(k * 8)]); // i64.store
+  f.emit(get(addr), get(g), ATOMIC.store, br(3)); // publish; found
+  f.emit(end, br(1), end); // lost the race: look at the slot again
+  f.emit(get(s), i32c(-2), op(0x46), brIf(0)); // being filled: wait
+  f.emit(get(s), i32c(-3), op(0x46), IF, f64c(1), RETURN, end);
+  f.emit(get(s), i32c(nk * 8), i32mul, get(kb), i32add, set(kaddr));
+  f.emit(block);
+  for (let k = 0; k < nk; k++) f.emit(get(kaddr), [0x29, 3, ...uleb(k * 8)], get(bits[k]), op(0x52), brIf(0)); // i64.load, i64.ne
+  f.emit(get(s), set(g), br(2)); // same key
+  f.emit(end);
+  f.emit(get(slot), i32c(1), i32add, get(mk), i32and, set(slot), br(0));
+  f.emit(end, end);
+  // group number out, next row
+  f.emit(get(ids), get(g), t === 'f32' ? op(0xb3) : op(0xb8), ty.store);
+  advance(f, ty, [...Array(nk).keys(), ids]);
+  f.emit(br(0), end, end, f64c(0));
+  return buildModule([f], shared);
+}
+
+function uleb(n) {
+  const out = [];
+  do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n);
+  return out;
 }
