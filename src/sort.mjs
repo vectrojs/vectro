@@ -30,33 +30,55 @@ export function labelRanks(dict, desc) {
 }
 
 // Stable sort of row indices 0..n-1 by several Float64Array keys (first key
-// most important): LSD radix sort, 16 bits per pass, last key first. Passes
-// where every row has the same 16 bits are skipped, so small integer keys
-// take one or two passes instead of four.
+// most important): LSD radix sort, last key first. Each key becomes two
+// uint32 words that sort as unsigned numbers; the words travel with the
+// indices (so every pass reads in order instead of gathering at random), in
+// 11-bit digits (2,048 buckets fit in cache). All digit counts are taken in
+// one pass per key, and digits that are the same in every row are skipped,
+// so small integer keys take one or two passes instead of six. Keys that are
+// whole numbers within 2^53 of their minimum (codes, IDs, counts) sort as
+// that offset, so only the digits that vary cost a pass.
+const DIGITS = [[0, 0], [0, 11], [0, 22], [1, 0], [1, 11], [1, 22]]; // [word (0 = low), shift]
 export function sortIndex(keys, n) {
-  let idx = new Uint32Array(n), tmp = new Uint32Array(n);
+  let idx = new Uint32Array(n);
   for (let i = 0; i < n; i++) idx[i] = i;
-  if (n <= 4096) return smallSort(keys, idx); // a comparison sort is quicker than 65,536-bucket passes
-  const count = new Uint32Array(65537);
+  if (n <= 4096) return smallSort(keys, idx); // a comparison sort is quicker than bucket passes
+  let lo = new Uint32Array(n), hi = new Uint32Array(n);
+  let idx2 = new Uint32Array(n), lo2 = new Uint32Array(n), hi2 = new Uint32Array(n);
+  const hist = new Uint32Array(6 * 2048);
   for (let k = keys.length - 1; k >= 0; k--) {
-    // float64 -> two uint32 halves that sort as unsigned numbers
+    // float64 -> two uint32 halves that sort as unsigned numbers, in the current order
     const f = keys[k];
-    const hi = new Uint32Array(n), lo = new Uint32Array(n);
+    let min = Infinity, max = -Infinity, whole = true;
+    for (let i = 0; i < n; i++) { const v = f[i]; if (v < min) min = v; if (v > max) max = v; if (v !== Math.floor(v)) { whole = false; break; } }
+    whole = whole && max - min < 2 ** 53; // (NaN and infinities fail `whole`)
     const bits = new Uint32Array(f.buffer, f.byteOffset, n * 2);
+    hist.fill(0);
     for (let i = 0; i < n; i++) {
-      let h = bits[2 * i + 1], l = bits[2 * i];
-      if (f[i] !== f[i]) { h = 0xffffffff; l = 0xffffffff; } // NaN: after everything
-      else if (h & 0x80000000) { h = ~h >>> 0; l = ~l >>> 0; } // negative: flip all
-      else h = (h | 0x80000000) >>> 0;                         // positive: flip the sign
+      const r = idx[i];
+      let h, l;
+      if (whole) { const o = f[r] - min; h = Math.floor(o / 4294967296); l = o - h * 4294967296; }
+      else {
+        h = bits[2 * r + 1]; l = bits[2 * r];
+        if (f[r] !== f[r]) { h = 0xffffffff; l = 0xffffffff; } // NaN: after everything
+        else if (h & 0x80000000) { h = ~h >>> 0; l = ~l >>> 0; } // negative: flip all
+        else h = (h | 0x80000000) >>> 0;                         // positive: flip the sign
+      }
       hi[i] = h; lo[i] = l;
+      hist[l & 2047]++; hist[2048 + ((l >>> 11) & 2047)]++; hist[4096 + (l >>> 22)]++;
+      hist[6144 + (h & 2047)]++; hist[8192 + ((h >>> 11) & 2047)]++; hist[10240 + (h >>> 22)]++;
     }
-    for (const [half, shift] of [[lo, 0], [lo, 16], [hi, 0], [hi, 16]]) {
-      count.fill(0);
-      for (let i = 0; i < n; i++) count[((half[idx[i]] >>> shift) & 0xffff) + 1]++;
-      if (count[((half[idx[0]] >>> shift) & 0xffff) + 1] === n) continue; // every row has these bits
-      for (let d = 0; d < 65536; d++) count[d + 1] += count[d];
-      for (let i = 0; i < n; i++) { const r = idx[i]; tmp[count[(half[r] >>> shift) & 0xffff]++] = r; }
-      [idx, tmp] = [tmp, idx];
+    for (let d = 0; d < 6; d++) {
+      const [word, shift] = DIGITS[d], base = d * 2048;
+      const src = word ? hi : lo;
+      if (hist[base + ((src[0] >>> shift) & 2047)] === n) continue; // every row has this digit
+      let sum = 0;
+      for (let b = 0; b < 2048; b++) { const c = hist[base + b]; hist[base + b] = sum; sum += c; }
+      for (let i = 0; i < n; i++) {
+        const p = hist[base + ((src[i] >>> shift) & 2047)]++;
+        idx2[p] = idx[i]; lo2[p] = lo[i]; hi2[p] = hi[i];
+      }
+      [idx, idx2] = [idx2, idx]; [lo, lo2] = [lo2, lo]; [hi, hi2] = [hi2, hi];
     }
   }
   return idx;

@@ -31,13 +31,22 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   `collect()`, `toRows(limit)`.
 - **Group by any keys:** `groupBy('region')`, `groupBy(['region', 'day'])`,
   `groupBy('account_id')`. Keys are category columns or any numbers (big IDs,
-  amounts, negatives; NaN is its own group, -0 groups with 0). Small keys (a
-  category, or whole numbers below 16.7M, alone or combined) are group numbers
-  as they are and run on all cores: `region + day` (2,920 pairs) on 10M rows
-  took 12 ms vs DuckDB's 84 ms. Other keys are numbered by a hash table first,
-  which runs on one thread: on 10M rows, 100K price groups took ~0.4 s and 1M
-  account IDs ~2 s, where DuckDB takes 0.09 s and 0.15 s (a parallel hash
-  kernel is the next step; `compare/bench-groupby.mjs`).
+  amounts, negatives; NaN is its own group, -0 groups with 0). Groups come
+  back sorted by key. Small keys (a category, or whole numbers below 16.7M,
+  alone or combined) are group numbers as they are. Other keys are numbered
+  by every thread at once in one shared hash table (compare-and-swap inserts),
+  and with many groups each thread adds up its own range of groups. On 10M
+  rows vs DuckDB (`compare/bench-groupby.mjs`, answers checked):
+
+  | Keys | Vectro | DuckDB |
+  |---|---|---|
+  | region + day (2,920 pairs) | 8 ms | 34 ms |
+  | price (100K amounts) | 35 ms | 41 ms |
+  | account (1M big IDs) | 190 ms | 63 ms |
+  | account + region (5.7M pairs) | 639 ms | 116 ms |
+
+  With millions of groups, about half of Vectro's time is sorting the groups
+  by key (DuckDB returns them unsorted) on one thread.
 - **Text functions** on category columns: `startsWith(col, 'x')`,
   `endsWith`, `contains`, `in(col, 'a', 'b')` and `like(col, 'EU-%')`. They run
   once per distinct label (not per row) and become a few range checks on the

@@ -258,6 +258,7 @@ export class Table {
       return yield* t.#runGroupsG(keys, ids, items, merged);
     } finally {
       this.engine.free(ids.data);
+      for (const x of ids.extra ?? []) this.engine.free(x);
       if (t !== this) t.dispose();
     }
   }
@@ -279,24 +280,18 @@ export class Table {
     const K = sizes.reduce((a, b) => a * b, 1);
     const C = engine.jit && K <= 1024 ? 4 : 1;
     if (K > 2 ** 24 || engine.T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (K > 65_536 && K > this.n)) return null;
-    const values = (g) => { // group number -> key values
-      const out = new Array(keys.length);
-      for (let k = keys.length - 1; k >= 0; k--) {
-        const code = g % sizes[k];
-        g = Math.floor(g / sizes[k]);
-        const c = this.cols.get(keys[k]);
-        out[k] = c.dict ? c.dict[code] : code;
-      }
+    const below = sizes.map((_, k) => sizes.slice(k + 1).reduce((a, b) => a * b, 1));
+    const keyColumn = (k, keep) => { // key k of each kept group (codes for text)
+      const out = new Float64Array(keep.length), d = below[k], size = sizes[k];
+      for (let r = 0; r < keep.length; r++) out[r] = Math.floor(keep[r] / d) % size;
       return out;
     };
-    const below = sizes.map((_, k) => sizes.slice(k + 1).reduce((a, b) => a * b, 1));
-    const sortKey = (g, k) => Math.floor(g / below[k]) % sizes[k];
-    if (keys.length === 1) return { K, data: this.cols.get(keys[0]).data, values, sortKey, owned: false, sorted: true };
+    if (keys.length === 1) return { K, data: this.cols.get(keys[0]).data, keyColumn, owned: false, sorted: true };
     let expr = keys[0];
     for (let k = 1; k < keys.length; k++) expr = `(${expr}) * ${sizes[k]} + ${keys[k]}`;
     const data = engine.alloc(this.type, this.n);
     yield* engine.evalG(expr, this.#vars({}), data);
-    return { K, data, values, sortKey, owned: true, sorted: true };
+    return { K, data, keyColumn, owned: true, sorted: true };
   }
 
   // Number each row's distinct key (tuple) with a hash table: { K, data
@@ -355,10 +350,12 @@ export class Table {
       }
       ids[i] = g;
     }
-    const dicts = keys.map((k) => this.cols.get(k).dict);
-    const values = (g) => keys.map((_, k) => (dicts[k] ? dicts[k][kv[g * nk + k]] : kv[g * nk + k]));
-    const sortKey = (g, k) => kv[g * nk + k]; // codes for text: dictionary order
-    return { K, data, values, sortKey, owned: true, sorted: false };
+    const keyColumn = (k, keep) => { // key k of each kept group (codes for text)
+      const out = new Float64Array(keep.length);
+      for (let r = 0; r < keep.length; r++) out[r] = kv[keep[r] * nk + k];
+      return out;
+    };
+    return { K, data, keyColumn, owned: true, sorted: false };
   }
 
   // The same numbering on every thread at once (see generateHashGroups): one
@@ -376,18 +373,20 @@ export class Table {
     engine._tableKernels ??= new Map();
     let v = engine._tableKernels.get(cacheKey);
     if (!v) { v = engine._register(generateHashGroups(t, nk, engine.isShared)); engine._tableKernels.set(cacheKey, v); }
+    const slack = 64 * 16 * Math.max(1, engine.T); // group numbers reserved but unused: < 64 per unit
     for (;;) {
+      const room = limit + slack;
       let cap = 1024;
-      while (cap < limit * 2) cap *= 2;
-      const slots = engine.alloc(Int32Array, cap), keyBits = engine.alloc(Float64Array, limit * nk), counter = engine.alloc(Int32Array, 4);
+      while (cap < room * 2) cap *= 2;
+      const slots = engine.alloc(Int32Array, cap), keyBits = engine.alloc(Float64Array, room * nk), counter = engine.alloc(Int32Array, 4);
       const data = engine.alloc(this.type, n);
       engine.live(slots).fill(-1);
       engine.live(counter)[0] = 0;
       let overflow, K;
       try {
-        const { parts } = yield* engine._fusedG(v, n, [...cols, data], [engine.live(slots).byteOffset, cap - 1, engine.live(keyBits).byteOffset, limit, engine.live(counter).byteOffset], 1);
+        const { parts } = yield* engine._fusedG(v, n, [...cols, data], [engine.live(slots).byteOffset, cap - 1, engine.live(keyBits).byteOffset, room, engine.live(counter).byteOffset], 1);
         K = engine.live(counter)[0];
-        overflow = parts.some((x) => x !== 0) || K > limit;
+        overflow = parts.some((x) => x !== 0); // (K may pass limit by numbers reserved but unused)
       } catch (err) { engine.free(data); engine.free(keyBits); throw err; } finally { engine.free(slots); engine.free(counter); }
       if (overflow) {
         engine.free(keyBits); engine.free(data);
@@ -395,11 +394,12 @@ export class Table {
         limit = Math.min(n, limit * 4);
         continue;
       }
-      const kv = Float64Array.from(engine.live(keyBits).subarray(0, K * nk));
-      engine.free(keyBits);
-      const dicts = keys.map((k) => this.cols.get(k).dict);
-      const values = (g) => keys.map((_, k) => (dicts[k] ? dicts[k][kv[g * nk + k]] : kv[g * nk + k]));
-      return { K, data, values, sortKey: (g, k) => kv[g * nk + k], owned: true, sorted: false };
+      const keyColumn = (k, keep) => { // key k of each kept group (codes for text)
+        const kv = engine.live(keyBits), out = new Float64Array(keep.length);
+        for (let r = 0; r < keep.length; r++) out[r] = kv[keep[r] * nk + k];
+        return out;
+      };
+      return { K, data, keyColumn, owned: true, sorted: false, extra: [keyBits] };
     }
   }
 
@@ -521,7 +521,7 @@ export class Table {
     for (let g = 0; g < K; g++) if (counts[g] > 0) m++;
     let keep = new Float64Array(m);
     for (let g = 0, r = 0; g < K; g++) if (counts[g] > 0) keep[r++] = g;
-    let codes = keys.map((_, k) => { const a = new Float64Array(m); for (let i = 0; i < m; i++) a[i] = groups.sortKey(keep[i], k); return a; });
+    let codes = keys.map((_, k) => groups.keyColumn(k, keep));
     if (!groups.sorted) {
       const idx = sortIndex(codes, m);
       const order = new Float64Array(m);

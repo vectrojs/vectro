@@ -111,7 +111,11 @@ export function generateCompact(pred, t, arrayNames, copyFrom, scalarNames, shar
 // (empty), -2 (being filled), -3 (the table ran out of room) or a group
 // number. A new key claims an empty slot with compare-and-swap, takes the next
 // group number from a shared counter, stores its key bits and then publishes
-// the number; a thread that meets a slot being filled waits for it. Keys are
+// the number; a thread that meets a slot being filled waits for it. Group
+// numbers are taken from the counter in growing batches (1, 2, 4... 64 per
+// unit: one shared counter hit per group would be a queue of every thread);
+// numbers a unit doesn't use stay empty groups, which have no rows and are
+// dropped. Keys are
 // compared as bits after -0 becomes 0 and every NaN the same NaN.
 // Signature: (key ptrs..., ids ptr, n, slotsBase, mask, keysBase, limit,
 // counterAddr) -> 0, or 1 if more than `limit` groups showed up.
@@ -136,12 +140,13 @@ export function generateHashGroups(t, nk, shared = true) {
   const f = new Fn('k', [...Array(nk).fill(I32), I32, I32, F64, F64, F64, F64, F64], [F64]);
   const [sb, mk, kb, lim, ctr] = [0, 1, 2, 3, 4].map(() => f.local(I32));
   const stop = f.local(I32), slot = f.local(I32), s = f.local(I32), g = f.local(I32), addr = f.local(I32), kaddr = f.local(I32);
-  const v = f.local(F64), h = f.local(I64);
+  const v = f.local(F64), h = f.local(I64), next = f.local(I32), last = f.local(I32), batch = f.local(I32);
   const bits = Array.from({ length: nk }, () => f.local(I64));
   const IF = [0x04, 0x40], RETURN = [0x0f];
 
   [sb, mk, kb, lim, ctr].forEach((l, i) => f.emit(get(S + i), [0xfc, 0x03], set(l))); // i32.trunc_sat_f64_u
   f.emit(get(n), i32c(ty.bytes), i32mul, get(ids), i32add, set(stop));
+  f.emit(i32c(0), set(next), i32c(0), set(last), i32c(1), set(batch)); // no numbers reserved yet
   f.emit(block, loop, get(ids), get(stop), i32geu, brIf(1));
   // key bits and hash
   f.emit(i64c(MIX), set(h));
@@ -158,7 +163,9 @@ export function generateHashGroups(t, nk, shared = true) {
   f.emit(get(addr), ATOMIC.load, set(s));
   f.emit(get(s), i32c(-1), op(0x46), IF); // empty: try to claim it
   f.emit(get(addr), i32c(-1), i32c(-2), ATOMIC.cmpxchg, i32c(-1), op(0x46), IF);
-  f.emit(get(ctr), i32c(1), ATOMIC.add, set(g));
+  f.emit(get(next), get(last), op(0x46), IF, get(ctr), get(batch), ATOMIC.add, set(next), get(next), get(batch), i32add, set(last)); // reserve more
+  f.emit(get(batch), i32c(1), op(0x74), set(batch), get(batch), i32c(64), get(batch), i32c(64), op(0x4b), op(0x1b), set(batch), end); // batch = min(2 * batch, 64)
+  f.emit(get(next), set(g), get(next), i32c(1), i32add, set(next));
   f.emit(get(g), get(lim), i32geu, IF, get(addr), i32c(-3), ATOMIC.store, f64c(1), RETURN, end);
   f.emit(get(g), i32c(nk * 8), i32mul, get(kb), i32add, set(kaddr));
   for (let k = 0; k < nk; k++) f.emit(get(kaddr), get(bits[k]), [0x37, 3, ...uleb(k * 8)]); // i64.store
