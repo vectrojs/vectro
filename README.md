@@ -38,36 +38,57 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
 ## Streaming (prototype)
 
 A stream is a live table spread over split-table workers. Rows arrive as CSV
-lines and are parsed in 256 KB batches into growing columns. Queries are the
-same as for any split table.
+lines or JSON lines and are parsed in 256 KB batches into growing columns.
+Queries are the same as for any split table.
 
 ```js
-import { SplitEngine } from 'vectrojs';
+import { SplitEngine } from 'vectrojs';             // browsers: from 'vectrojs/browser'
 
-const engine = new SplitEngine({ workers: 7 });     // default: one worker per core
+const engine = new SplitEngine({ workers: 4 });     // default: one worker per core
 const orders = await engine.streamAsync({
+  format: 'ndjson',                                  // or 'csv' (no header)
   columns: { ts: 'number', price: 'number', qty: 'number', region: 'category' },
-  keepRows: 10_000_000,                              // or keepMs: 60_000, timeColumn: 'ts'
+  keepRows: 2_000_000,                               // or keepMs: 60_000, timeColumn: 'ts'
 });
 
-await Promise.all(engine.workers.map((_, w) =>      // each worker reads its own TCP stream...
-  orders.connect(w, { host: 'feed.internal', port: 9000 + w })));
-socket.on('data', (chunk) => orders.push(chunk));    // ...or push chunks from one connection
+// each worker reads its own feed: nothing passes through this thread
+await Promise.all(engine.workers.map((_, w) =>
+  orders.connect(w, { url: `wss://feed.example.com/orders?part=${w}` })));  // or { host, port } for TCP (Node)
+// ...or push chunks you receive yourself: socket.on('data', (c) => orders.push(c))
 
-await orders.groupBy('region').aggAsync({ revenue: 'sum(price * qty)' });
-const fixed = await orders.snapshotAsync();          // a fixed copy, for derive and toRows
+// running totals, updated as rows arrive
+const live = await orders.windowAsync({
+  by: 'region', every: 1000, last: 300_000, timeColumn: 'ts',
+  agg: { orders: 'count()', revenue: 'sum(price * qty)', avg: 'mean(price)' },
+});
+await live.readAsync();                  // per region, last 5 minutes (~1 ms)
+await live.readAsync({ series: true });  // per second and region, for charts
+
+await orders.filter("region == 'EU'").aggAsync({ big: 'count(price > 900)' });  // any query, over the rows kept
+const fixed = await orders.snapshotAsync();                                      // a fixed copy, for derive and toRows
 ```
 
-- **Backpressure:** when a worker has more than 4 MB waiting to be parsed, it
-  pauses its socket (or delays its reply to `push`) until it's down to 1 MB.
-  TCP then slows the sender, so memory stays bounded.
+- **JSON lines** are parsed byte by byte straight into columns (no object per
+  row): keys in any order, extra and nested keys skipped, `null` and missing
+  values empty, bad lines counted (`badLines`) and skipped.
+- **Windows** keep one small total per (slice of `every` ms, group) in each
+  worker, so reading costs about a millisecond, and the totals outlive rows
+  dropped by `keepRows`. The window ends at the newest time seen.
+- **Backpressure (TCP and push):** when a worker has more than 4 MB waiting to
+  be parsed, it pauses its socket (or delays its reply to `push`) until it's
+  down to 1 MB. TCP then slows the sender. WebSockets can't be paused, so a
+  WebSocket feed faster than the workers grows their backlog.
 - **Queries go first:** parsing runs one batch per event-loop turn, so a query
   waits for at most one batch.
-- **Kept rows:** `keepRows` (newest rows, split evenly over workers) or
-  `keepMs` with `timeColumn` (rows newer than the newest time minus `keepMs`).
 
-`npm run bench:stream` (M1 Pro, 7 workers, 10M rows kept, localhost TCP, a live
-query every 250 ms over every kept row):
+**In a browser** (`examples/stream/`, Chrome, 4 Web Workers each reading its own
+WebSocket of JSON lines): it kept up with **1.13–1.2 million orders per second**
+(the feed's rate, so the real limit is higher), the 30-second window read in
+0.2–14 ms, and the page never waited more than 6 ms. Run it:
+`npm run serve:split`, then open `/examples/stream/?rate=300000`.
+
+**In Node** (`npm run bench:stream`, M1 Pro, 7 workers, 10M rows kept,
+localhost TCP, a live query every 250 ms over every kept row):
 
 | Receiver | Rows/s taken in | Query median / max | Main thread stalled up to |
 |---|---|---|---|
@@ -75,9 +96,9 @@ query every 250 ms over every kept row):
 | Vectro, 1 connection, chunks pushed to workers | 17.0–17.5M | 13–14 / 22–32 ms | 6–9 ms |
 | Vectro, 1 connection per worker | 16.7–18.5M | 12–13 / 31–62 ms | 19–47 ms |
 
-The producer runs on the same machine, so all 8 cores are busy. With one
-connection per worker the main thread does almost nothing, yet the OS
-sometimes pauses it (the 19–47 ms stalls).
+The producer runs on the same machine, so all 8 cores are busy. With JSON
+lines (`FORMAT=ndjson`), one run gave 3.6M rows/s vs 1.4M for `JSON.parse` per
+line. That needs remeasuring: the machine was swapping heavily at the time.
 
 ## Runtimes
 
@@ -134,6 +155,5 @@ answers.
 ## Not done yet
 
 Sort, top-k, joins, integer/date types, missing values and persistence.
-Streams take CSV lines only (no JSON lines yet), connect over TCP in Node
-only (no WebSocket in browsers yet), and have no running totals or sliding
-windows beyond `keepRows`/`keepMs`. Memory is capped at 4 GB per engine and freed with `dispose()`.
+Streams take flat records only (no nested JSON fields), and windows group by
+at most one category column. Memory is capped at 4 GB per engine and freed with `dispose()`.

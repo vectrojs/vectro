@@ -14,6 +14,7 @@ import { createServer } from 'node:http';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { acceptWebSocket } from '../stream/ws-server.mjs';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const PORT = Number(process.argv[2] ?? 8766);
@@ -21,7 +22,7 @@ const ISOLATE = !process.argv.includes('--no-isolation');
 const HOST = process.argv.includes('--lan') ? '0.0.0.0' : '127.0.0.1';
 const TYPES = { '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.csv': 'text/csv', '.json': 'application/json' };
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   if (req.method === 'POST' && req.url.startsWith('/report?')) {
     const name = new URL(req.url, 'http://x').searchParams.get('name')?.replace(/[^\w.-]/g, '_') || 'report';
     const chunks = [];
@@ -45,4 +46,28 @@ createServer(async (req, res) => {
   } catch {
     res.writeHead(404).end('not found');
   }
-}).listen(PORT, HOST, () => console.log(`serving ${ROOT} ${ISOLATE ? 'with' : 'without'} cross-origin isolation on http://${HOST === '0.0.0.0' ? 'all interfaces' : 'localhost'}:${PORT}`));
+});
+
+// /feed: a WebSocket of live orders as JSON lines, timestamped now, for the
+// stream demo (examples/stream/). ?rate=rows per second, ?part=n varies the data.
+const REGIONS = ['EU', 'US', 'APAC', 'LATAM', 'MEA', 'UK', 'CA', 'ANZ'];
+server.on('upgrade', (req, socket) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname !== '/feed') return socket.destroy();
+  const ws = acceptWebSocket(req, socket);
+  const rate = Math.min(2_000_000, Number(url.searchParams.get('rate') ?? 50_000));
+  let seed = 1 + Number(url.searchParams.get('part') ?? 0);
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const timer = setInterval(() => {
+    if (!ws.open) return clearInterval(timer);
+    const now = Date.now(), n = Math.round(rate / 20);
+    let out = '';
+    for (let i = 0; i < n; i++) {
+      const r = rnd(), region = REGIONS[Math.floor(r * r * 8)]; // some regions busier than others
+      out += `{"ts":${now},"price":${(5 + rnd() * 995).toFixed(2)},"qty":${1 + Math.floor(rnd() * 9)},"region":"${region}"}\n`;
+    }
+    ws.send(out);
+  }, 50);
+});
+
+server.listen(PORT, HOST, () => console.log(`serving ${ROOT} ${ISOLATE ? 'with' : 'without'} cross-origin isolation on http://${HOST === '0.0.0.0' ? 'all interfaces' : 'localhost'}:${PORT}`));

@@ -427,9 +427,11 @@ export class StreamTable extends SplitTable {
     return this.engine._call(w, 'streamPush', { id: this.id, bytes: lines }, [lines.buffer]);
   }
 
-  // Worker `worker` opens its own TCP connection and reads CSV lines from it.
-  connect(worker, { host = '127.0.0.1', port }) {
-    return this.engine._call(worker, 'streamConnect', { id: this.id, host, port });
+  // Worker `worker` opens its own connection and reads lines from it:
+  // { url: 'wss://…' } for a WebSocket (browsers, Node 22+; each message is
+  // whole lines), or { host, port } for raw TCP (Node).
+  connect(worker, { url, host = '127.0.0.1', port } = {}) {
+    return this.engine._call(worker, 'streamConnect', { id: this.id, url, host, port });
   }
 
   // Parse whatever every worker has received; returns totals.

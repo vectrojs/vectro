@@ -19,6 +19,7 @@ const nextTurn = globalThis.setImmediate ?? ((fn) => setTimeout(fn, 0));
 // sender, instead of unparsed data piling up in memory.
 const HIGH = 4 << 20, LOW = 1 << 20;
 const NL = 10;
+const textEncoder = new TextEncoder();
 const KINDS = { number: 'number', category: 'category' };
 
 export function createStreams(getEngine) {
@@ -298,9 +299,12 @@ export function createStreams(getEngine) {
       queue(s, bytes);
       return s.pendingBytes > HIGH ? new Promise((resolve) => s.waiters.push(resolve)) : true;
     },
-    // This worker reads its own TCP connection; nothing passes through the page.
-    async streamConnect({ id, host = '127.0.0.1', port }) {
+    // This worker reads its own connection; nothing passes through the page.
+    // url: a WebSocket (browsers and Node 22+); each message is one or more
+    // whole lines. host + port: raw TCP (Node only), cut anywhere.
+    async streamConnect({ id, url, host = '127.0.0.1', port }) {
       const s = get(id);
+      if (url) return connectWebSocket(s, url);
       const net = await import('node:net');
       return new Promise((resolve, reject) => {
         const socket = net.connect({ host, port }, () => resolve(true));
@@ -333,6 +337,26 @@ export function createStreams(getEngine) {
       return n;
     },
   };
+
+  // WebSockets can't be paused (in browsers or Node), so there is no
+  // backpressure here: a feed faster than the workers grows the backlog.
+  function connectWebSocket(s, url) {
+    if (typeof WebSocket !== 'function') throw new Error('vectro: this runtime has no WebSocket (Node 22+ and browsers do)');
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      let opened = false;
+      ws.onopen = () => { opened = true; resolve(true); };
+      ws.onmessage = (ev) => {
+        const bytes = typeof ev.data === 'string' ? textEncoder.encode(ev.data) : new Uint8Array(ev.data);
+        if (!bytes.length) return;
+        queue(s, bytes[bytes.length - 1] === NL ? bytes : concat([bytes, Uint8Array.of(NL)]));
+      };
+      ws.onerror = () => { const err = new Error(`vectro: WebSocket ${url} failed`); s.error ??= err.message; if (!opened) reject(err); };
+      ws.onclose = () => flush(s);
+      s.sockets.push({ destroy: () => ws.close(), pause() {}, resume() {} });
+    });
+  }
 
   const stats = (s) => ({ rows: s.n - s.start, rowsIn: s.rowsIn, badLines: s.badLines, bytesIn: s.bytesIn, batches: s.batches, unparsedBytes: s.pendingBytes + (s.partial?.length ?? 0), error: s.error });
 

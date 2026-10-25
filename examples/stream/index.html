@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vectro live stream</title>
+<style>
+  :root { --ink: #1b2430; --muted: #5b6573; --line: #d9dee5; --bar: #0f766e; --bg: #fff; --soft: #f4f6f8; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ink: #e6edf3; --muted: #9aa3ae; --line: #30363d; --bar: #3fb9a8; --bg: #0d1117; --soft: #161b22; } }
+  body { font: 15px/1.5 -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); background: var(--bg); max-width: 920px; margin: 24px auto; padding: 0 16px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 14px 0; }
+  .stat { background: var(--soft); border-radius: 8px; padding: 10px 12px; }
+  .stat b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  svg { width: 100%; height: 140px; display: block; }
+  .muted { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Vectro: live orders</h1>
+<p class="muted" id="about">Connecting…</p>
+<div class="stats">
+  <div class="stat"><b id="rate">–</b><span>rows per second taken in</span></div>
+  <div class="stat"><b id="kept">–</b><span>rows kept (newest)</span></div>
+  <div class="stat"><b id="read">–</b><span>to read the 30 s window</span></div>
+  <div class="stat"><b id="wait">–</b><span>longest the page waited</span></div>
+</div>
+<h3>Revenue per second, last 30 s</h3>
+<svg id="chart" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-label="Revenue per second"></svg>
+<h3>By region, last 30 s</h3>
+<table id="regions"><tr><th>Region</th><th class="n">Orders</th><th class="n">Revenue</th><th class="n">Avg price</th></tr></table>
+<script type="module">
+// Each Web Worker opens its own WebSocket to /feed and parses JSON lines into
+// columns. The page reads a running-total window twice a second.
+import { SplitEngine } from '../../src/browser.mjs';
+
+const params = new URLSearchParams(location.search);
+const WORKERS = Number(params.get('workers') ?? Math.min(4, navigator.hardwareConcurrency || 4));
+const RATE = Number(params.get('rate') ?? 100_000); // rows per second per worker connection
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+const R = { workers: WORKERS, rateAsked: RATE * WORKERS, samples: [], errors: [] };
+
+// page responsiveness: how long between two turns of a MessageChannel ping-pong
+let worst = 0, last = performance.now();
+const ch = new MessageChannel();
+ch.port1.onmessage = () => { const now = performance.now(); worst = Math.max(worst, now - last); last = now; ch.port2.postMessage(0); };
+ch.port2.postMessage(0);
+
+try {
+  const engine = new SplitEngine({ workers: WORKERS });
+  const orders = await engine.streamAsync({ format: 'ndjson', columns: { ts: 'number', price: 'number', qty: 'number', region: 'category' }, keepRows: 2_000_000 });
+  const live = await orders.windowAsync({ by: 'region', every: 1000, last: 30_000, timeColumn: 'ts', agg: { orders: 'count()', revenue: 'sum(price * qty)', avg: 'mean(price)' } });
+  const total = await orders.windowAsync({ every: 1000, last: 30_000, timeColumn: 'ts', agg: { revenue: 'sum(price * qty)' } });
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  await Promise.all(engine.workers.map((_, w) => orders.connect(w, { url: `${proto}://${location.host}/feed?rate=${RATE}&part=${w}` })));
+  $('about').textContent = `${WORKERS} Web Workers, each reading its own WebSocket feed of about ${fmt(RATE)} orders per second (JSON lines). Nothing passes through this page.`;
+
+  let prev = { t: performance.now(), rows: 0 };
+  setInterval(async () => {
+    const st = await orders.statsAsync();
+    const now = performance.now();
+    const rate = ((st.rowsIn - prev.rows) / (now - prev.t)) * 1000;
+    prev = { t: now, rows: st.rowsIn };
+    const s0 = performance.now();
+    const [regions, series] = await Promise.all([live.readAsync(), total.readAsync({ series: true })]);
+    const readMs = performance.now() - s0;
+    $('rate').textContent = fmt(rate);
+    $('kept').textContent = fmt(st.rows);
+    $('read').textContent = `${readMs.toFixed(1)} ms`;
+    $('wait').textContent = `${worst.toFixed(1)} ms`;
+    $('regions').innerHTML = '<tr><th>Region</th><th class="n">Orders</th><th class="n">Revenue</th><th class="n">Avg price</th></tr>' +
+      regions.sort((a, b) => b.revenue - a.revenue).map((r) => `<tr><td>${r.region}</td><td class="n">${fmt(r.orders)}</td><td class="n">${fmt(r.revenue)}</td><td class="n">${r.avg.toFixed(2)}</td></tr>`).join('');
+    const bars = series.slice(-30), max = Math.max(1, ...bars.map((b) => b.revenue)), w = 600 / 30;
+    $('chart').innerHTML = bars.map((b, i) => { const h = (b.revenue / max) * 130; return `<rect x="${i * w + 1}" y="${140 - h}" width="${w - 2}" height="${h}" fill="var(--bar)" rx="2"/>`; }).join('');
+    R.samples.push({ rate, kept: st.rows, readMs, regions: regions.length, seconds: series.length, worst, badLines: st.badLines, errors: st.errors });
+    worst = 0;
+  }, 500);
+} catch (err) {
+  R.errors.push(String(err?.stack ?? err));
+  $('about').textContent = `Failed: ${err.message}`;
+}
+
+// ?report=name: after 10 s, send what was measured to the test server
+const report = params.get('report');
+if (report) setTimeout(() => fetch(`/report?name=${encodeURIComponent(report)}`, { method: 'POST', body: JSON.stringify({ ...R, userAgent: navigator.userAgent }) }), 10_000);
+</script>
+</body>
+</html>
