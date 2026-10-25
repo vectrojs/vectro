@@ -14,7 +14,7 @@ const R = { userAgent: navigator.userAgent, runs: [] };
 let seed = 5;
 const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff) - 0.5;
 try {
-  const N = 50_000, DIM = 384;
+  const N = Number(new URLSearchParams(location.search).get("n") ?? 50_000), DIM = 384;
   const flat = Float32Array.from({ length: N * DIM }, rnd);
   const q = Float32Array.from({ length: DIM }, rnd);
   // brute force cosine, in float32 like the index

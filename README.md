@@ -91,20 +91,19 @@ the best, so it reuses the compiled kernels, filters and split tables (pass a
 `SplitEngine` to use Web Workers on any page). It is exact, not approximate:
 no index to build or tune, results identical to brute force.
 
-`npm run bench:vectors` (M1 Pro, 384 dimensions, top 10, cosine; the machine
-was short of memory, so treat these as provisional):
+`npm run bench:vectors` (M1 Pro, 384 dimensions, top 10, cosine):
 
 | Embeddings | Vectro | Plain JS loop (Float32Array) |
 |---|---|---|
-| 100,000 (154 MB) | 11.4 ms | 36.9 ms |
-| 200,000 (307 MB) | 16.2 ms | 75.4 ms |
+| 100,000 (154 MB) | 11.7 ms | 35.9 ms (3.1×) |
+| 200,000 (307 MB) | 13.8 ms | 71.5 ms (5.2×) |
+| 500,000 (768 MB) | 22.8 ms | 179.3 ms (7.9×) |
 
 With a `SplitEngine`, every worker searches its own rows in one round trip
-and the page keeps the best k. Open question: in Chrome (50,000 × 384) the
-page's own thread (10 ms) beat 8 Web Workers (58 ms), and in Node more threads
-helped little (200,000 × 384: 14.6 ms split, 18.8 ms threads, 21.7 ms one
-thread). Measured on a machine short of memory and CPU; to re-measure on a
-clean one (`examples/check/vectors.html` in a browser).
+and the page keeps the best k. In Chrome (`examples/check/vectors.html?n=200000`),
+8 Web Workers took 12.4 ms against 21 ms on the page's own thread; at 50,000
+vectors the two were about equal (10.1 vs 8.8 ms). Keep the tab in front when
+measuring: browsers slow down hidden tabs.
 
 `table.select(...columns)` (a narrow view, no copy) and
 `splitTable.topAsync(k, by, { columns })` keep top-k cheap on wide tables.
@@ -155,11 +154,13 @@ const fixed = await orders.snapshotAsync();                                     
 - **Queries go first:** parsing runs one batch per event-loop turn, so a query
   waits for at most one batch.
 
-**In a browser** (`examples/stream/`, Chrome, 4 Web Workers each reading its own
-WebSocket of JSON lines): it kept up with **1.13–1.2 million orders per second**
-(the feed's rate, so the real limit is higher), the 30-second window read in
-0.2–14 ms, and the page never waited more than 6 ms. Run it:
-`npm run serve:split`, then open `/examples/stream/?rate=300000`.
+**In a browser** (`examples/stream/`, Chrome, Web Workers each reading its own
+WebSocket of JSON lines): with 4 workers it kept up with the feed's
+**2 million orders per second**; with 8 workers it took in **3.5–3.6 million per
+second** (the test feed, one Node thread writing JSON, is the likely limit).
+The page never waited more than 4 ms, and the 30-second window read in
+0.1–11 ms. Run it: `npm run serve:split`, then open
+`/examples/stream/?workers=8&rate=500000`.
 
 **In Node** (`npm run bench:stream`, M1 Pro, 7 workers, 10M rows kept,
 localhost TCP, a live query every 250 ms over every kept row):
@@ -168,11 +169,11 @@ localhost TCP, a live query every 250 ms over every kept row):
 |---|---|---|---|
 | Plain Node, 1 connection (split/Number parsing, a loop per query) | 3.2–3.3M | 19–20 / 23 ms | 40–41 ms |
 | Vectro, 1 connection, chunks pushed to workers | 17.0–17.5M | 13–14 / 22–32 ms | 6–9 ms |
-| Vectro, 1 connection per worker | 16.7–18.5M | 12–13 / 31–62 ms | 19–47 ms |
+| Vectro, 1 connection per worker | 16.7–18.5M | 12–14 / 29–62 ms | 12 ms (19–47 ms on an overloaded machine) |
 
-The producer runs on the same machine, so all 8 cores are busy. With JSON
-lines (`FORMAT=ndjson`), one run gave 3.6M rows/s vs 1.4M for `JSON.parse` per
-line. That needs remeasuring: the machine was swapping heavily at the time.
+The producer runs on the same machine, so all 8 cores are busy. JSON lines
+(`FORMAT=ndjson`): Vectro took in 9.3–10.3M rows/s against 2.45M for plain Node
+using `JSON.parse` per line, with live queries at 12–14 ms (plain: 18.5 ms).
 
 ## Runtimes
 
