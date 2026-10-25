@@ -39,12 +39,13 @@
   ],
   "scripts": {
     "build": "node scripts/build-wasm.mjs",
-    "test": "node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs && node test/test-async.mjs && node test/test-split.mjs && node test/test-balance.mjs && node test/test-stream.mjs && node test/test-ndjson.mjs && node test/test-window.mjs && node test/test-websocket.mjs && node test/test-frames.mjs && node test/test-emitter.mjs && node test/test-arrow.mjs && node test/test-groupby.mjs && node test/test-join.mjs && node test/test-distinct.mjs && node test/test-types.mjs && node test/test-plan.mjs && node test/test-sql.mjs && node test/test-sort.mjs && node test/test-zones.mjs && node test/test-textfns.mjs && node test/test-vectors.mjs && node test/test-mcp.mjs && node test/test-check-cases.mjs",
+    "test": "node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs && node test/test-async.mjs && node test/test-split.mjs && node test/test-balance.mjs && node test/test-stream.mjs && node test/test-ndjson.mjs && node test/test-window.mjs && node test/test-websocket.mjs && node test/test-frames.mjs && node test/test-emitter.mjs && node test/test-arrow.mjs && node test/test-groupby.mjs && node test/test-join.mjs && node test/test-distinct.mjs && node test/test-types.mjs && node test/test-plan.mjs && node test/test-sql.mjs && node test/test-pack.mjs && node test/test-sort.mjs && node test/test-zones.mjs && node test/test-textfns.mjs && node test/test-vectors.mjs && node test/test-mcp.mjs && node test/test-check-cases.mjs",
     "test:single": "VECTRO_MODE=single sh -c 'node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs'",
     "test:interp": "VECTRO_MODE=interp sh -c 'node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs'",
     "test:edge": "npm run build && VECTRO_MODE=edge sh -c 'node --disallow-code-generation-from-strings test/test-ops.mjs && node --disallow-code-generation-from-strings test/test-fusion.mjs && node --disallow-code-generation-from-strings test/test-tables.mjs && node --disallow-code-generation-from-strings test/test-csv.mjs'",
     "test:browser-sim": "VECTRO_MODE=browser-sim sh -c 'node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs && node test/test-async.mjs'",
-    "test:all": "npm test && npm run test:single && npm run test:interp && npm run test:edge && npm run test:browser-sim",
+    "test:all": "npm test && npm run test:single && npm run test:interp && npm run test:edge && npm run test:browser-sim && npm run test:compressed",
+    "test:compressed": "VECTRO_COMPRESS=1 npm test",
     "check:expected": "node scripts/make-check-expected.mjs",
     "bench": "node --max-old-space-size=8192 bench/bench.mjs",
     "bench:async": "node --max-old-space-size=8192 bench/bench-async.mjs",
@@ -57,6 +58,7 @@
     "bench:sort": "node --max-old-space-size=8192 bench/bench-sort.mjs",
     "bench:vectors": "node --max-old-space-size=8192 bench/bench-vectors.mjs",
     "mcp": "node mcp/server.mjs",
+    "bench:pack": "node --max-old-space-size=8192 bench/bench-pack.mjs",
     "bench:plan": "node --max-old-space-size=8192 bench/bench-plan.mjs",
     "bench:zones": "node --max-old-space-size=8192 bench/bench-zones.mjs"
   },

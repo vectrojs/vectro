@@ -17,6 +17,7 @@ import { Query } from './plan.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
 import { DATE_FNS, DATE_RESULT, parseDateText, toMillis } from './dates.mjs';
+import { chooseEncoding, encodingCandidates, packInto, decodeOne, KINDS } from './pack.mjs';
 
 const IDENT = /^[A-Za-z_]\w*$/;
 const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count', 'countDistinct', 'approxDistinct']);
@@ -47,7 +48,11 @@ export class Table {
     if (!this.pred || !this.zones || this.n < 4 * ZONE_ROWS) return this;
     const zonesOf = (name) => {
       const c = this.cols.get(name);
-      return (c.zones ??= computeZones(this.engine.live(c.data), this.n));
+      if (c.zones) return c.zones;
+      if (!c.enc) return (c.zones = computeZones(this.engine.live(c.data), this.n));
+      const codes = this.engine.live(c.data), plain = new Float64Array(this.n); // packed: zones of the values
+      for (let i = 0; i < this.n; i++) plain[i] = decodeOne(c.enc, codes[i], this.type === Float32Array);
+      return (c.zones = computeZones(plain, this.n));
     };
     const range = zoneRange(this.pred, this.cols, this.params, this.n, zonesOf, this.type === Float32Array ? Math.fround : undefined);
     if (!range) return this;
@@ -62,7 +67,7 @@ export class Table {
 
   // dates: names of columns holding dates as ms or ISO text (arrays of Date
   // objects are dates anyway).
-  static fromColumns(engine, columns, { type = Float64Array, dates = [] } = {}) {
+  static fromColumns(engine, columns, { type = Float64Array, dates = [], compress = false } = {}) {
     for (const [name, values] of Object.entries(columns)) {
       if (dates.includes(name) || isDates(values)) columns = { ...columns, [name]: { dates: Float64Array.from(values, toMillis) } };
     }
@@ -77,7 +82,8 @@ export class Table {
       cols.set(name, values.dates ? { data: copyNumbers(engine, type, values.dates), dict: null, codes: null, date: true }
         : isCoded(values) ? codedText(engine, type, values) : isText(values) ? encodeText(engine, type, values) : { data: copyNumbers(engine, type, values), dict: null, codes: null });
     }
-    return new Table(engine, cols, n, { owned: [...cols.keys()] });
+    const t = new Table(engine, cols, n, { owned: [...cols.keys()] });
+    return compress ? t.compress() : t;
   }
 
   // Convert an array of objects. Column types come from the first row.
@@ -109,7 +115,7 @@ export class Table {
 
   get length() { return this.n; }            // physical rows (ignores the filter)
   get columnNames() { return [...this.cols.keys()]; }
-  get type() { return this.cols.values().next().value.data.constructor; }
+  get type() { const c = this.cols.values().next().value; return c.enc ? c.plainType : c.data.constructor; }
 
   column(name) {
     const c = this.cols.get(name);
@@ -137,8 +143,133 @@ export class Table {
 
   #vars(params) {
     const vars = { ...params };
-    for (const [name, c] of this.cols) vars[name] = c.data;
+    const t = this.type === Float32Array ? 'f32' : 'f64';
+    for (const [name, c] of this.cols) vars[name] = c.enc ? { data: c.data, enc: c.enc, n: this.n, type: t } : c.data; // packed: the kernels decode it
     return vars;
+  }
+
+  // ---- compressed columns (see pack.mjs) ---------------------------------------------
+  // Store each number and category column in 1, 2 or 4 bytes per row where
+  // every value decodes back exactly; others stay as they are. In place: the
+  // table (and its views) keep working, with less memory. Returns the table.
+  compress() { return this.engine._drive(this.#compressG()); }
+  compressAsync() { return this.engine._driveAsync(this.#compressG()); }
+
+  *#compressG() {
+    const { engine } = this;
+    const f32 = this.type === Float32Array;
+    for (const c of new Set(this.cols.values())) {
+      if (c.enc || c.strings) continue;
+      const values = engine.live(c.data);
+      const n = values.length;
+      const enc = engine.jit ? yield* this.#chooseEncodingG(c.data, n, f32) : chooseEncoding(values, n, f32);
+      if (!enc) continue;
+      const plainType = values.constructor, old = c.data;
+      c.data = engine.jit ? yield* this.#packG(old, n, enc) : packInto(engine, old, n, enc);
+      c.enc = enc;
+      c.plainType = plainType;
+      c.rows = n;
+      engine.free(old);
+    }
+    for (const c of this.cols.values()) c.data = engine.live(c.data);
+    return this;
+  }
+
+  // On every thread: statistics in one pass, then each candidate checked
+  // value by value with the kernels' own arithmetic (count of values that
+  // wouldn't come back exactly).
+  *#chooseEncodingG(data, n, f32) {
+    const { engine } = this;
+    if (!n) return null;
+    const [min, max, frac, nan, inf, negZero] = yield* engine.evalG([
+      'min(v == v ? v : Infinity)', 'max(v == v ? v : -Infinity)', 'count(v == v && v != floor(v))',
+      'count(v != v)', 'count(v == Infinity || v == -Infinity)', 'count(v == 0 && 1 / v < 0)'], { v: data });
+    const cands = encodingCandidates({ min, max, whole: frac === 0, nan: nan > 0, inf: inf > 0, negZero: negZero > 0 }, f32);
+    for (const enc of cands) {
+      const back = enc.div ? `floor(v * ${enc.div} + 0.5) / ${enc.div}` : `floor((v - base) / ${enc.mul} + 0.5) * ${enc.mul} + base`;
+      const bad = yield* engine.evalG(`count(v == v && ${back} != v)`, { v: data, base: enc.base });
+      if (bad === 0) return enc;
+    }
+    return null;
+  }
+
+  // The codes, computed on every thread, in a new packed array.
+  *#packG(data, n, enc) {
+    const { engine } = this;
+    const k = KINDS[enc.kind];
+    const codes = engine.alloc(this.type, n);
+    try {
+      const code = enc.div ? `floor(v * ${enc.div} + 0.5)` : `floor((v - base) / ${enc.mul} + 0.5)`;
+      yield* engine.evalG(`v == v ? ${code} : ${k.nan}`, { v: data, base: enc.base }, codes);
+      const out = engine.alloc(k.Type, n + 16 / k.bytes);
+      out.set(engine.live(codes).subarray(0, n));
+      return out;
+    } finally { engine.free(codes); }
+  }
+
+  // Bytes the columns take now, and without packing.
+  memoryBytes() {
+    let now = 0, plain = 0;
+    const bpe = this.type.BYTES_PER_ELEMENT;
+    for (const c of new Set(this.cols.values())) {
+      const rows = c.enc ? c.rows : c.data.length;
+      now += c.enc ? c.data.BYTES_PER_ELEMENT * rows : c.data.byteLength;
+      plain += rows * bpe;
+    }
+    return { bytes: now, uncompressed: plain };
+  }
+
+  #hasPacked() { for (const c of this.cols.values()) if (c.enc) return true; return false; }
+
+  // The same rows with packed columns decoded (new arrays, owned): all of
+  // them, or those in `names` (the others stay packed).
+  *#decodedG(names = null) {
+    const { engine } = this;
+    const t = this.type === Float32Array ? 'f32' : 'f64';
+    const cols = new Map(), owned = [];
+    for (const [name, c] of this.cols) {
+      if (!c.enc || (names && !names.has(name))) { cols.set(name, c); continue; }
+      const out = engine.alloc(c.plainType, this.n);
+      if (engine.jit) yield* engine.evalG('x', { x: { data: c.data, enc: c.enc, n: this.n, type: t } }, out);
+      else { const codes = engine.live(c.data), o = engine.live(out); for (let i = 0; i < this.n; i++) o[i] = decodeOne(c.enc, codes[i], t === 'f32'); }
+      const { enc, plainType, rows, ...rest } = c;
+      cols.set(name, { ...rest, data: out });
+      owned.push(name);
+    }
+    for (const c of cols.values()) c.data = engine.live(c.data);
+    return new Table(engine, cols, this.n, { pred: this.pred, params: this.params, owned, zones: this.zones });
+  }
+
+  // collect() for a table with packed columns: the filter as 1 / 0 (fused,
+  // reads packed columns), the matching row numbers (compacted), then every
+  // column gathered (packed columns stay packed).
+  *#collectPackedG() {
+    const { engine, n } = this;
+    const T = this.type, t = T === Float32Array ? 'f32' : 'f64';
+    const mask = engine.alloc(T, n), rows = engine.alloc(T, n);
+    try {
+      yield* engine.evalG(`(${this.pred}) ? 1 : 0`, this.#vars(this.params), mask);
+      const r = engine.live(rows);
+      for (let i = 0; i < n; i++) r[i] = i;
+      const tmp = new Table(engine, new Map([['__m', { data: engine.live(mask), dict: null, codes: null }], ['__r', { data: engine.live(rows), dict: null, codes: null }]]), n, { pred: '__m != 0', zones: false });
+      const hit = yield* tmp.#collectG();
+      const m = hit.n, perm = engine.alloc(Uint32Array, Math.max(1, m));
+      perm.set(engine.live(hit.cols.get('__r').data).subarray(0, m));
+      hit.dispose();
+      try {
+        const out = new Map();
+        for (const [name, c] of this.cols) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, m, t, c.enc), zones: undefined, ...(c.enc ? { rows: m } : {}) });
+        for (const c of out.values()) c.data = engine.live(c.data);
+        return new Table(engine, out, m, { owned: [...out.keys()] });
+      } finally { engine.free(perm); }
+    } finally { engine.free(mask); engine.free(rows); }
+  }
+
+  // Run op on the decoded table (packed columns read as plain numbers).
+  *#viaPlainG(op, names = null) {
+    const t = yield* this.#decodedG(names);
+    let out;
+    try { out = yield* op(t); return out; } finally { if (out !== t) t.dispose(); }
   }
 
   #mergeParams(params) {
@@ -182,6 +313,7 @@ export class Table {
   aggAsync(spec, params = {}) { return this.engine._driveAsync(this.#aggG(spec, params)); }
 
   *#aggG(spec, params) {
+    if (!this.engine.jit && this.#hasPacked()) return yield* this.#viaPlainG((t) => t.#aggG(spec, params)); // (the interpreter reads plain numbers)
     const narrow = this.#narrow();
     if (narrow !== this) return yield* narrow.#aggG(spec, params);
     const merged = this.#mergeParams(params);
@@ -283,6 +415,17 @@ export class Table {
   }
 
   *#groupAggG(keys, spec, params) {
+    if (this.#hasPacked()) {
+      const used = new Set(keys);
+      for (const src of [...Object.values(spec), this.pred ?? '1']) walk(parse(src), (m) => { if (m.t === 'var' && this.cols.has(m.name)) used.add(m.name); });
+      if (!this.engine.jit) { // the interpreter reads plain numbers
+        if ([...used].some((n) => this.cols.get(n).enc)) return yield* this.#viaPlainG((t) => t.#groupAggG(keys, spec, params), used);
+      } else if (keys.some((k) => this.cols.get(k).enc)) { // the group kernel reads packed columns; the hash path needs plain keys
+        const direct = yield* this.#directGroups(keys, Object.keys(spec).length + 1);
+        if (direct?.owned) this.engine.free(direct.data);
+        if (!direct) return yield* this.#viaPlainG((t) => t.#groupAggG(keys, spec, params), new Set(keys.filter((k) => this.cols.get(k).enc)));
+      }
+    }
     const narrow = this.#narrow();
     if (narrow !== this) return yield* narrow.#groupAggG(keys, spec, params);
     const merged = this.#mergeParams(params);
@@ -320,7 +463,8 @@ export class Table {
       if (c.dict) { sizes.push(c.dict.length); offsets.push(0); continue; }
       if (!this.n) { sizes.push(0); offsets.push(0); continue; }
       // whole numbers in a range under 2^24 (from their minimum: 202301..202412, IDs from 1e9, negatives)
-      const [lo, hi, frac] = yield* engine.evalG(['min(k)', 'max(k)', 'count(k != floor(k))'], { k: c.data });
+      const k = c.enc ? { data: c.data, enc: c.enc, n: this.n, type: this.type === Float32Array ? 'f32' : 'f64' } : c.data;
+      const [lo, hi, frac] = yield* engine.evalG(['min(k)', 'max(k)', 'count(k != floor(k))'], { k });
       if (frac > 0 || !(hi - lo < 2 ** 24) || !Number.isFinite(lo)) return null;
       sizes.push(hi - lo + 1);
       offsets.push(lo);
@@ -334,7 +478,7 @@ export class Table {
       for (let r = 0; r < keep.length; r++) out[r] = (Math.floor(keep[r] / d) % size) + o;
       return out;
     };
-    if (keys.length === 1 && offsets[0] === 0) return { K, data: this.cols.get(keys[0]).data, keyColumn, owned: false, sorted: true };
+    if (keys.length === 1 && offsets[0] === 0) return { K, data: this.cols.get(keys[0]).data, enc: this.cols.get(keys[0]).enc ?? null, keyColumn, owned: false, sorted: true };
     const term = (k) => (offsets[k] ? `(${keys[k]} - ${offsets[k] < 0 ? `(${offsets[k]})` : offsets[k]})` : keys[k]);
     let expr = term(0);
     for (let k = 1; k < keys.length; k++) expr = `(${expr}) * ${sizes[k]} + ${term(k)}`;
@@ -509,7 +653,13 @@ export class Table {
       columns[key] = dict ? { codes: new Uint32Array(codes[k]), labels: dict } : codes[k];
     });
     for (const it of allItems) { // distinct counts per group: from (group, value) pairs
-      if (DISTINCT.has(it.fn)) it.perGroup = yield* this.#distinctCountsG(it.arg, merged, groups.data, K);
+      if (!DISTINCT.has(it.fn)) continue;
+      let gData = groups.data;
+      if (groups.enc) { // a packed key: group numbers as plain numbers
+        gData = engine.alloc(this.type, this.n);
+        yield* engine.evalG('x', { x: { data: groups.data, enc: groups.enc, n: this.n, type: this.type === Float32Array ? 'f32' : 'f64' } }, gData);
+      }
+      try { it.perGroup = yield* this.#distinctCountsG(it.arg, merged, gData, K); } finally { if (gData !== groups.data) engine.free(gData); }
     }
     allItems.forEach((it) => {
       const i = items.indexOf(it);
@@ -556,15 +706,18 @@ export class Table {
     // filtered (the hash path collects them first).
     const slotsNeeded = T * J * K * C;
     const big = T > 1 && slotsNeeded > (engine._bigGroupSlots ?? 2 ** 23);
+    // packed columns (and a packed key) are decoded by the kernel as it reads them
+    const encs = arrayNames.map((nm) => this.cols.get(nm).enc ?? null), keyEnc = groups.enc ?? null;
+    const encKey = JSON.stringify([encs, keyEnc]);
     if (big && engine.jit && J * K <= (engine._maxGroupSlots ?? MAX_GROUP_SLOTS)) {
       // many groups: each thread adds up its own range of groups, all rows
       const acc = engine.alloc(Float64Array, J * K);
       analysis.items.forEach((it, j) => engine.live(acc).fill(IDENTITY[it.reduce], j * K, (j + 1) * K));
-      const cacheKey = `grouprange|${t}|${sources.join(';')}|${this.pred}|${arrayNames}|${scalarNames}`;
+      const cacheKey = `grouprange|${t}|${sources.join(';')}|${this.pred}|${arrayNames}|${scalarNames}|${encKey}`;
       engine._tableKernels ??= new Map();
       let v = engine._tableKernels.get(cacheKey);
       if (!v) {
-        v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, 1, engine.isShared, true));
+        v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, 1, engine.isShared, true, encs, keyEnc));
         engine._tableKernels.set(cacheKey, v);
       }
       const arrays = [...arrayNames.map((nm) => this.cols.get(nm).data), groups.data];
@@ -573,7 +726,13 @@ export class Table {
       totals = analysis.items.map((_, j) => a.slice(j * K, (j + 1) * K));
       engine.free(acc);
     } else if (slotsNeeded > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (!this.pred && big)) {
-      totals = yield* this.#scatterG(groups.data, K, analysis.items, sources, merged); // too many groups for per-thread accumulators
+      let keyData = groups.data;
+      if (keyEnc) { // (the scatter reads group numbers as plain numbers)
+        keyData = engine.alloc(this.type, this.n);
+        const codes = engine.live(groups.data), o = engine.live(keyData);
+        for (let i = 0; i < this.n; i++) o[i] = decodeOne(keyEnc, codes[i], t === 'f32');
+      }
+      try { totals = yield* this.#scatterG(keyData, K, analysis.items, sources, merged); } finally { if (keyData !== groups.data) engine.free(keyData); } // too many groups for per-thread accumulators
     } else {
       // Accumulators: one block per thread, padded to 256 bytes so two threads
       // never update the same cache line. Every slot starts at its identity.
@@ -584,11 +743,11 @@ export class Table {
         for (let s = 0; s < T; s++) acc.fill(IDENTITY[it.reduce], ...slots(s, j));
       });
       if (engine.jit) {
-        const cacheKey = `group|${t}|${C}|${sources.join(';')}|${this.pred}|${arrayNames}|${scalarNames}`;
+        const cacheKey = `group|${t}|${C}|${sources.join(';')}|${this.pred}|${arrayNames}|${scalarNames}|${encKey}`;
         engine._tableKernels ??= new Map();
         let v = engine._tableKernels.get(cacheKey);
         if (!v) {
-          v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, C, engine.isShared));
+          v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, C, engine.isShared, false, encs, keyEnc));
           engine._tableKernels.set(cacheKey, v);
         }
         const arrays = [...arrayNames.map((nm) => this.cols.get(nm).data), groups.data];
@@ -635,6 +794,7 @@ export class Table {
   // table (every thread), and each pair adds one to its group. Missing values
   // (NaN) don't count, as in SQL's COUNT(DISTINCT x).
   *#distinctCountsG(arg, merged, groupData, K) {
+    if (this.#hasPacked()) return yield* this.#viaPlainG((t) => t.#distinctCountsG(arg, merged, groupData, K));
     const { engine, n } = this;
     const counts = new Float64Array(K);
     if (!n) return counts;
@@ -700,6 +860,7 @@ export class Table {
   collectAsync() { return this.engine._driveAsync(this.#collectG()); }
 
   *#collectG() {
+    if (this.#hasPacked() && this.pred) return yield* (this.engine.jit ? this.#collectPackedG() : this.#viaPlainG((t) => t.#collectG())); // (gathering packed codes needs compiled kernels)
     const narrow = this.#narrow();
     if (narrow !== this) return yield* narrow.#collectG();
     if (!this.pred) return this;
@@ -777,7 +938,9 @@ export class Table {
     for (const key of keys) {
       if (key.column) {
         const c = this.cols.get(key.column), rank = labelRanks(c.dict, key.desc), codes = engine.live(c.data);
-        out.push(Float64Array.from(codes, (code) => rank[code]));
+        const out1 = new Float64Array(this.n);
+        for (let i = 0; i < this.n; i++) out1[i] = rank[c.enc ? decodeOne(c.enc, codes[i]) : codes[i]];
+        out.push(out1);
         continue;
       }
       const d = yield* this.#deriveG('__np_sortkey', key.text, {});
@@ -808,20 +971,20 @@ export class Table {
     try {
       for (const key of keys) {
         const c = key.column ? null : this.cols.get(key.text.trim());
-        if (c && !c.dict && !c.strings) { arrays.push(c.data); continue; } // a number column: as it is
+        if (c && !c.dict && !c.strings && !c.enc) { arrays.push(c.data); continue; } // a number column: as it is (packed: decoded below)
         const a = engine.alloc(this.type, n);
         made.push(a);
         arrays.push(a);
         if (key.column) { // text: rank of each label, A to Z (or Z to A)
           const col = this.cols.get(key.column), rank = labelRanks(col.dict, key.desc);
           const codes = engine.live(col.data), out = engine.live(a);
-          for (let i = 0; i < n; i++) out[i] = rank[codes[i]];
+          for (let i = 0; i < n; i++) out[i] = rank[col.enc ? decodeOne(col.enc, codes[i]) : codes[i]];
         } else yield* engine.evalG(this.#bind(key.text, {}).src, this.#vars({}), a);
       }
       const perm = yield* sortPermG(engine, arrays, n, t);
       try {
         const out = new Map();
-        for (const [name, c] of this.cols) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, n, t), zones: undefined });
+        for (const [name, c] of this.cols) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, n, t, c.enc), zones: undefined, ...(c.enc ? { rows: n } : {}) }); // (packed stays packed)
         for (const c of out.values()) c.data = engine.live(c.data); // later allocations may have moved memory
         return new Table(engine, out, n, { owned: [...out.keys()] });
       } finally {
@@ -838,10 +1001,10 @@ export class Table {
     const out = new Map();
     for (const [name, c] of this.cols) {
       if (omit?.has(name)) continue;
-      const data = engine.alloc(c.data.constructor, count);
+      const data = engine.alloc(c.data.constructor, count + (c.enc ? 16 / c.data.BYTES_PER_ELEMENT : 0)); // (packed: codes copied as they are, room after the end)
       const src = engine.live(c.data);
       for (let i = 0; i < count; i++) data[i] = src[perm[i]];
-      out.set(name, { ...c, data, zones: undefined }); // (new rows: no zone maps yet)
+      out.set(name, { ...c, data, zones: undefined, ...(c.enc ? { rows: count } : {}) }); // (new rows: no zone maps yet)
     }
     for (const c of out.values()) c.data = engine.live(c.data); // later allocations may have moved memory
     return new Table(engine, out, count, { owned: [...out.keys()] });
@@ -913,6 +1076,7 @@ export class Table {
   toColumnsAsync() { return this.engine._driveAsync(this.#toColumnsG()); }
 
   *#toColumnsG() {
+    if (this.#hasPacked()) return yield* this.#viaPlainG((t) => t.#toColumnsG());
     const t = yield* this.#collectG();
     const out = {};
     for (const [name, c] of t.cols) {
@@ -940,9 +1104,13 @@ export class Table {
     const rows = [];
     const { engine } = this;
     const cols = [...t.cols].map(([name, c]) => [name, c, engine.live(c.data), c.strings ? engine.live(c.strings) : null]);
+    const f32 = t.type === Float32Array;
     for (let i = 0; i < Math.min(t.n, limit); i++) {
       const row = {};
-      for (const [name, c, data, sbuf] of cols) row[name] = c.dict ? c.dict[data[i]] : sbuf ? decodeString(sbuf, data[i]) : c.date ? (data[i] === data[i] ? new Date(data[i]) : null) : data[i];
+      for (const [name, c, data, sbuf] of cols) {
+        const x = c.enc ? decodeOne(c.enc, data[i], f32) : data[i]; // (packed: decoded here, row by row)
+        row[name] = c.dict ? c.dict[x] : sbuf ? decodeString(sbuf, x) : c.date ? (x === x ? new Date(x) : null) : x;
+      }
       rows.push(row);
     }
     if (t !== this) t.dispose();
@@ -985,6 +1153,8 @@ export class Table {
   joinAsync(other, opts) { return this.engine._driveAsync(this.#joinG(other, opts)); }
 
   *#joinG(other, opts) {
+    if (this.#hasPacked()) return yield* this.#viaPlainG((t) => t.#joinG(other, opts));
+    if (other instanceof Table && other.#hasPacked()) { const o = yield* other.#decodedG(); try { return yield* this.#joinG(o, opts); } finally { o.dispose(); } }
     if (!(other instanceof Table)) throw new TypeError('vectro: join needs another table of the same engine');
     const l = yield* this.#collectG(), r = yield* other.#collectG();
     try {

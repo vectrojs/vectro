@@ -75,6 +75,20 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   yourself. On 10M rows vs DuckDB (`compare/bench-distinct.mjs`): 365 days
   4 ms vs 5; regions per day 9 ms vs 34; 1M accounts 81 ms vs 48; accounts per
   region (5.7M pairs) 214 ms vs 100.
+- **Compressed columns:** `table.compress()` (or `engine.table(cols, { compress:
+  true })`, `parseCSV(text, { compress: true })`) stores each number and
+  category column in 1, 2 or 4 bytes per row when every value comes back
+  exactly: small counts and category codes in 1 byte, prices in cents and
+  timestamps on whole seconds in 4, missing values as a reserved code. It is in
+  place (views keep working) and checked value by value with the kernels' own
+  arithmetic, so answers never change. The fused kernels read packed columns
+  directly (SIMD widen, convert, scale), so do group-by kernels; sort, top and
+  join copy the codes, so results stay small; other operations decode what
+  they need. 10M orders (`npm run bench:pack`): 458 MB → 143 MB (3.2x smaller),
+  compressed in 0.34 s; queries run about as fast as on plain columns (a new
+  column 4.0 → 3.0 ms, filtered revenue 2.4 → 2.9 ms, group by region 4.7 →
+  4.4 ms, top 10 8.4 → 12.9 ms). The whole test suite also runs with every
+  table compressed (`npm run test:compressed`).
 - **SQL:** `sql(text, { orders, customers })` runs a SELECT over your tables
   and returns a lazy query (`.toRows()`, `.collect()`, `.explain()`):
 

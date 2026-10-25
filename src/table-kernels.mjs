@@ -3,7 +3,7 @@
 // and every aggregation into one pass over memory.
 
 import { I32, F64, TY, Fn, buildModule, get, set, i32c, block, loop, end, br, brIf, i32add, i32mul, i32and, i32geu } from './wasm.mjs';
-import { Emitter } from './fuse.mjs';
+import { Emitter, packedScalar, PACKED_BYTES } from './fuse.mjs';
 
 const F64_LOAD = [0x2b, 3, 0], F64_STORE = [0x39, 3, 0];
 const F64_OP = { add: [0xa0], min: [0xa4], max: [0xa5] };
@@ -23,12 +23,15 @@ function bindValues(f, t, arrayNames, firstScalarParam, scalarNames) {
   return env;
 }
 
+// packed columns (a.enc, see pack.mjs) are decoded as they are read
 function loadRow(f, ty, env) {
-  for (const a of env.arrays.values()) f.emit(get(a.ptr), ty.load, set(a.sca));
+  for (const a of env.arrays.values()) {
+    if (a.enc) { packedScalar(f, env.t, a.enc, a.ptr, env.raw, env.tmp); f.emit(set(a.sca)); } else f.emit(get(a.ptr), ty.load, set(a.sca));
+  }
 }
 
-function advance(f, ty, ptrs) {
-  for (const p of ptrs) f.emit(get(p), i32c(ty.bytes), i32add, set(p));
+function advance(f, ty, ptrs, encs = []) {
+  ptrs.forEach((p, i) => f.emit(get(p), i32c(encs[i] ? PACKED_BYTES[encs[i].kind] : ty.bytes), i32add, set(p)));
 }
 
 // Group-by: for every row (that passes `pred`), add each aggregation's value
@@ -37,8 +40,8 @@ function advance(f, ty, ptrs) {
 // run of rows in the same group doesn't wait on its own previous update.
 // Signature: (array ptrs..., key ptr, n, accBase, K, scalars...)
 // ranged: two more params (lo, hi) after K; only rows whose group is in
-// [lo, hi) are added (see runGroupRange).
-export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, shared = true, ranged = false) {
+// [lo, hi) are added (see runGroupRange). encs[i] / keyEnc: packed columns.
+export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, shared = true, ranged = false, encs = [], keyEnc = null) {
   const log2C = Math.log2(C);
   if (!Number.isInteger(log2C)) throw new Error('copies must be a power of two');
   const ty = TY[t];
@@ -47,6 +50,8 @@ export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, 
   const extra = ranged ? 2 : 0;
   const f = new Fn('k', [...Array(A).fill(I32), I32, I32, I32, I32, ...Array(extra).fill(I32), ...Array(scalarNames.length).fill(F64)], []);
   const env = bindValues(f, t, arrayNames, A + 4 + extra, scalarNames);
+  arrayNames.forEach((name, i) => { env.arrays.get(name).enc = encs[i] ?? null; });
+  env.t = t; env.raw = f.local(ty.val); env.tmp = f.local(ty.val);
   const em = new Emitter(f, t, env);
   em.prepare([...items.map((it) => it.ast), pred]); // (the loop body is emitted once: no reset needed)
   const stop = f.local(I32), idx = f.local(I32), addr = f.local(I32), copy = f.local(I32);
@@ -54,12 +59,13 @@ export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, 
 
   // base_j = accBase + j * K * C * 8
   items.forEach((_, j) => f.emit(get(K), i32c(j * C * 8), [0x6c], get(accBase), i32add, set(bases[j])));
-  f.emit(get(n), i32c(ty.bytes), [0x6c], get(key), i32add, set(stop));
+  f.emit(get(n), i32c(keyEnc ? PACKED_BYTES[keyEnc.kind] : ty.bytes), [0x6c], get(key), i32add, set(stop));
 
   f.emit(block, loop, get(key), get(stop), i32geu, brIf(1));
   loadRow(f, ty, env);
   // slot = key * C + copy
-  f.emit(get(key), ty.load, TRUNC_SAT_U[t], i32c(log2C), I32_SHL, get(copy), i32add, set(idx));
+  if (keyEnc) packedScalar(f, t, keyEnc, key, env.raw, env.tmp); else f.emit(get(key), ty.load);
+  f.emit(TRUNC_SAT_U[t], i32c(log2C), I32_SHL, get(copy), i32add, set(idx));
   f.emit(block);
   if (ranged) f.emit(get(idx), get(lo), [0x6b], get(hi), get(lo), [0x6b], i32geu, brIf(0)); // (idx - lo) >= (hi - lo), unsigned: not ours
   if (pred) { em.scaMask(pred); f.emit(I32_EQZ, brIf(0)); }
@@ -73,8 +79,8 @@ export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, 
   });
   f.emit(end);
   if (C > 1) f.emit(get(copy), i32c(1), i32add, i32c(C - 1), [0x71], set(copy));
-  advance(f, ty, [...env.arrays.values()].map((a) => a.ptr));
-  advance(f, ty, [key]);
+  advance(f, ty, [...env.arrays.values()].map((a) => a.ptr), [...env.arrays.values()].map((a) => a.enc));
+  advance(f, ty, [key], [keyEnc]);
   f.emit(br(0), end, end);
   return buildModule([f], shared);
 }

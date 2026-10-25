@@ -7,6 +7,7 @@ import { parse } from './fuse.mjs';
 import { createStreams } from './stream-worker.mjs';
 import { parseKeys } from './sort.mjs';
 import { searchTable } from './vectors.mjs';
+import { decodeOne } from './pack.mjs';
 import { SKETCH_SIZE, sketchAdd, hashNumber, hashText } from './sketch.mjs';
 
 export function serveSplitWorker(post, listen) {
@@ -44,7 +45,10 @@ export function serveSplitWorker(post, listen) {
     let r = 0, total = 0;
     for (let k = 0; k < segs.length && total < limit; k++) {
       const vars = { ...scalars };
-      for (const [name, c] of columns) vars[name] = engine.live(c.data).subarray(r, r + segs[k]); // memory may have grown
+      for (const [name, c] of columns) { // (memory may have grown: live views)
+        const part = engine.live(c.data).subarray(r, r + segs[k]);
+        vars[name] = c.enc ? { data: part, enc: c.enc, n: segs[k], type: t.type === Float32Array ? 'f32' : 'f64' } : part;
+      }
       const c = segs[k] ? engine.eval(src, vars) : 0;
       out.push(c);
       total += c;
@@ -83,7 +87,7 @@ export function serveSplitWorker(post, listen) {
       }
       for (const c of cols.values()) c.data = engine.live(c.data); // later allocations may have moved memory
       for (const name of dates) cols.get(name).date = true;
-      const n = cols.values().next().value?.data.length ?? 0;
+      const n = base ? base.length : (Object.values(text)[0]?.codes.length ?? 0);
       const t = new Table(engine, cols, n, { owned: [...order] });
       tables.set(id, t);
       return { n: t.length, names: t.columnNames };
@@ -99,13 +103,23 @@ export function serveSplitWorker(post, listen) {
     // Switch text columns to the shared dictionary: code -> lut[code].
     remap({ id, maps }) {
       const t = table(id);
+      let repack = false;
       for (const [name, { lut, dict }] of Object.entries(maps)) {
         const c = t.cols.get(name);
+        if (c.enc) { // packed codes: unpack, renumber, pack again below
+          const plain = engine.alloc(c.plainType, t.length), codes = engine.live(c.data);
+          for (let i = 0; i < t.length; i++) plain[i] = decodeOne(c.enc, codes[i], c.plainType === Float32Array);
+          engine.free(c.data);
+          c.data = plain;
+          delete c.enc; delete c.plainType; delete c.rows;
+          repack = true;
+        }
         const data = engine.live(c.data);
-        for (let i = 0; i < data.length; i++) data[i] = lut[data[i]];
+        for (let i = 0; i < t.length; i++) data[i] = lut[data[i]];
         c.dict = dict;
         c.codes = new Map(dict.map((s, i) => [s, i]));
       }
+      if (repack) t.compress();
       return true;
     },
     agg({ id, preds, spec, params }) {
@@ -211,7 +225,7 @@ export function serveSplitWorker(post, listen) {
       const value = await handlers[op](args);
       post({ rid, ok: true, value }, transferList(value));
     } catch (err) {
-      post({ rid, ok: false, error: err?.message ?? String(err) });
+      post({ rid, ok: false, error: (globalThis.process?.env?.VECTRO_DEBUG ? err?.stack : err?.message) ?? String(err) });
     }
   });
 }

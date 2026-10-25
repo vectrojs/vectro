@@ -97,7 +97,7 @@ export function createStreams(getEngine) {
     const buf = new Uint8Array(s.header.length + bytes.length);
     buf.set(s.header, 0);
     buf.set(bytes, s.header.length);
-    const t = engine.parseCSV(buf, { types: s.types, sampleRows: 1 }); // types are known
+    const t = engine.parseCSV(buf, { types: s.types, sampleRows: 1, compress: false }); // types are known; a batch is copied in at once
     try {
       append(s, t.length, (k) => { const f = t.cols.get(s.names[k]); return { data: engine.live(f.data), dict: f.dict }; }, bytes.length);
     } finally {

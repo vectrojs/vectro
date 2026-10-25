@@ -92,16 +92,26 @@ export function moveModule(shared) {
   return buildModule([f], shared);
 }
 
-// gather(start, end, unit, src, perm, dst): dst[i] = src[perm[i]] (float64 or float32).
-export function gatherModule(t, shared) {
+// gather(start, end, unit, src, perm, dst): dst[i] = src[perm[i]], for
+// elements of 8, 4, 2 or 1 bytes (float64; float32 or packed i32; u16; u8):
+// bits are copied as they are, so packed columns stay packed.
+const GATHER = {
+  8: { sh: 3, load: [0x29, 3, 0], store: [0x37, 3, 0] },  // i64.load / store
+  4: { sh: 2, load: [0x28, 2, 0], store: [0x36, 2, 0] },  // i32
+  2: { sh: 1, load: [0x2f, 1, 0], store: [0x3b, 1, 0] },  // i32.load16_u / store16
+  1: { sh: 0, load: [0x2d, 0, 0], store: [0x3a, 0, 0] },  // i32.load8_u / store8
+};
+export function gatherModule(bytes, shared) {
+  if (typeof bytes === 'string') bytes = bytes === 'f32' ? 4 : 8;
+  const { sh, load, store } = GATHER[bytes];
   const f = new Fn('k', [I32, I32, I32, I32, I32, I32], []);
   const [start, stop, , src, perm, dst] = [0, 1, 2, 3, 4, 5];
-  const i = f.local(I32), sh = t === 'f32' ? 2 : 3;
+  const i = f.local(I32);
   f.emit(get(start), set(i));
   f.emit(block, loop, get(i), get(stop), i32geu, brIf(1));
   f.emit(get(i), i32c(sh), I32_SHL, get(dst), i32add);
-  f.emit(addr4(perm, i), I32_LOAD, i32c(sh), I32_SHL, get(src), i32add, t === 'f32' ? F32_LOAD : F64_LOAD);
-  f.emit(t === 'f32' ? F32_STORE : F64_STORE);
+  f.emit(addr4(perm, i), I32_LOAD, i32c(sh), I32_SHL, get(src), i32add, load);
+  f.emit(store);
   f.emit(get(i), i32c(1), i32add, set(i), br(0), end, end);
   return buildModule([f], shared);
 }

@@ -2,7 +2,7 @@
 // `[sum(a), min(a), count(a > 500 && b < 3)]` into ONE WebAssembly SIMD
 // function that reads each array once, instead of one pass per operation.
 
-import { I32, F64, V128, TY, Fn, loops, buildModule, get, set, simd, vload, vstore } from './wasm.mjs';
+import { I32, F64, V128, TY, Fn, loops, buildModule, get, set, simd, vload, vstore, memarg } from './wasm.mjs';
 
 // ---- parsing -----------------------------------------------------------------
 
@@ -315,9 +315,43 @@ export class Emitter {
   }
 }
 
+// Packed columns (see pack.mjs): load the codes of one vector's rows, widen
+// them to 32-bit lanes, convert to floats, scale, and turn the missing code
+// into NaN. off = byte offset of the vector's first row.
+const PACKED_VEC = {
+  f64: { u8: (off) => [...simd(0x02, ...memarg(0, off)), ...simd(0xa9), ...simd(0xff)], // load8x8_u, extend_low_u, convert_low_u
+    u16: (off) => [...simd(0x5c, ...memarg(0, off)), ...simd(0xa9), ...simd(0xff)],     // load32_zero
+    i32: (off) => [...simd(0x5d, ...memarg(0, off)), ...simd(0xfe)] },                   // load64_zero, convert_low_s
+  f32: { u8: (off) => [...simd(0x5c, ...memarg(0, off)), ...simd(0x89), ...simd(0xa9), ...simd(0xfb)],
+    u16: (off) => [...simd(0x04, ...memarg(0, off)), ...simd(0xfb)],                     // load16x4_u
+    i32: (off) => [...simd(0x00, ...memarg(0, off)), ...simd(0xfa)] },
+};
+const PACKED_SCA = {
+  f64: { u8: [0x2d, 0, 0, 0xb8], u16: [0x2f, 1, 0, 0xb8], i32: [0x28, 2, 0, 0xb7] },
+  f32: { u8: [0x2d, 0, 0, 0xb3], u16: [0x2f, 1, 0, 0xb3], i32: [0x28, 2, 0, 0xb2] },
+};
+const PACKED_NAN = { u8: 255, u16: 65535, i32: -2147483648 };
+export const PACKED_BYTES = { u8: 1, u16: 2, i32: 4 };
+
+// One row of a packed column, decoded, on the stack (scalar kernels). raw and
+// tmp: locals of the element type, used when the column has missing values.
+export function packedScalar(f, t, enc, ptr, raw, tmp) {
+  const ty = TY[t], S = SCA[t];
+  const { kind, div, mul, base, nan } = enc;
+  f.emit(get(ptr), PACKED_SCA[t][kind]);
+  if (nan) f.emit([0x22, ...get(raw).slice(1)]); // local.tee
+  if (div) f.emit(ty.cnst(div), [S.div]);
+  else {
+    if (mul !== 1) f.emit(ty.cnst(mul), [S.mul]);
+    if (base !== 0) f.emit(ty.cnst(base), [S.add]);
+  }
+  if (nan) f.emit(set(tmp), ty.cnst(NaN), get(tmp), get(raw), ty.cnst(PACKED_NAN[kind]), [S.eq], [SELECT]);
+}
+
 // Build the kernel for one element type ('f64' | 'f32') and one binding of
 // names to arrays/scalars. Signature: (array ptrs..., [out ptr], n, scalars...).
-export function generate(analysis, t, arrayNames, scalarNames, shared = true) {
+// encs[i]: the packing of array i (null: plain floats).
+export function generate(analysis, t, arrayNames, scalarNames, shared = true, encs = []) {
   const ty = TY[t];
   const { items, isMap } = analysis;
   const nPtr = arrayNames.length + (isMap ? 1 : 0);
@@ -334,7 +368,7 @@ export function generate(analysis, t, arrayNames, scalarNames, shared = true) {
   // Values reused across the loop live in locals: constants, scalars, loaded vectors.
   const consts = new Map();
   const env = {
-    arrays: new Map(arrayNames.map((name, i) => [name, { ptr: i, vec: [], sca: 0 }])),
+    arrays: new Map(arrayNames.map((name, i) => [name, { ptr: i, vec: [], sca: 0, enc: encs[i] ?? null }])),
     scalars: new Map(),
     constVec: (v) => {
       if (!consts.has(v)) {
@@ -358,7 +392,40 @@ export function generate(analysis, t, arrayNames, scalarNames, shared = true) {
   // Constants are created on first use, which must happen before the loop.
   const literals = [0, 1];
   for (const it of items) walk(it.ast, (m) => { if (m.t === 'num') literals.push(m.v); });
+  for (const a of env.arrays.values()) {
+    if (!a.enc) continue;
+    literals.push(a.enc.div || a.enc.mul, a.enc.base);
+    if (a.enc.nan) literals.push(NaN, PACKED_NAN[a.enc.kind]);
+  }
   literals.forEach((v) => env.constVec(v));
+  const V = VEC[t], S = SCA[t];
+  const conv = f.local(V128), convS = f.local(ty.val);
+  // one vector of a packed column -> decoded values on the stack
+  const loadPacked = (a, k) => {
+    const { kind, div, mul, base, nan } = a.enc;
+    f.emit(get(a.ptr), PACKED_VEC[t][kind](k * ty.lanes * PACKED_BYTES[kind]));
+    if (nan) f.emit([0x22, ...get(conv).slice(1)]); // local.tee: keep the raw value for the missing test
+    if (div) f.emit(get(env.constVec(div)), simd(V.div));
+    else {
+      if (mul !== 1) f.emit(get(env.constVec(mul)), simd(V.mul));
+      if (base !== 0) f.emit(get(env.constVec(base)), simd(V.add));
+    }
+    if (nan) { // bitselect(NaN, value, raw == missing code)
+      f.emit(set(tmpDec), get(env.constVec(NaN)), get(tmpDec), get(conv), get(env.constVec(PACKED_NAN[kind])), simd(V.eq), simd(BITSELECT));
+    }
+  };
+  const loadPackedSca = (a) => {
+    const { kind, div, mul, base, nan } = a.enc;
+    f.emit(get(a.ptr), PACKED_SCA[t][kind]);
+    if (nan) f.emit([0x22, ...get(convS).slice(1)]);
+    if (div) f.emit(ty.cnst(div), [S.div]);
+    else {
+      if (mul !== 1) f.emit(ty.cnst(mul), [S.mul]);
+      if (base !== 0) f.emit(ty.cnst(base), [S.add]);
+    }
+    if (nan) f.emit(set(tmpDecS), ty.cnst(NaN), get(tmpDecS), get(convS), ty.cnst(PACKED_NAN[kind]), [S.eq], [SELECT]);
+  };
+  const tmpDec = f.local(V128), tmpDecS = f.local(ty.val);
 
   const em = new Emitter(f, t, env);
   em.prepare(items.map((it) => it.ast));
@@ -381,10 +448,13 @@ export function generate(analysis, t, arrayNames, scalarNames, shared = true) {
   const out = ptrs[nPtr - 1];
   loops(f, ty, {
     ptrs, n, U,
+    strides: ptrs.map((i) => (encs[i] ? PACKED_BYTES[encs[i].kind] : ty.bytes)),
     body: () => {
       em.reset();
       for (let k = 0; k < U; k++) {
-        for (const a of env.arrays.values()) f.emit(get(a.ptr), vload(16 * k), set(a.vec[k]));
+        for (const a of env.arrays.values()) {
+          if (a.enc) { loadPacked(a, k); f.emit(set(a.vec[k])); } else f.emit(get(a.ptr), vload(16 * k), set(a.vec[k]));
+        }
         if (isMap) { f.emit(get(out)); em.vec(items[0].ast, k); f.emit(vstore(16 * k)); continue; }
         for (const acc of accs) {
           if (acc.wide) {
@@ -418,7 +488,9 @@ export function generate(analysis, t, arrayNames, scalarNames, shared = true) {
     },
     tail: () => {
       em.reset();
-      for (const a of env.arrays.values()) f.emit(get(a.ptr), ty.load, set(a.sca));
+      for (const a of env.arrays.values()) {
+        if (a.enc) { loadPackedSca(a); f.emit(set(a.sca)); } else f.emit(get(a.ptr), ty.load, set(a.sca));
+      }
       if (isMap) { f.emit(get(out)); em.sca(items[0].ast); f.emit(ty.store); return; }
       for (const acc of accs) {
         f.emit(get(acc.s));

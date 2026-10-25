@@ -87,10 +87,13 @@ export function* sortPermG(engine, keys, n, t) {
 }
 
 // dst[i] = src[perm[i]] for i < n, on every thread; src and the result are
-// engine arrays of type t.
-export function* gatherG(engine, src, perm, n, t) {
-  const g = kernel(engine, `gather|${t}`, () => gatherModule(t, engine.isShared));
-  const dst = engine.alloc(t === 'f32' ? Float32Array : Float64Array, n);
+// engine arrays of type t, or with enc a packed column (its codes are copied
+// as they are; the result keeps the same packing, with room after the end).
+export function* gatherG(engine, src, perm, n, t, enc = null) {
+  const s = engine.live(src);
+  const bytes = s.BYTES_PER_ELEMENT;
+  const g = kernel(engine, `gather|${bytes}`, () => gatherModule(bytes, engine.isShared));
+  const dst = engine.alloc(enc ? s.constructor : t === 'f32' ? Float32Array : Float64Array, n + (enc ? 16 / bytes : 0));
   yield* engine._unitsG(g, n, [engine.live(src).byteOffset, engine.live(perm).byteOffset, engine.live(dst).byteOffset]);
   return engine.live(dst);
 }

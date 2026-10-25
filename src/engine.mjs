@@ -7,6 +7,9 @@ import { buildStaticModule } from './static-kernels.mjs';
 import { analyze, generate } from './fuse.mjs';
 import { interpretReduce, interpretMap } from './interp.mjs';
 import { Table } from './table.mjs';
+import { decodeOne } from './pack.mjs';
+
+const COMPRESS_ALL = !!globalThis.process?.env?.VECTRO_COMPRESS; // tests: pack every table
 import { parseCSV, parseCSVAsync } from './csv.mjs';
 import { readArrow } from './arrow.mjs';
 import { encode } from './bytes.mjs';
@@ -547,8 +550,8 @@ export class Engine {
   *evalG(spec, vars, out) { return yield* this.compile(spec).runG(vars, out); }
 
   // Generate, compile and hand a kernel variant to every thread.
-  _variant(analysis, t, arrayNames, scalarNames) {
-    return this._register(generate(analysis, t, arrayNames, scalarNames, this.isShared));
+  _variant(analysis, t, arrayNames, scalarNames, encs = []) {
+    return this._register(generate(analysis, t, arrayNames, scalarNames, this.isShared, encs));
   }
 
   // Compile generated WASM and send it to every thread; returns { id, fn }.
@@ -694,13 +697,14 @@ export class Engine {
   // ---- tables ---------------------------------------------------------------
 
   // Build a table from columns: { price: Float64Array | number[], region: string[] }
-  table(columns, opts) { return Table.fromColumns(this, columns, opts); }
+  // opts.compress: pack the columns (see Table.compress).
+  table(columns, opts) { return Table.fromColumns(this, columns, { ...opts, compress: opts?.compress ?? COMPRESS_ALL }); }
 
   // Load Arrow IPC bytes (stream or file format, e.g. a .arrow / .feather
   // file or what pyarrow, Polars or DuckDB send). columns: names to read.
   fromArrow(bytes, { columns, type } = {}) {
     const r = readArrow(bytes, { columns });
-    return Table.fromColumns(this, r.columns, { type, dates: r.dates });
+    return Table.fromColumns(this, r.columns, { type, dates: r.dates, compress: COMPRESS_ALL });
   }
 
   // Build a table from an array of objects (one-time conversion cost).
@@ -708,8 +712,9 @@ export class Engine {
 
   // Load CSV text or bytes into a table, parsing on all threads.
   // (Reading files is in node.mjs: engine.readCSV(path).)
-  parseCSV(text, opts) { return parseCSV(this, text, opts); }
-  parseCSVAsync(text, opts) { return parseCSVAsync(this, text, opts); }
+  // opts.compress: pack the columns afterwards (see Table.compress).
+  parseCSV(text, opts) { const t = parseCSV(this, text, opts); return opts?.compress ?? COMPRESS_ALL ? t.compress() : t; }
+  async parseCSVAsync(text, opts) { const t = await parseCSVAsync(this, text, opts); return opts?.compress ?? COMPRESS_ALL ? t.compress() : t; }
 
   async close() {
     this.ctrl[C.OP] = OP.EXIT;
@@ -764,7 +769,21 @@ class Kernel {
   // Same results as the compiled kernels, with only precompiled code.
   #interpret(vars, out) {
     const { analysis } = this;
-    const { type, n, arrayNames, arrays, scalarNames, scalars } = this.#bind(vars, out);
+    const { type, n, arrayNames, arrays: raw, scalarNames, scalars, encs } = this.#bind(vars, out);
+    // packed columns: decode first (the interpreter's kernels read plain floats)
+    const temps = [];
+    const arrays = raw.map((a, i) => {
+      if (!encs[i]) return a;
+      const plain = this.engine.alloc(type === 'f32' ? Float32Array : Float64Array, n);
+      const codes = this.engine.live(a);
+      for (let r = 0; r < n; r++) plain[r] = decodeOne(encs[i], codes[r], type === 'f32');
+      temps.push(plain);
+      return plain;
+    });
+    try { return this.#interpretPlain(analysis, type, n, arrayNames, arrays.map((x) => this.engine.live(x)), scalarNames, scalars, out); } finally { for (const x of temps) this.engine.free(x); }
+  }
+
+  #interpretPlain(analysis, type, n, arrayNames, arrays, scalarNames, scalars, out) {
     if (arrays.some((a) => !this.engine._inMemory(a))) {
       throw new TypeError('vectro: fused expressions need arrays from engine.alloc() (or engine.toShared())');
     }
@@ -779,40 +798,47 @@ class Kernel {
 
   #prepare(vars, out) {
     const { analysis } = this;
-    const { type, n, arrayNames, arrays, scalarNames, scalars } = this.#bind(vars, out);
-    const key = `${type}|${arrayNames}|${scalarNames}`;
+    const { type, n, arrayNames, arrays, scalarNames, scalars, encs } = this.#bind(vars, out);
+    const key = `${type}|${arrayNames}|${scalarNames}|${encs.map((e) => (e ? `${e.kind}:${e.mul}:${e.div}:${e.base}:${e.nan}` : '')).join(',')}`;
     let v = this.variants.get(key);
     if (!v) {
-      v = this.engine._variant(analysis, type, arrayNames, scalarNames);
+      v = this.engine._variant(analysis, type, arrayNames, scalarNames, encs);
       this.variants.set(key, v);
     }
     const R = analysis.isMap ? 0 : analysis.items.length;
     return { v, n, arrays, scalars, R };
   }
 
+  // vars[name]: a number, a Float64Array / Float32Array, or a packed column
+  // { data, enc, n, type } (see pack.mjs).
   #bind(vars, out) {
     const { analysis } = this;
-    const arrayNames = [], scalarNames = [], arrays = [], scalars = [];
+    const arrayNames = [], scalarNames = [], arrays = [], scalars = [], encs = [], lengths = [];
+    let packedType = null;
     for (const name of analysis.vars) {
       const v = vars[name];
       if (typeof v === 'number') { scalarNames.push(name); scalars.push(v); }
-      else if (ArrayBuffer.isView(v)) { arrayNames.push(name); arrays.push(this.engine.live(v)); }
+      else if (ArrayBuffer.isView(v)) { const a = this.engine.live(v); arrayNames.push(name); arrays.push(a); encs.push(null); lengths.push(a.length); } // (live: a stale view has length 0)
+      else if (v?.enc && ArrayBuffer.isView(v.data)) { arrayNames.push(name); arrays.push(this.engine.live(v.data)); encs.push(v.enc); lengths.push(v.n); packedType = v.type; }
       else throw new TypeError(`vectro: missing value for "${name}"`);
     }
     if (analysis.isMap) {
       if (!out) throw new TypeError('vectro: an elementwise expression needs an output array: run(vars, out)');
-      arrays.push(this.engine.live(out));
+      const o = this.engine.live(out);
+      arrays.push(o); encs.push(null); lengths.push(o.length);
     } else if (!arrays.length) {
       throw new TypeError('vectro: a reduction needs at least one array');
     }
-    const type = arrays[0] instanceof Float64Array ? 'f64' : arrays[0] instanceof Float32Array ? 'f32' : null;
+    const plain = arrays.filter((_, i) => !encs[i]);
+    const ctor = plain[0]?.constructor ?? (packedType === 'f32' ? Float32Array : Float64Array);
+    const type = ctor === Float64Array ? 'f64' : ctor === Float32Array ? 'f32' : null;
     if (!type) throw new TypeError('vectro: fused expressions support Float64Array and Float32Array');
-    const n = arrays[0].length;
-    for (const a of arrays) {
-      if (a.constructor !== arrays[0].constructor) throw new TypeError('vectro: all arrays in an expression must have the same type');
-      if (a.length !== n) throw new RangeError('vectro: all arrays in an expression must have the same length');
+    const n = lengths[0];
+    for (let i = 0; i < arrays.length; i++) {
+      if (!encs[i] && arrays[i].constructor !== ctor) throw new TypeError('vectro: all arrays in an expression must have the same type');
+      if (lengths[i] !== n) throw new RangeError('vectro: all arrays in an expression must have the same length');
     }
-    return { type, n, arrayNames, arrays, scalarNames, scalars };
+    return { type, n, arrayNames, arrays, scalarNames, scalars, encs };
   }
 }
 

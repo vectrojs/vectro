@@ -79,19 +79,22 @@ export class Fn {
 // Loop skeleton shared by every kernel. `ptrs` advance together; the main loop
 // handles U vectors (U*16 bytes) per iteration, then a scalar loop does the
 // leftover elements.
-export function loops(f, ty, { ptrs, n, U, body, between = () => {}, tail }) {
+// strides: bytes per row of each pointer (default: the element type's; packed
+// columns use fewer, see pack.mjs).
+export function loops(f, ty, { ptrs, n, U, body, between = () => {}, tail, strides = null }) {
   const vend = f.local(I32), stop = f.local(I32);
   const perIter = ty.lanes * U;
-  f.emit(get(n), i32c(~(perIter - 1)), i32and, i32c(ty.bytes), i32mul, get(ptrs[0]), i32add, set(vend));
-  f.emit(get(n), i32c(ty.bytes), i32mul, get(ptrs[0]), i32add, set(stop));
+  const stride = (i) => strides?.[i] ?? ty.bytes;
+  f.emit(get(n), i32c(~(perIter - 1)), i32and, i32c(stride(0)), i32mul, get(ptrs[0]), i32add, set(vend));
+  f.emit(get(n), i32c(stride(0)), i32mul, get(ptrs[0]), i32add, set(stop));
   f.emit(block, loop, get(ptrs[0]), get(vend), i32geu, brIf(1));
   body();
-  for (const p of ptrs) f.emit(get(p), i32c(16 * U), i32add, set(p));
+  ptrs.forEach((p, i) => f.emit(get(p), i32c(stride(i) * perIter), i32add, set(p)));
   f.emit(br(0), end, end);
   between();
   f.emit(block, loop, get(ptrs[0]), get(stop), i32geu, brIf(1));
   tail();
-  for (const p of ptrs) f.emit(get(p), i32c(ty.bytes), i32add, set(p));
+  ptrs.forEach((p, i) => f.emit(get(p), i32c(stride(i)), i32add, set(p)));
   f.emit(br(0), end, end);
 }
 
