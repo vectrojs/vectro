@@ -5,7 +5,7 @@ and compiles each query, filter included, into one SIMD WebAssembly loop, then
 runs it on every CPU core. It runs in Node, in browsers (any page) and on
 Cloudflare Workers, with no native addon, compiler or server.
 
-> Status: prototype (0.1.0). Not published yet. Formerly "nodeplus".
+> Status: prototype (0.1.0). Not published yet. Formerly "nodeplus". MIT license.
 
 ```js
 import { Engine } from 'vectro';

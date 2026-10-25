@@ -2,8 +2,14 @@
   "name": "vectro",
   "version": "0.0.1",
   "description": "Multi-core analytics engine for JavaScript (Node, browsers, edge). Coming soon.",
-  "repository": { "type": "git", "url": "https://github.com/vectrojs/vectro" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vectrojs/vectro"
+  },
   "homepage": "https://github.com/vectrojs",
-  "license": "UNLICENSED",
-  "files": ["README.md"]
+  "license": "MIT",
+  "files": [
+    "README.md",
+    "LICENSE"
+  ]
 }
