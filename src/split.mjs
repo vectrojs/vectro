@@ -457,6 +457,57 @@ export class StreamTable extends SplitTable {
     const parts = await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'toRows', { id: this.id, preds: this.preds, limit: Number.isFinite(limit) ? limit : undefined, segs: [Infinity] })));
     return parts.flatMap((p) => p.rows).slice(0, limit);
   }
+
+  // Running totals over a time window, kept up to date as rows arrive:
+  //   const w = await orders.windowAsync({ by: 'region', every: 1000, last: 300_000,
+  //     timeColumn: 'ts', agg: { revenue: 'sum(price * qty)', orders: 'count()' } });
+  //   await w.readAsync();                  // per region, over the last 5 minutes
+  //   await w.readAsync({ series: true });  // per second and region, for charts
+  // Workers keep one small total per (slice of `every` ms, group), so reading
+  // costs nothing like a scan, and totals outlive rows dropped by keepRows.
+  // The window ends at the newest time seen and covers whole slices.
+  async windowAsync({ by = null, every, last, timeColumn = null, agg }) {
+    const { ask, outs } = plan(agg);
+    const fns = Object.keys(ask).map((k) => outs.find((o) => o.out === k)?.fn ?? (k.startsWith('__np_n_') ? 'count' : 'sum'));
+    const wid = ++this.engine.nextTable;
+    await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamWindow', { id: this.id, wid, by, every, last, timeColumn, ask, fns })));
+    return new LiveWindow(this, wid, { by, every, slices: Math.ceil(last / every), ask, fns, outs });
+  }
+}
+
+class LiveWindow {
+  constructor(stream, wid, spec) { this.stream = stream; this.wid = wid; this.spec = spec; }
+
+  async readAsync({ series = false } = {}) {
+    const { by, every, slices, ask, fns, outs } = this.spec;
+    const engine = this.stream.engine, id = this.stream.id;
+    const parts = await Promise.all(this.stream.counts.map((_, w) => engine._call(w, 'streamWindowRead', { id, wid: this.wid })));
+    const newest = Math.max(-Infinity, ...parts.flat().map((r) => r[0]));
+    const askNames = Object.keys(ask);
+    const merged = new Map(); // series: slice\0group, totals: group
+    for (const part of parts) {
+      for (const [slice, group, ...values] of part) {
+        if (slice <= newest - slices) continue;
+        const key = series ? `${slice}\u0000${group}` : group;
+        const acc = merged.get(key);
+        if (!acc) { merged.set(key, { slice, group, values: values.slice() }); continue; }
+        values.forEach((v, j) => { const f = fns[j]; acc.values[j] = f === 'min' ? Math.min(acc.values[j], v) : f === 'max' ? Math.max(acc.values[j], v) : acc.values[j] + v; });
+      }
+    }
+    const rows = [...merged.values()].map(({ slice, group, values }) => {
+      const row = series ? { t: slice * every } : {};
+      if (by) row[by] = group;
+      const val = (name) => values[askNames.indexOf(name)];
+      for (const { out, fn } of outs) row[out] = fn === 'mean' ? val(`__np_sum_${out}`) / val(`__np_n_${out}`) : val(out);
+      return row;
+    });
+    const label = (r) => (by ? r[by] : '');
+    return rows.sort((a, b) => (series && a.t !== b.t ? a.t - b.t : label(a) < label(b) ? -1 : label(a) > label(b) ? 1 : 0));
+  }
+
+  async dispose() {
+    await Promise.all(this.stream.counts.map((_, w) => this.stream.engine._call(w, 'streamWindowClose', { id: this.stream.id, wid: this.wid })));
+  }
 }
 
 function join(a, b) {

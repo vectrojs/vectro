@@ -38,7 +38,7 @@ export function createStreams(getEngine) {
       codes: columns[name] === 'category' ? new Map() : null,
     }]));
     streams.set(id, {
-      id, names, format, badLines: 0, types: columns, header: new TextEncoder().encode(`${names.join(',')}\n`),
+      id, names, format, badLines: 0, windows: new Map(), types: columns, header: new TextEncoder().encode(`${names.join(',')}\n`),
       cols, cap: 1 << 16, n: 0, start: 0, keepRows, keepMs, timeColumn, maxTime: -Infinity,
       pending: [], pendingBytes: 0, partial: null, timer: null, scheduled: false, sockets: [], waiters: [], paused: false,
       rowsIn: 0, bytesIn: 0, batches: 0, error: null,
@@ -113,6 +113,7 @@ export function createStreams(getEngine) {
       const ts = engine.live(s.cols.get(s.timeColumn).data);
       for (let i = s.n; i < s.n + m; i++) if (ts[i] > s.maxTime) s.maxTime = ts[i];
     }
+    for (const w of s.windows.values()) updateWindow(s, w, s.n, m);
     s.n += m;
     s.rowsIn += m;
     s.bytesIn += nbytes;
@@ -183,8 +184,113 @@ export function createStreams(getEngine) {
     queue(s, lines);
   }
 
+  // ---- running totals over time windows ---------------------------------------
+  // A window keeps, per time slice of `every` ms and per group, the partial
+  // aggregates of every row that arrived (sum and count for means). Slices
+  // older than `last` are dropped. Rows can be dropped (keepRows) while their
+  // totals stay. Each batch is grouped by (slice, group) with the compiled
+  // group-by: key = (slice - first slice in the batch) * groups + group code.
+  const GROUP_KEYS = 2 ** 24;
+
+  function openWindow(s, { wid, by = null, every, last, timeColumn, ask, fns }) {
+    const time = timeColumn ?? s.timeColumn;
+    if (!s.cols.has(time)) throw new Error(`vectro: window needs timeColumn, a number column of milliseconds (columns: ${s.names.join(', ')})`);
+    if (by != null && !s.cols.get(by)?.dict) throw new Error(`vectro: window "by" must be a category column, got "${by}"`);
+    if (!(every > 0) || !(last >= every)) throw new Error('vectro: window needs every > 0 and last >= every (milliseconds)');
+    const w = { by, every, slices: Math.ceil(last / every), time, ask, fns, buckets: new Map(), newest: -Infinity };
+    s.windows.set(wid, w);
+    if (s.n > s.start) updateWindow(s, w, s.start, s.n - s.start); // rows already kept count too
+    return true;
+  }
+
+  // Add rows [from, from + m) of stream s to window w.
+  function updateWindow(s, w, from, m) {
+    if (!m) return;
+    const engine = getEngine();
+    const view = (extra) => {
+      const cols = new Map();
+      for (const [name, c] of s.cols) cols.set(name, { data: engine.live(c.data).subarray(from, from + m), dict: c.dict, codes: c.codes, strings: null });
+      return new Table(engine, cols, m, { owned: [] });
+    };
+    const t = view();
+    const { lo, hi } = t.filter(`${w.time} == ${w.time}`).agg({ lo: `min(${w.time})`, hi: `max(${w.time})` });
+    if (!(lo <= hi)) return; // no row has a time
+    const first = Math.floor(lo / w.every), G = w.by ? Math.max(1, s.cols.get(w.by).dict.length) : 1;
+    const span = Math.floor(hi / w.every) - first + 1;
+    const add = (slice, group, values) => {
+      if (slice > w.newest) w.newest = slice;
+      let b = w.buckets.get(slice);
+      if (!b) w.buckets.set(slice, (b = new Map()));
+      const acc = b.get(group);
+      if (!acc) { b.set(group, values.slice()); return; }
+      for (let j = 0; j < values.length; j++) {
+        const f = w.fns[j];
+        acc[j] = f === 'min' ? Math.min(acc[j], values[j]) : f === 'max' ? Math.max(acc[j], values[j]) : acc[j] + values[j];
+      }
+    };
+    const askNames = Object.keys(w.ask);
+    const label = (code) => (w.by ? s.cols.get(w.by).dict[code] : null);
+    if (span * G < GROUP_KEYS) {
+      const keyExpr = `${w.time} == ${w.time} ? (floor(${w.time} / __np_every) - __np_first) * __np_g + ${w.by ?? 0} : 0`;
+      const keyed = t.derive('__np_key', keyExpr, { __np_every: w.every, __np_first: first, __np_g: G });
+      try {
+        // group-by returns only keys that have rows; a pass takes at most 7 aggregates
+        const timed = keyed.filter(`${w.time} == ${w.time}`);
+        const byKey = new Map();
+        for (let i = 0; i < askNames.length; i += 7) {
+          const part = askNames.slice(i, i + 7);
+          const g = timed.groupBy('__np_key').agg(Object.fromEntries(part.map((a) => [a, w.ask[a]])));
+          try {
+            const keys = engine.live(g.cols.get('__np_key').data);
+            const cols = part.map((a) => engine.live(g.cols.get(a).data));
+            for (let r = 0; r < keys.length; r++) {
+              let vals = byKey.get(keys[r]);
+              if (!vals) byKey.set(keys[r], (vals = new Array(askNames.length)));
+              cols.forEach((c, j) => { vals[i + j] = c[r]; });
+            }
+          } finally { g.dispose(); }
+        }
+        for (const [key, vals] of byKey) add(first + Math.floor(key / G), label(key % G), vals);
+      } finally { keyed.dispose(); }
+    } else {
+      // times spread too far for one group-by: compute each argument, then add row by row
+      const argCols = askNames.map((a) => {
+        const src = w.ask[a], arg = src.slice(src.indexOf('(') + 1, -1).trim();
+        return w.fns[askNames.indexOf(a)] === 'count' && !arg ? null : arg;
+      });
+      const derived = argCols.map((arg, j) => (arg ? t.derive(`__np_a${j}`, arg) : null));
+      try {
+        const ts = engine.live(s.cols.get(w.time).data).subarray(from, from + m);
+        const codes = w.by ? engine.live(s.cols.get(w.by).data).subarray(from, from + m) : null;
+        const vals = derived.map((d, j) => (d ? engine.live(d.cols.get(`__np_a${j}`).data) : null));
+        const values = new Array(askNames.length);
+        for (let i = 0; i < m; i++) {
+          if (Number.isNaN(ts[i])) continue;
+          for (let j = 0; j < values.length; j++) {
+            const v = vals[j] ? vals[j][i] : 1;
+            values[j] = w.fns[j] === 'count' ? (v != 0 ? 1 : 0) : v; // same rules as the compiled count(x): x != 0
+          }
+          add(Math.floor(ts[i] / w.every), label(codes ? codes[i] : 0), values);
+        }
+      } finally { for (const d of derived) d?.dispose(); }
+    }
+    // drop slices that fell out of the window
+    for (const slice of w.buckets.keys()) if (slice <= w.newest - w.slices) w.buckets.delete(slice);
+  }
+
   const handlers = {
     streamOpen: open,
+    streamWindow({ id, ...opts }) { return openWindow(get(id), opts); },
+    // Every slice kept: [slice, group label, ...values in ask order].
+    streamWindowRead({ id, wid }) {
+      const s = get(id), w = s.windows.get(wid);
+      if (!w) throw new Error(`vectro: no window ${wid} on this stream`);
+      flush(s);
+      const out = [];
+      for (const [slice, groups] of w.buckets) for (const [group, acc] of groups) out.push([slice, group, ...acc]);
+      return out;
+    },
+    streamWindowClose({ id, wid }) { return get(id).windows.delete(wid); },
     // Complete lines from the page (it cuts at newlines before routing).
     // The reply waits while the backlog is high, so the page slows down too.
     streamPush({ id, bytes }) {
