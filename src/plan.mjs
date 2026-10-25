@@ -81,7 +81,7 @@ export class Query {
   derive(name, expr, params = {}) { return new Query({ op: 'derive', input: this.node, name, ast: bindParams(parse(expr), params) }); }
   select(...names) { return new Query({ op: 'select', input: this.node, names: names.flat() }); }
   sort(by) { return new Query({ op: 'sort', input: this.node, by: keyList(by) }); }
-  limit(n) { return new Query({ op: 'limit', input: this.node, n: Math.max(0, Math.floor(n)) }); }
+  limit(n, offset = 0) { return new Query({ op: 'limit', input: this.node, n: Math.max(0, Math.floor(n)), offset: Math.max(0, Math.floor(offset)) }); }
   top(k, by) { return this.sort(by).limit(k); }
   join(other, opts) {
     const right = other instanceof Query ? other.node : { op: 'scan', table: other };
@@ -219,12 +219,12 @@ function* execG(node, needed, temps) {
       const s = yield* execG(node.input, want, temps);
       const t = yield* materializeG(s, new Set(node.keys), temps, specAsts);
       const spec = Object.fromEntries(Object.entries(node.spec).map(([k, a]) => [k, toSource(inline(a, s.derived))]));
-      const g = yield { table: t, method: 'groupAgg', args: [node.keys, spec] };
+      const g = yield { table: t, method: node.keys.length ? 'groupAgg' : 'oneRow', args: [node.keys, spec] };
       return { table: g, derived: new Map(), visible: g.columnNames };
     }
     case 'limit': case 'sort': {
       const sortNode = node.op === 'sort' ? node : node.input.op === 'sort' ? node.input : null;
-      const k = node.op === 'limit' ? node.n : null;
+      const k = node.op === 'limit' ? node.n + (node.offset ?? 0) : null;
       const below = sortNode ? sortNode.input : node.input;
       const keyAsts = (sortNode?.by ?? []).map((b) => parse(String(b).trim()));
       const s = yield* execG(below, union(needed, new Set(keyAsts.flatMap((a) => [...vars(a)]))), temps);
@@ -241,6 +241,7 @@ function* execG(node, needed, temps) {
         });
         r = yield { table: base, method: k === null ? 'sort' : 'top', args: k === null ? [by] : [k, by] };
       } else r = yield { table: base, method: 'head', args: [k] };
+      if (node.offset) r = yield { table: r, method: 'slice', args: [node.offset] };
       for (const n of keep) {
         const d = s.derived.get(n);
         if (!d) continue;
@@ -319,6 +320,10 @@ function call(req, sync) {
   const { table, method, args } = req;
   const suffix = sync ? '' : 'Async';
   if (method === 'groupAgg') return table.groupBy(args[0])[`agg${suffix}`](args[1]);
+  if (method === 'oneRow') { // totals without keys, as a one-row table
+    const asTable = (o) => table.engine.table(Object.fromEntries(Object.entries(o).map(([k, v]) => [k, [v]])));
+    return sync ? asTable(table.agg(args[1])) : table.aggAsync(args[1]).then(asTable);
+  }
   if (method === 'derive' && req.date) { // keep the date flag of dayStart(ts) and friends
     const mark = (t) => { t.cols.get(args[0]).date = true; return t; };
     return sync ? mark(table.derive(...args)) : table.deriveAsync(...args).then(mark);
@@ -365,8 +370,8 @@ function describe(node, depth = 0) {
     case 'aggregate': return `${describe(node.input, depth)}\n${pad}groupBy ${node.keys.join(', ')}: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}${node.pushed ? ` (${node.pushed} filter(s) on keys moved below)` : ''}`;
     case 'sort': return `${describe(node.input, depth)}\n${pad}sort ${node.by.join(', ')}`;
     case 'limit': return node.input.op === 'sort'
-      ? `${describe(node.input.input, depth)}\n${pad}top ${node.n} by ${node.input.by.join(', ')} (sort + limit)`
-      : `${describe(node.input, depth)}\n${pad}limit ${node.n}`;
+      ? `${describe(node.input.input, depth)}\n${pad}top ${node.n + (node.offset ?? 0)} by ${node.input.by.join(', ')} (sort + limit)${node.offset ? `, then skip ${node.offset}` : ''}`
+      : `${describe(node.input, depth)}\n${pad}limit ${node.n}${node.offset ? ` offset ${node.offset}` : ''}`;
     case 'join': return `${pad}join ${JSON.stringify(node.opts.on)} ${node.opts.how ?? 'inner'}\n${pad}  left:\n${describe(node.left, depth + 2)}\n${pad}  right:\n${describe(node.right, depth + 2)}`;
     case 'output': return describe(node.input, depth);
     case 'total': return `${describe(node.input, depth)}\n${pad}totals: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}`;

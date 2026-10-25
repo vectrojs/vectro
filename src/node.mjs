@@ -94,3 +94,4 @@ export { Emitter } from './emitter.mjs';
 export { BatchEncoder, FrameReader, encodeSchema, encodeEnd } from './frames.mjs';
 export { readArrow, writeArrow, ArrowReader, ArrowEncoder } from './arrow.mjs';
 export { DistinctSketch } from './sketch.mjs';
+export { sql } from './sql.mjs';

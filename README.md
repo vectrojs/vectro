@@ -75,6 +75,32 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   yourself. On 10M rows vs DuckDB (`compare/bench-distinct.mjs`): 365 days
   4 ms vs 5; regions per day 9 ms vs 34; 1M accounts 81 ms vs 48; accounts per
   region (5.7M pairs) 214 ms vs 100.
+- **SQL:** `sql(text, { orders, customers })` runs a SELECT over your tables
+  and returns a lazy query (`.toRows()`, `.collect()`, `.explain()`):
+
+  ```js
+  import { sql } from 'vectrojs';
+  sql(`SELECT c.tier, COUNT(*) AS n, SUM(o.price * o.qty) AS revenue
+       FROM orders o JOIN customers c ON o.cust = c.cust
+       WHERE o.region = 'EU' AND o.ts >= DATE '2024-01-01'
+       GROUP BY c.tier HAVING COUNT(*) > 100 ORDER BY revenue DESC LIMIT 5`,
+      { orders, customers }).toRows();
+  ```
+
+  SELECT [DISTINCT], FROM with aliases, [INNER | LEFT] JOIN ... ON / USING,
+  WHERE, GROUP BY (columns, expressions, select aliases or positions),
+  HAVING, ORDER BY ... ASC/DESC, LIMIT / OFFSET; COUNT(*), COUNT(x),
+  COUNT(DISTINCT x), SUM, AVG, MIN, MAX, APPROX_COUNT_DISTINCT anywhere in
+  SELECT / HAVING / ORDER BY; BETWEEN, IN, LIKE, IS [NOT] NULL, CASE, %,
+  COALESCE, NULLIF, ROUND, LEAST, GREATEST, CAST, DATE / TIMESTAMP literals,
+  INTERVAL '7 days', EXTRACT, DATE_TRUNC, YEAR(), MONTH()... It compiles to
+  the planner below, so SQL gets every optimization. Text can be compared,
+  matched and grouped but not computed (no `||` or UPPER). The MCP server has
+  a `sql` tool. The same SQL text vs DuckDB on 10M orders + 100K customers
+  (`compare/bench-sql.mjs`, answers checked): filtered totals 3.0 vs 9.5 ms,
+  group by region 6.6 vs 31.8 ms, join + filter + group 21.4 vs 30.6 ms, top 10
+  customers 9.8 vs 45.0 ms, top 20 rows 8.7 vs 24.5 ms, CASE inside SUM 6.0 vs
+  36.7 ms; distinct customers per month is slower (144 vs 74 ms).
 - **Lazy queries (a planner):** `t.lazy()` records a chain (`filter`, `derive`,
   `select`, `join`, `groupBy().agg`, `sort`, `limit`/`top`) and optimizes it as a
   whole before running it with `collect()`, `toRows()`, `agg()` or `count()`

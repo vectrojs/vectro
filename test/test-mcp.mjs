@@ -37,7 +37,7 @@ server.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initi
 const old = await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } });
 expect('older protocol accepted', old.result?.protocolVersion === '2024-11-05');
 const list = await rpc('tools/list', {});
-expect('tools listed', ['load_file', 'list_tables', 'describe_table', 'query', 'search_similar', 'add_column', 'drop_table'].every((n) => list.result.tools.some((t) => t.name === n)));
+expect('tools listed', ['load_file', 'list_tables', 'describe_table', 'query', 'sql', 'search_similar', 'add_column', 'drop_table'].every((n) => list.result.tools.some((t) => t.name === n)));
 expect('unknown method', (await rpc('no/such', {})).error?.code === -32601);
 
 let r = await call('load_file', { path: 'orders.csv' });
@@ -54,6 +54,14 @@ expect('group + sort', !r.error && JSON.stringify(r.data.rows) === JSON.stringif
 r = await call('query', { table: 'orders', filter: 'qty == 5', sort: ['-price', 'id'], limit: 3 });
 const top3 = rows.filter((x) => x.qty === 5).sort((a, b) => b.price - a.price || a.id - b.id).slice(0, 3).map((x) => x.id);
 expect('rows sorted', !r.error && JSON.stringify(r.data.rows.map((x) => x.id)) === JSON.stringify(top3) && r.data.matching_rows === 1000, r.text);
+r = await call('sql', { query: "SELECT region, SUM(price * qty) AS revenue FROM events GROUP BY region ORDER BY revenue DESC" });
+expect('sql group', !r.error && JSON.stringify(r.data.rows) === JSON.stringify(byRegion) && r.data.rows_in_answer === REG.length, r.text);
+r = await call('sql', { query: 'SELECT o.id FROM orders o JOIN events e ON o.id = e.id WHERE o.qty = 5 ORDER BY o.price DESC, o.id LIMIT 3' });
+expect('sql join', !r.error && JSON.stringify(r.data.rows.map((x) => x.id)) === JSON.stringify(top3), r.text);
+r = await call('sql', { query: 'SELECT id FROM orders' });
+expect('sql rows capped', !r.error && r.data.rows_in_answer === 5000 && r.data.returned === 500, r.text);
+r = await call('sql', { query: 'SELECT nope FROM orders' });
+expect('sql error', r.error && r.text.includes('no column "nope"'), r.text);
 r = await call('add_column', { table: 'orders', name: 'revenue', expression: 'price * qty' });
 expect('add column', !r.error && r.data.columns.revenue === 'number', r.text);
 r = await call('query', { table: 'orders', aggregates: { total: 'sum(revenue)' } });

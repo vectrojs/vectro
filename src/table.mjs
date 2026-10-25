@@ -314,27 +314,30 @@ export class Table {
   // the accumulators stay small (or no larger than the rows). Else null.
   *#directGroups(keys, J) {
     const { engine } = this;
-    const sizes = [];
+    const sizes = [], offsets = [];
     for (const key of keys) {
       const c = this.cols.get(key);
-      if (c.dict) { sizes.push(c.dict.length); continue; }
-      if (!this.n) { sizes.push(0); continue; }
+      if (c.dict) { sizes.push(c.dict.length); offsets.push(0); continue; }
+      if (!this.n) { sizes.push(0); offsets.push(0); continue; }
+      // whole numbers in a range under 2^24 (from their minimum: 202301..202412, IDs from 1e9, negatives)
       const [lo, hi, frac] = yield* engine.evalG(['min(k)', 'max(k)', 'count(k != floor(k))'], { k: c.data });
-      if (lo < 0 || frac > 0 || !(hi < 2 ** 24)) return null;
-      sizes.push(hi + 1);
+      if (frac > 0 || !(hi - lo < 2 ** 24) || !Number.isFinite(lo)) return null;
+      sizes.push(hi - lo + 1);
+      offsets.push(lo);
     }
     const K = sizes.reduce((a, b) => a * b, 1);
     const C = engine.jit && K <= 1024 ? 4 : 1;
-    if (K > 2 ** 24 || engine.T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (K > 65_536 && K > this.n)) return null;
+    if (K > 2 ** 24 || engine.T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (K > 65_536 && K > 2 * this.n)) return null;
     const below = sizes.map((_, k) => sizes.slice(k + 1).reduce((a, b) => a * b, 1));
     const keyColumn = (k, keep) => { // key k of each kept group (codes for text)
-      const out = new Float64Array(keep.length), d = below[k], size = sizes[k];
-      for (let r = 0; r < keep.length; r++) out[r] = Math.floor(keep[r] / d) % size;
+      const out = new Float64Array(keep.length), d = below[k], size = sizes[k], o = offsets[k];
+      for (let r = 0; r < keep.length; r++) out[r] = (Math.floor(keep[r] / d) % size) + o;
       return out;
     };
-    if (keys.length === 1) return { K, data: this.cols.get(keys[0]).data, keyColumn, owned: false, sorted: true };
-    let expr = keys[0];
-    for (let k = 1; k < keys.length; k++) expr = `(${expr}) * ${sizes[k]} + ${keys[k]}`;
+    if (keys.length === 1 && offsets[0] === 0) return { K, data: this.cols.get(keys[0]).data, keyColumn, owned: false, sorted: true };
+    const term = (k) => (offsets[k] ? `(${keys[k]} - ${offsets[k] < 0 ? `(${offsets[k]})` : offsets[k]})` : keys[k]);
+    let expr = term(0);
+    for (let k = 1; k < keys.length; k++) expr = `(${expr}) * ${sizes[k]} + ${term(k)}`;
     const data = engine.alloc(this.type, this.n);
     yield* engine.evalG(expr, this.#vars({}), data);
     return { K, data, keyColumn, owned: true, sorted: true };
@@ -748,7 +751,7 @@ export class Table {
     const keep = new Set(names.flat());
     for (const nm of keep) if (!this.cols.has(nm)) throw new Error(`vectro: no column "${nm}"`);
     if (this.pred) walk(parse(this.pred), (m) => { if (m.t === 'var' && this.cols.has(m.name)) keep.add(m.name); });
-    const cols = new Map([...this.cols].filter(([nm]) => keep.has(nm)));
+    const cols = new Map([...keep].map((nm) => [nm, this.cols.get(nm)])); // in the order asked (then the filter's columns)
     return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params });
   }
 
@@ -961,6 +964,17 @@ export class Table {
     return out;
   }
 
+  // Rows [start, end) (matching the filter) as a new table.
+  slice(start, end = Infinity) { return this.engine._drive(this.#sliceG(start, end)); }
+  sliceAsync(start, end = Infinity) { return this.engine._driveAsync(this.#sliceG(start, end)); }
+  *#sliceG(start, end) {
+    const t = yield* this.#collectG();
+    const a = Math.max(0, Math.min(t.n, Math.floor(start))), b = Math.max(a, Math.min(t.n, Math.floor(end)));
+    const out = t.#gather(Uint32Array.from({ length: b - a }, (_, i) => a + i), b - a);
+    if (t !== this) t.dispose();
+    return out;
+  }
+
   // Hash join: orders.join(customers, { on: 'customer_id', how: 'inner' | 'left' }).
   // on: a column both tables have, several (['region', 'day']), or
   // { left: 'cust', right: 'id' }. Put the smaller table on the right (it is
@@ -995,9 +1009,9 @@ export class Table {
 
 // ---- helpers ---------------------------------------------------------------------
 
-const RESERVED = new Set(['Infinity', 'NaN', 'sum', 'mean', 'min', 'max', 'count', 'abs', 'sqrt', 'floor', 'ceil']);
+const RESERVED = new Set(['Infinity', 'NaN']); // (function names are fine: sum(...) is a call, sum a column)
 function checkName(name) {
-  if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _, not a function name)`);
+  if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _)`);
 }
 
 // Missing values (NaN) in aggregations, as in SQL: sum and mean skip them

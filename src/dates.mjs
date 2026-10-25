@@ -5,7 +5,7 @@
 // same fused kernels as everything else (no new kernel code):
 //   year(ts) month(ts) day(ts) hour(ts) minute(ts) second(ts)
 //   weekday(ts)  (1 = Monday ... 7 = Sunday, ISO)
-//   dayStart(ts) hourStart(ts) weekStart(ts) (Monday) monthStart(ts)  -> ms
+//   dayStart(ts) hourStart(ts) weekStart(ts) (Monday) monthStart(ts) yearStart(ts) -> ms
 //   date('2024-03-01') / date('2024-03-01T12:00:00Z')                  -> ms
 // Times are UTC; text with an offset (+02:00) is converted to UTC.
 
@@ -125,6 +125,11 @@ export const DATE_FNS = {
   hourStart: (ts) => mul(fdiv(ts, HOUR), num(HOUR)),
   weekStart: (ts) => mul(sub(fdiv(ts, DAY), mod(add(fdiv(ts, DAY), num(3)), 7)), num(DAY)),
   monthStart: (ts) => sub(mul(fdiv(ts, DAY), num(DAY)), mul(sub(civil(ts).d, num(1)), num(DAY))),
+  yearStart: (ts) => { // January 1 of the year: days from civil (y, 1, 1)
+    const y = sub(civil(ts).y, num(1)), era = fdiv(y, 400), yoe = sub(y, mul(era, num(400)));
+    const doe = add(sub(add(mul(yoe, num(365)), fdiv(yoe, 4)), fdiv(yoe, 100)), num(306));
+    return mul(sub(add(mul(era, num(146097)), doe), num(719468)), num(DAY));
+  },
 };
 // functions whose result is itself a date
-export const DATE_RESULT = new Set(['dayStart', 'hourStart', 'weekStart', 'monthStart', 'date']);
+export const DATE_RESULT = new Set(['dayStart', 'hourStart', 'weekStart', 'monthStart', 'yearStart', 'date']);

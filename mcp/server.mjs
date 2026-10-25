@@ -11,7 +11,7 @@
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { resolve, sep, extname, basename } from 'node:path';
 import { createInterface } from 'node:readline';
-import { Engine, VectorIndex } from '../src/node.mjs';
+import { Engine, VectorIndex, sql } from '../src/node.mjs';
 import { parseNDJSON } from '../src/ndjson.mjs';
 
 const VERSION = '0.1.0';
@@ -74,6 +74,17 @@ const TOOLS = [
       },
       required: ['table'],
     },
+  },
+  {
+    name: 'sql',
+    description: [
+      'Run one SQL SELECT over the loaded tables (by their names).',
+      'SELECT [DISTINCT] ... FROM t [JOIN u ON t.x = u.y | USING (x)] [LEFT JOIN ...] WHERE ... GROUP BY ... HAVING ... ORDER BY ... [ASC|DESC] LIMIT n [OFFSET m].',
+      'Aggregates: COUNT(*), COUNT(x), COUNT(DISTINCT x), SUM, AVG, MIN, MAX, APPROX_COUNT_DISTINCT. Also BETWEEN, IN, LIKE, IS NULL, CASE WHEN, COALESCE, ROUND, LEAST, GREATEST, CAST, DATE \'2024-01-01\', INTERVAL \'7 days\', EXTRACT(YEAR FROM ts), DATE_TRUNC(\'month\', ts), YEAR(ts), MONTH(ts).',
+      'Text columns can be compared, matched (LIKE, IN) and grouped, not computed (no ||, UPPER...).',
+      'At most 500 rows come back (add LIMIT); the answer says how many rows the query has.',
+    ].join(' '),
+    inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
   },
   {
     name: 'search_similar',
@@ -182,6 +193,14 @@ function loadJSONLines(bytes, types) {
 }
 
 const handlers = {
+  sql({ query }) {
+    const all = Object.fromEntries([...tables].map(([n, e]) => [n, e.table]));
+    const t = sql(query, all).collect();
+    try {
+      const rows = clean(t.toRows(MAX_ROWS));
+      return { rows_in_answer: t.length, returned: rows.length, rows };
+    } finally { t.dispose(); }
+  },
   async load_file({ path, name, types }) {
     const real = safePath(path);
     const ext = extname(real).toLowerCase();
