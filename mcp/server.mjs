@@ -54,7 +54,7 @@ const TOOLS = [
     name: 'query',
     description: [
       'Answer a question about a table. All parts are optional except table.',
-      'Expressions use column names, numbers, + - * /, comparisons (== != < <= > >=), && || !, cond ? a : b, and abs sqrt floor ceil min max. Text is compared with quotes: region == \'EU\'.',
+      'Expressions use column names, numbers, + - * /, comparisons (== != < <= > >=), && || !, cond ? a : b, and abs sqrt floor ceil min max. Text is compared with quotes: region == \'EU\'. Category text functions: startsWith(col, \'x\'), endsWith(col, \'x\'), contains(col, \'x\'), in(col, \'a\', \'b\'), like(col, \'EU-%\') (% any run, _ one character).',
       'filter: which rows, e.g. "region == \'EU\' && price > 100".',
       'aggregates: { name: "sum(expr)" | "mean(expr)" | "min(expr)" | "max(expr)" | "count()" | "count(condition)" }.',
       'group_by: a category column (or whole-number column) to aggregate per group.',

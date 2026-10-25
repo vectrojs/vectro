@@ -7,6 +7,7 @@
 // query (agg, groupBy, collect, toRows) works on a live stream unchanged.
 import { Table } from './table.mjs';
 import { parseNDJSON } from './ndjson.mjs';
+import { ZONE_ROWS } from './zones.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
@@ -39,7 +40,9 @@ export function createStreams(getEngine) {
       codes: columns[name] === 'category' ? new Map() : null,
     }]));
     streams.set(id, {
-      id, names, format, badLines: 0, windows: new Map(), types: columns, header: new TextEncoder().encode(`${names.join(',')}\n`),
+      id, names, format, badLines: 0, windows: new Map(),
+      types: columns, header: new TextEncoder().encode(`${names.join(',')}\n`),
+      zones: new Map(names.map((name) => [name, { mins: [], maxs: [] }])), // per block of ZONE_ROWS buffer rows
       cols, cap: 1 << 16, n: 0, start: 0, keepRows, keepMs, timeColumn, maxTime: -Infinity,
       pending: [], pendingBytes: 0, partial: null, timer: null, scheduled: false, sockets: [], waiters: [], paused: false,
       rowsIn: 0, bytesIn: 0, batches: 0, error: null,
@@ -60,6 +63,8 @@ export function createStreams(getEngine) {
     if (s.start > 0) { // move the kept rows to the front
       for (const c of s.cols.values()) { const d = engine.live(c.data); d.copyWithin(0, s.start, s.n); }
       s.n -= s.start; need -= s.start; s.start = 0;
+      for (const z of s.zones.values()) { z.mins.length = 0; z.maxs.length = 0; }
+      updateZones(s, 0, s.n); // rows moved: rebuild the zone maps
     }
     if (need <= s.cap) return;
     const cap = Math.max(need, s.cap * 2);
@@ -115,6 +120,7 @@ export function createStreams(getEngine) {
       for (let i = s.n; i < s.n + m; i++) if (ts[i] > s.maxTime) s.maxTime = ts[i];
     }
     for (const w of s.windows.values()) updateWindow(s, w, s.n, m);
+    updateZones(s, s.n, m);
     s.n += m;
     s.rowsIn += m;
     s.bytesIn += nbytes;
@@ -185,6 +191,22 @@ export function createStreams(getEngine) {
     queue(s, lines);
   }
 
+  // Zone maps for rows [from, from + m): min and max per block of ZONE_ROWS
+  // buffer rows, kept up to date as batches arrive, so filtered queries on
+  // live data (usually time-ordered) skip old blocks. See zones.mjs.
+  function updateZones(s, from, m) {
+    const engine = getEngine();
+    for (const [name, z] of s.zones) {
+      const d = engine.live(s.cols.get(name).data);
+      for (let i = from, end = from + m; i < end; ) {
+        const b = Math.floor(i / ZONE_ROWS), stop = Math.min(end, (b + 1) * ZONE_ROWS);
+        let lo = z.mins[b] ?? Infinity, hi = z.maxs[b] ?? -Infinity;
+        for (; i < stop; i++) { const v = d[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+        z.mins[b] = lo; z.maxs[b] = hi;
+      }
+    }
+  }
+
   // ---- running totals over time windows ---------------------------------------
   // A window keeps, per time slice of `every` ms and per group, the partial
   // aggregates of every row that arrived (sum and count for means). Slices
@@ -211,7 +233,7 @@ export function createStreams(getEngine) {
     const view = (extra) => {
       const cols = new Map();
       for (const [name, c] of s.cols) cols.set(name, { data: engine.live(c.data).subarray(from, from + m), dict: c.dict, codes: c.codes, strings: null });
-      return new Table(engine, cols, m, { owned: [] });
+      return new Table(engine, cols, m, { owned: [], zones: false });
     };
     const t = view();
     const { lo, hi } = t.filter(`${w.time} == ${w.time}`).agg({ lo: `min(${w.time})`, hi: `max(${w.time})` });
@@ -369,7 +391,10 @@ export function createStreams(getEngine) {
       if (!s) return null;
       const engine = getEngine();
       const cols = new Map();
-      for (const [name, c] of s.cols) cols.set(name, { data: engine.live(c.data).subarray(s.start, s.n), dict: c.dict, codes: c.codes, strings: null });
+      for (const [name, c] of s.cols) {
+        const z = s.zones.get(name);
+        cols.set(name, { data: engine.live(c.data).subarray(s.start, s.n), dict: c.dict, codes: c.codes, strings: null, zones: { block: ZONE_ROWS, shift: s.start, mins: z.mins, maxs: z.maxs } });
+      }
       return new Table(engine, cols, s.n - s.start, { owned: [] });
     },
     close(id) {

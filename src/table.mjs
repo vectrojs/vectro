@@ -6,6 +6,7 @@
 // sum(p ? e : 0). No filtered copy is made unless you ask with collect().
 
 import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
+import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
 import { parse, toSource, walk, analyze, isMask } from './fuse.mjs';
 import { generateGroupBy, generateCompact } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
@@ -20,7 +21,7 @@ export class Table {
   // cols: Map name -> { data, dict, codes, strings }
   //   category text: dict (code -> string) and codes (string -> code)
   //   free text:     strings = bytes the values point into (see csv-kernel)
-  constructor(engine, cols, n, { pred = null, params = {}, owned = [], ownedBuffers = [] } = {}) {
+  constructor(engine, cols, n, { pred = null, params = {}, owned = [], ownedBuffers = [], zones = true } = {}) {
     this.engine = engine;
     this.cols = cols;
     this.n = n;
@@ -28,6 +29,25 @@ export class Table {
     this.params = params;   // scalar values the filter refers to
     this.owned = owned;     // columns this table allocated (freed by dispose)
     this.ownedBuffers = ownedBuffers; // e.g. CSV bytes that free-text columns point into
+    this.zones = zones;     // may zone maps narrow filtered queries (see zones.mjs)
+  }
+
+  // With a filter, the rows that can match it according to the zone maps
+  // (min and max per block, kept on each column and computed on first use),
+  // as a table over just those rows; otherwise this table.
+  #narrow() {
+    if (!this.pred || !this.zones || this.n < 4 * ZONE_ROWS) return this;
+    const zonesOf = (name) => {
+      const c = this.cols.get(name);
+      return (c.zones ??= computeZones(this.engine.live(c.data), this.n));
+    };
+    const range = zoneRange(this.pred, this.cols, this.params, this.n, zonesOf, this.type === Float32Array ? Math.fround : undefined);
+    if (!range) return this;
+    const [lo, hi] = range;
+    this.engine._zoneSkips = (this.engine._zoneSkips ?? 0) + (this.n - (hi - lo)); // rows skipped (tests, benchmarks)
+    const cols = new Map();
+    for (const [name, c] of this.cols) cols.set(name, { ...c, data: this.engine.live(c.data).subarray(lo, hi), zones: undefined });
+    return new Table(this.engine, cols, hi - lo, { pred: this.pred, params: this.params, zones: false });
   }
 
   // ---- building tables --------------------------------------------------------
@@ -144,6 +164,8 @@ export class Table {
   aggAsync(spec, params = {}) { return this.engine._driveAsync(this.#aggG(spec, params)); }
 
   *#aggG(spec, params) {
+    const narrow = this.#narrow();
+    if (narrow !== this) return yield* narrow.#aggG(spec, params);
     const merged = this.#mergeParams(params);
     const P = this.pred;
     const items = Object.entries(spec).map(([out, src]) => ({ out, ...this.#aggItem(src, merged) }));
@@ -208,6 +230,8 @@ export class Table {
   }
 
   *#groupAggG(key, spec, params) {
+    const narrow = this.#narrow();
+    if (narrow !== this) return yield* narrow.#groupAggG(key, spec, params);
     const { engine } = this;
     const merged = this.#mergeParams(params);
     const keyCol = this.cols.get(key);
@@ -313,6 +337,8 @@ export class Table {
   collectAsync() { return this.engine._driveAsync(this.#collectG()); }
 
   *#collectG() {
+    const narrow = this.#narrow();
+    if (narrow !== this) return yield* narrow.#collectG();
     if (!this.pred) return this;
     const { engine } = this;
     const vars = this.#vars(this.params);
@@ -424,6 +450,8 @@ export class Table {
   }
 
   *#topG(k, by) {
+    const narrow = this.#narrow(); // sample and count only rows that can match the filter
+    if (narrow !== this) return yield* narrow.#topG(k, by);
     const { engine } = this;
     k = Math.max(0, Math.floor(k));
     const keys = parseKeys(by, this.cols);
@@ -441,7 +469,7 @@ export class Table {
     // A cutoff from an evenly spaced sample: the first key is computed for the
     // sampled rows only. The full passes (count, then collect) are fused
     // filters "first key <= cutoff" on all threads; nothing else is stored.
-    const S = 20_000, stride = Math.max(1, Math.floor(n / S));
+    const S = Math.min(20_000, Math.max(1_024, Math.ceil(n / 64))), stride = Math.max(1, Math.floor(n / S));
     const picked = Uint32Array.from({ length: Math.ceil(n / stride) }, (_, i) => i * stride);
     // copy only the columns the first key reads (a table can be very wide)
     const used = new Set();
@@ -536,10 +564,56 @@ function encodeText(engine, type, values) {
   return { data, dict, codes };
 }
 
+// Text functions, run once per distinct label of a category column, not per
+// row: the matching codes become a few range checks the fused loop can run.
+const TEXT_FNS = {
+  startsWith: (label, [p]) => label.startsWith(p),
+  endsWith: (label, [p]) => label.endsWith(p),
+  contains: (label, [p]) => label.includes(p),
+  in: (label, list) => list.includes(label),
+  like: (label, [pattern], re) => re.test(label),
+};
+const MAX_RANGES = 256;
+
+// startsWith(region, 'E') -> (region >= 0 && region <= 1) || region == 5
+function textCall(n, cols, src) {
+  const [colNode, ...rest] = n.args;
+  const c = colNode?.t === 'var' ? cols.get(colNode.name) : null;
+  if (c?.strings) throw new Error(`vectro: "${colNode.name}" is a free-text column; ${n.fn}() needs a category column (load it as types: { ${colNode.name}: 'category' })`);
+  if (!c?.dict) throw new SyntaxError(`vectro: ${n.fn}() needs a text column first, then text in quotes, in "${src}"`);
+  if (!rest.length || rest.some((a) => a.t !== 'str')) throw new SyntaxError(`vectro: ${n.fn}(${colNode.name}, …) needs text in quotes after the column, in "${src}"`);
+  if (n.fn !== 'in' && rest.length !== 1) throw new SyntaxError(`vectro: ${n.fn}() takes a column and one text, in "${src}"`);
+  const args = rest.map((a) => a.v);
+  const re = n.fn === 'like' ? new RegExp(`^${args[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`) : null;
+  const match = c.dict.map((label) => TEXT_FNS[n.fn](label, args, re));
+  // runs of consecutive codes that match (or, if shorter, that don't)
+  const runs = (want) => {
+    const out = [];
+    for (let i = 0; i < match.length; i++) {
+      if (match[i] !== want) continue;
+      let j = i;
+      while (j + 1 < match.length && match[j + 1] === want) j++;
+      out.push([i, j]);
+      i = j;
+    }
+    return out;
+  };
+  const yes = runs(true), no = runs(false);
+  const col = { t: 'var', name: colNode.name };
+  const num = (v) => ({ t: 'num', v });
+  const anyOf = (list) => list.map(([a, b]) => (a === b ? { t: 'bin', op: '==', l: col, r: num(a) } : { t: 'bin', op: '&&', l: { t: 'bin', op: '>=', l: col, r: num(a) }, r: { t: 'bin', op: '<=', l: col, r: num(b) } }))
+    .reduce((x, y) => ({ t: 'bin', op: '||', l: x, r: y }));
+  if (!yes.length) return { t: 'bin', op: '==', l: col, r: num(-1) }; // nothing matches
+  if (!no.length) return { t: 'bin', op: '==', l: col, r: col };      // everything matches
+  if (Math.min(yes.length, no.length) > MAX_RANGES) throw new Error(`vectro: ${n.fn}() matches ${match.filter(Boolean).length} labels of "${colNode.name}" spread over too many runs; group by it first or filter differently`);
+  return yes.length <= no.length ? anyOf(yes) : { t: 'un', op: '!', x: anyOf(no) };
+}
+
 // `region == 'EU'` -> `region == 3` (the code for 'EU', or -1 if absent).
 function rewriteText(ast, cols, src) {
   const textCol = (n) => n.t === 'var' && cols.get(n.name)?.dict;
   const fix = (n) => {
+    if (n.t === 'call' && TEXT_FNS[n.fn]) return textCall(n, cols, src);
     if (n.t === 'bin') {
       if ((n.op === '==' || n.op === '!=') && (n.l.t === 'str' || n.r.t === 'str')) {
         const [colNode, strNode] = n.l.t === 'str' ? [n.r, n.l] : [n.l, n.r];

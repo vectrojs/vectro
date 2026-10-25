@@ -36,6 +36,7 @@ export function labelRanks(dict, desc) {
 export function sortIndex(keys, n) {
   let idx = new Uint32Array(n), tmp = new Uint32Array(n);
   for (let i = 0; i < n; i++) idx[i] = i;
+  if (n <= 4096) return smallSort(keys, idx); // a comparison sort is quicker than 65,536-bucket passes
   const count = new Uint32Array(65537);
   for (let k = keys.length - 1; k >= 0; k--) {
     // float64 -> two uint32 halves that sort as unsigned numbers
@@ -52,11 +53,28 @@ export function sortIndex(keys, n) {
     for (const [half, shift] of [[lo, 0], [lo, 16], [hi, 0], [hi, 16]]) {
       count.fill(0);
       for (let i = 0; i < n; i++) count[((half[idx[i]] >>> shift) & 0xffff) + 1]++;
-      if (count.some((c, d) => c === n && d > 0)) continue; // every row has these bits
+      if (count[((half[idx[0]] >>> shift) & 0xffff) + 1] === n) continue; // every row has these bits
       for (let d = 0; d < 65536; d++) count[d + 1] += count[d];
       for (let i = 0; i < n; i++) { const r = idx[i]; tmp[count[(half[r] >>> shift) & 0xffff]++] = r; }
       [idx, tmp] = [tmp, idx];
     }
   }
   return idx;
+}
+
+// Stable comparison sort of row indices for small inputs (same order as the
+// radix sort: by each key in turn, NaN last, ties in table order).
+function smallSort(keys, idx) {
+  const order = Array.from(idx);
+  order.sort((a, b) => {
+    for (const f of keys) {
+      const x = f[a], y = f[b];
+      if (x === y) continue;
+      if (x !== x) { if (y !== y) continue; return 1; }
+      if (y !== y) return -1;
+      return x < y ? -1 : 1;
+    }
+    return a - b;
+  });
+  return Uint32Array.from(order);
 }

@@ -29,6 +29,15 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
 - **Queries:** `filter(expr)` (lazy), `agg({ name: 'sum(expr)' | 'mean' | 'min' | 'max' | 'count()' })`,
   `sum/mean/min/max/count(expr)`, `groupBy(key).agg(...)`, `derive(name, expr)`,
   `collect()`, `toRows(limit)`.
+- **Text functions** on category columns: `startsWith(col, 'x')`,
+  `endsWith`, `contains`, `in(col, 'a', 'b')` and `like(col, 'EU-%')`. They run
+  once per distinct label (not per row) and become a few range checks on the
+  codes, so text filters run as fast as number filters.
+- **Zone maps:** each column keeps the min and max of every 16,384-row block
+  (built on the first filter that uses it; streams keep them up to date as
+  batches arrive). A filter with `column < number` parts skips every block
+  that can't match, which pays off on time-ordered data such as logs, orders
+  and streams. Exact: only blocks that provably fail are skipped.
 - **Sort and top-k:** `sort(by)` and `top(k, by)`, e.g. `top(10, '-revenue')`
   for the 10 largest. Keys are columns or expressions (`'-(price * qty)'`),
   several keys sort in order (`['region', '-price']`), text sorts by label,
@@ -66,6 +75,23 @@ filter. The assistant can only read files under `--root`, and its
 expressions are Vectro's small math language (no code runs). Mistakes come
 back as tool errors the assistant can read and fix. Answers include `ms`, the
 time Vectro took.
+
+## Zone maps
+
+`npm run bench:zones` (10M time-ordered rows, one every 10 ms, M1 Pro):
+
+| Query | With zone maps | Without | Faster |
+|---|---|---|---|
+| Revenue, last hour | 0.68 ms | 4.00 ms | 5.9× |
+| Revenue, last 6 hours | 1.13 ms | 3.22 ms | 2.8× |
+| One hour in the middle, EU only | 0.42 ms | 3.73 ms | 8.8× |
+| By region, last hour | 1.16 ms | 5.00 ms | 4.3× |
+| Top 10 orders, last hour | 4.15 ms | 5.82 ms | 1.4× |
+
+On a live stream of 7M rows (7 workers), "last minute" and "last 10 minutes"
+took 0.21–0.25 ms against 1.6–1.7 ms for a full scan (6–8×). The first
+filtered query on a column of a 10M-row table builds its zone maps
+(~25–50 ms, once).
 
 ## Vector search
 
