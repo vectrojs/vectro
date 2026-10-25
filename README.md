@@ -61,7 +61,12 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   several keys sort in order (`['region', '-price']`), text sorts by label,
   ties keep table order and missing values come last. `top` doesn't sort
   everything: it finds a cutoff from a sample, then collects only the rows
-  past it, on all cores. Split tables and streams have `topAsync`.
+  past it, on all cores. Split tables and streams have `topAsync`. Full sorts
+  of 50,000+ rows run on every core: a parallel radix sort (11-bit digits,
+  digits that never change are skipped, whole numbers sort as offsets), then
+  every column is gathered in the new order on every core. Sorting 10M rows
+  by `-price` takes ~130 ms (one thread: ~350 ms; a JavaScript comparator
+  sort: ~4.6 s).
 - **Async API:** every query has an `…Async` version that runs on the worker
   threads while your server or page keeps working.
 - **Expressions** are a small, safe language: numbers, columns, `+ - * /`,
@@ -351,9 +356,8 @@ answers.
 
 ## Not done yet
 
-Joins, integer/date types, missing values and persistence. Full `sort` runs
-on the calling thread (top-k is parallel), and split tables have `topAsync`
-but no full sort.
+Joins, integer/date types, missing values and persistence. Split tables have
+`topAsync` but no full sort.
 Binary streams have number and category columns only; Arrow ZSTD compression isn't supported.
 Streams take flat records only (no nested JSON fields), and windows group by
 at most one category column. Memory is capped at 4 GB per engine and freed with `dispose()`.

@@ -142,5 +142,20 @@ for (const workers of [1, 3]) {
   await split.close();
 }
 await engine.close();
+// the parallel sort (tables of 50,000+ rows) on float32 tables and other
+// thread counts gives the same order as plain JavaScript
+for (const [label, make, opts] of [['float32', () => new Engine(), { type: Float32Array }], ['one thread', () => new Engine({ threads: 1 }), {}], ['3 threads', () => new Engine({ threads: 3 }), {}]]) {
+  const e = make();
+  const cols = data(90_000);
+  if (opts.type) cols.price = cols.price.map((p) => Math.fround(p));
+  const t = e.table(cols, opts);
+  for (const by of ['-price', ['region', '-price'], ['-region', 'qty', 'price']]) {
+    checks++;
+    const want = norm(reference(rowsOf(cols), by)).map((r) => r.id);
+    const got = norm(t.sort(by).toRows()).map((r) => r.id);
+    if (!same(got, want)) fail(`${label} sort by ${by}`);
+  }
+  await e.close();
+}
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} sort checks passed`);
 process.exit(failures ? 1 : 0);

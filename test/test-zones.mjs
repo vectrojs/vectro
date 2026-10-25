@@ -120,5 +120,21 @@ for (const [name, make] of [['threads', () => new Engine()], ['interpreter', () 
   }
 }
 
+// tables made from other tables' rows (sort, collect, top) get new zone maps,
+// not copies of the old ones (a stale copy skipped blocks that match)
+{
+  const e = new Engine();
+  const n = 200_000;
+  const t = e.table({ ts: Float64Array.from({ length: n }, (_, i) => i), v: Float64Array.from({ length: n }, (_, i) => (i * 7919) % 1000) });
+  t.filter('ts < 1000').count(); // builds zone maps on ts
+  const sorted = t.sort('-ts'), kept = t.filter('v >= 500').collect(), best = t.top(150_000, '-ts');
+  const want = (rows) => rows.filter((r) => r.ts < 1000).length;
+  for (const [label, x] of [['sort', sorted], ['collect', kept], ['top', best]]) {
+    checks++;
+    const got = x.filter('ts < 1000').count();
+    if (got !== want(x.toRows())) fail(`${label}: stale zone maps (${got} rows)`);
+  }
+  await e.close();
+}
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} zone-map checks passed`);
 process.exit(failures ? 1 : 0);

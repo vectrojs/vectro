@@ -607,6 +607,19 @@ export class Engine {
     };
   }
 
+  // A kernel run over n rows in units on every thread (see runIndexed);
+  // returns the number of units (they decide each unit's own slots).
+  *_unitsG(v, n, scalars) {
+    yield {
+      op: OP.UNITS, n, arrays: [], F: v.fn,
+      setup: () => {
+        for (let j = 0; j < scalars.length; j++) this.sc[j] = scalars[j];
+        this.ctrl[C.KERNEL] = v.id;
+        this.ctrl[C.NSCAL] = scalars.length;
+      },
+    };
+  }
+
   // Group-by kernel split by group ranges (see runGroupRange): one set of
   // accumulators at accBase, J blocks of K slots.
   *_groupRangeG(v, n, arrays, scalars, accBase, K) {

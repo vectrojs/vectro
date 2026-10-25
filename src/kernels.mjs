@@ -6,7 +6,7 @@ import { countPattern } from './bytes.mjs';
 
 export const OP = {
   EXIT: 0, SUM: 1, MIN: 2, MAX: 3, ADD: 4, SCALE: 5, DOT: 6, HEAVY: 7,
-  COUNT_GT: 8, SORT_CHUNK: 9, MERGE: 10, COUNT_BYTES: 11, COPY: 12, FUSED: 13, GROUP: 14, COMPACT: 15, CSV_SCAN: 16, CSV_PARSE: 17, GROUP_RANGE: 18,
+  COUNT_GT: 8, SORT_CHUNK: 9, MERGE: 10, COUNT_BYTES: 11, COPY: 12, FUSED: 13, GROUP: 14, COMPACT: 15, CSV_SCAN: 16, CSV_PARSE: 17, GROUP_RANGE: 18, UNITS: 19,
 };
 
 // Layout of the shared control block (Int32 slots).
@@ -100,6 +100,8 @@ function runUnit(op, u, units, T, n, A, sc, ctrl, W, res, F, self) {
       runGroup(F, u, units, n, A, sc, ctrl, self);
     } else if (op === OP.GROUP_RANGE) {
       runGroupRange(F, u, units, n, A, sc, ctrl);
+    } else if (op === OP.UNITS) {
+      runIndexed(F, u, units, n, sc, ctrl);
     } else if (op === OP.COMPACT) {
       runCompact(F, u, units, n, A, sc, ctrl);
     } else if (op === OP.CSV_SCAN) {
@@ -153,6 +155,14 @@ function runGroupRange(F, u, units, n, A, sc, ctrl) {
   for (const ta of A) if (ta) args.push(ta.byteOffset);
   args.push(n, sc[ns], K, Math.floor((u * K) / units), Math.floor(((u + 1) * K) / units));
   for (let j = 0; j < ns; j++) args.push(sc[j]);
+  F(...args);
+}
+
+// A kernel that is told its rows and its unit: (start, end, unit, scalars...).
+// Pointers travel as scalars; the unit number lets it use its own slots.
+function runIndexed(F, u, units, n, sc, ctrl) {
+  const args = [chunkStart(u, units, n), chunkStart(u + 1, units, n), u];
+  for (let j = 0, ns = ctrl[C.NSCAL]; j < ns; j++) args.push(sc[j]);
   F(...args);
 }
 

@@ -11,6 +11,7 @@ import { parse, toSource, walk, analyze, isMask } from './fuse.mjs';
 import { generateGroupBy, generateCompact, generateHashGroups } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
+import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
 
@@ -18,6 +19,7 @@ const IDENT = /^[A-Za-z_]\w*$/;
 const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count']);
 const IDENTITY = { sum: 0, count: 0, mean: 0, min: Infinity, max: -Infinity };
 const MAX_GROUP_SLOTS = 2 ** 28; // threads * aggregations * groups (2GB of float64)
+const PARALLEL_SORT_ROWS = 50_000; // smaller tables sort on the calling thread
 
 export class Table {
   // cols: Map name -> { data, dict, codes, strings }
@@ -524,7 +526,17 @@ export class Table {
     for (let g = 0, r = 0; g < K; g++) if (counts[g] > 0) keep[r++] = g;
     let codes = keys.map((_, k) => groups.keyColumn(k, keep));
     if (!groups.sorted) {
-      const idx = sortIndex(codes, m);
+      let idx;
+      if (engine.jit && m >= PARALLEL_SORT_ROWS) { // many groups: sort them on every thread
+        const arrays = codes.map((a) => { const x = engine.alloc(Float64Array, m); engine.live(x).set(a); return x; });
+        try {
+          const perm = yield* sortPermG(engine, arrays, m, 'f64');
+          idx = engine.live(perm).slice();
+          engine.free(perm);
+        } finally {
+          for (const x of arrays) engine.free(x);
+        }
+      } else idx = sortIndex(codes, m);
       const order = new Float64Array(m);
       for (let r = 0; r < m; r++) order[r] = keep[idx[r]];
       keep = order;
@@ -618,7 +630,7 @@ export class Table {
       }
       const dst = batch.map(() => engine.alloc(this.type, total));
       yield* engine._compactG(v, this.n, srcNames.map((nm) => this.cols.get(nm).data), dst, offsets, scalars, units);
-      batch.forEach((nm, k) => out.set(nm, { ...this.cols.get(nm), data: dst[k] }));
+      batch.forEach((nm, k) => out.set(nm, { ...this.cols.get(nm), data: dst[k], zones: undefined })); // (new rows: no zone maps yet)
     }
     engine.free(offsets);
     return new Table(engine, out, total, { owned: names });
@@ -669,10 +681,45 @@ export class Table {
     const t = yield* this.#collectG();
     try {
       const keys = parseKeys(by, t.cols);
+      if (this.engine.jit && t.n >= PARALLEL_SORT_ROWS) return yield* t.#sortParallelG(keys);
       const perm = sortIndex(yield* t.#keyArraysG(keys), t.n);
       return t.#gather(perm, perm.length);
     } finally {
       if (t !== this) t.dispose();
+    }
+  }
+
+  // Sort on every thread (see parallel-sort.mjs): keys as engine arrays of
+  // the table's type (a plain number column is used as it is), then every
+  // column gathered in the new order on every thread.
+  *#sortParallelG(keys) {
+    const { engine, n } = this;
+    const t = this.type === Float32Array ? 'f32' : 'f64';
+    const made = [], arrays = [];
+    try {
+      for (const key of keys) {
+        const c = key.column ? null : this.cols.get(key.text.trim());
+        if (c && !c.dict && !c.strings) { arrays.push(c.data); continue; } // a number column: as it is
+        const a = engine.alloc(this.type, n);
+        made.push(a);
+        arrays.push(a);
+        if (key.column) { // text: rank of each label, A to Z (or Z to A)
+          const col = this.cols.get(key.column), rank = labelRanks(col.dict, key.desc);
+          const codes = engine.live(col.data), out = engine.live(a);
+          for (let i = 0; i < n; i++) out[i] = rank[codes[i]];
+        } else yield* engine.evalG(this.#bind(key.text, {}).src, this.#vars({}), a);
+      }
+      const perm = yield* sortPermG(engine, arrays, n, t);
+      try {
+        const out = new Map();
+        for (const [name, c] of this.cols) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, n, t), zones: undefined });
+        for (const c of out.values()) c.data = engine.live(c.data); // later allocations may have moved memory
+        return new Table(engine, out, n, { owned: [...out.keys()] });
+      } finally {
+        engine.free(perm);
+      }
+    } finally {
+      for (const a of made) engine.free(a);
     }
   }
 
@@ -685,7 +732,7 @@ export class Table {
       const data = engine.alloc(c.data.constructor, count);
       const src = engine.live(c.data);
       for (let i = 0; i < count; i++) data[i] = src[perm[i]];
-      out.set(name, { ...c, data });
+      out.set(name, { ...c, data, zones: undefined }); // (new rows: no zone maps yet)
     }
     for (const c of out.values()) c.data = engine.live(c.data); // later allocations may have moved memory
     return new Table(engine, out, count, { owned: [...out.keys()] });
