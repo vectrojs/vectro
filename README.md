@@ -58,8 +58,11 @@ claude mcp add vectro -- node /path/to/vectro/mcp/server.mjs --root ~/data
 ```
 
 Tools: `load_file`, `list_tables`, `describe_table` (column stats, common
-labels), `query` (filter, group_by, aggregates, sort, limit), `add_column`,
-`drop_table`. The assistant can only read files under `--root`, and its
+labels), `query` (filter, group_by, aggregates, sort, limit),
+`search_similar`, `add_column`, `drop_table`. A JSON-lines file with an
+embedding field (an array of numbers) also gets a vector index, so the
+assistant can ask for the rows most similar to a row (or to a vector), with a
+filter. The assistant can only read files under `--root`, and its
 expressions are Vectro's small math language (no code runs). Mistakes come
 back as tool errors the assistant can read and fix. Answers include `ms`, the
 time Vectro took.

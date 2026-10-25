@@ -17,6 +17,12 @@ const rows = Array.from({ length: 5000 }, (_, i) => ({ id: i, price: (i * 37) % 
 writeFileSync(join(dir, 'data', 'orders.csv'), 'id,price,qty,region\n' + rows.map((r) => `${r.id},${r.price},${r.qty},${r.region}`).join('\n') + '\n');
 writeFileSync(join(dir, 'data', 'events.jsonl'), rows.map((r) => JSON.stringify({ ...r, extra: { nested: true } })).join('\n') + '\nnot json\n');
 writeFileSync(join(dir, 'secret.csv'), 'a\n1\n');
+// documents with 8-number embeddings
+let seed = 3;
+const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff) - 0.5;
+const docs = Array.from({ length: 2000 }, (_, i) => ({ id: i, topic: ['ai', 'db', 'web'][i % 3], year: 2015 + (i % 10), embedding: Array.from({ length: 8 }, rnd) }));
+writeFileSync(join(dir, 'data', 'docs.jsonl'), docs.map((d) => JSON.stringify(d)).join('\n') + '\n');
+const cosine = (a, b) => { let d = 0, x = 0, y = 0; for (let j = 0; j < a.length; j++) { const p = Math.fround(a[j]), q = Math.fround(b[j]); d += p * q; x += p * p; y += q * q; } return d / Math.sqrt(x * y); };
 
 const server = spawn(process.execPath, [new URL('../mcp/server.mjs', import.meta.url).pathname, '--root', join(dir, 'data')], { stdio: ['pipe', 'pipe', 'pipe'] });
 const pending = new Map();
@@ -31,7 +37,7 @@ server.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initi
 const old = await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } });
 expect('older protocol accepted', old.result?.protocolVersion === '2024-11-05');
 const list = await rpc('tools/list', {});
-expect('tools listed', ['load_file', 'list_tables', 'describe_table', 'query', 'add_column', 'drop_table'].every((n) => list.result.tools.some((t) => t.name === n)));
+expect('tools listed', ['load_file', 'list_tables', 'describe_table', 'query', 'search_similar', 'add_column', 'drop_table'].every((n) => list.result.tools.some((t) => t.name === n)));
 expect('unknown method', (await rpc('no/such', {})).error?.code === -32601);
 
 let r = await call('load_file', { path: 'orders.csv' });
@@ -67,6 +73,23 @@ for (const [label, name, args, text] of [
   r = await call(name, args);
   expect(`error: ${label}`, r.error && r.text.includes(text), r.text);
 }
+// embeddings: load, then similar rows by row, by vector, with a filter
+r = await call('load_file', { path: 'docs.jsonl' });
+expect('load embeddings', !r.error && r.data.rows === 2000 && r.data.embedding?.dim === 8 && r.data.columns.topic === 'category', r.text);
+const nearest = (q, keep = () => true) => docs.filter(keep).map((d) => ({ id: d.id, s: cosine(d.embedding, q) })).sort((a, b) => b.s - a.s);
+r = await call('search_similar', { table: 'docs', like: { column: 'id', value: 7 }, k: 5 });
+const want = nearest(docs[7].embedding).slice(0, 5);
+expect('similar to a row', !r.error && r.data.rows[0].id === 7 && r.data.rows.every((h, j) => Math.abs(cosine(docs[h.id].embedding, docs[7].embedding) - want[j].s) < 1e-5), r.text);
+const qv = Array.from({ length: 8 }, rnd);
+r = await call('search_similar', { table: 'docs', vector: qv, k: 4, filter: "topic == 'ai' && year >= 2020" });
+const wantF = nearest(qv, (d) => d.topic === 'ai' && d.year >= 2020).slice(0, 4);
+expect('similar to a vector, filtered', !r.error && r.data.rows.length === 4 && r.data.rows.every((h, j) => h.topic === 'ai' && h.year >= 2020 && Math.abs(cosine(docs[h.id].embedding, qv) - wantF[j].s) < 1e-5), r.text);
+r = await call('search_similar', { table: 'orders', like: { column: 'id', value: 1 } });
+expect('error: no embeddings', r.error && r.text.includes('has no embeddings'), r.text);
+r = await call('search_similar', { table: 'docs', like: { column: 'id', value: 99999 } });
+expect('error: no such row', r.error && r.text.includes('no row where'), r.text);
+r = await call('drop_table', { table: 'docs' });
+
 r = await call('drop_table', { table: 'events' });
 r = await call('list_tables', {});
 expect('drop + list', !r.error && r.data.tables.length === 1 && r.data.tables[0].table === 'orders', r.text);

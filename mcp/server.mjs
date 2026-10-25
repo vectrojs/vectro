@@ -11,7 +11,7 @@
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { resolve, sep, extname, basename } from 'node:path';
 import { createInterface } from 'node:readline';
-import { Engine } from '../src/node.mjs';
+import { Engine, VectorIndex } from '../src/node.mjs';
 import { parseNDJSON } from '../src/ndjson.mjs';
 
 const VERSION = '0.1.0';
@@ -76,6 +76,21 @@ const TOOLS = [
     },
   },
   {
+    name: 'search_similar',
+    description: 'For tables loaded from JSON lines that have an embedding field (an array of numbers): the k rows whose embeddings are most similar (cosine) to a given row\'s, or to a given vector. Optional filter on the other columns.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string' },
+        like: { type: 'object', description: 'The row to compare with, found by a column value, e.g. { "column": "id", "value": 42 }', properties: { column: { type: 'string' }, value: {} }, required: ['column', 'value'] },
+        vector: { type: 'array', items: { type: 'number' }, description: 'Or an embedding to compare with (same length as the stored ones)' },
+        k: { type: 'integer', minimum: 1, maximum: MAX_ROWS },
+        filter: { type: 'string', description: 'Which rows may be returned, e.g. "year >= 2020"' },
+      },
+      required: ['table'],
+    },
+  },
+  {
     name: 'add_column',
     description: 'Add a computed column to a table, e.g. name "revenue", expression "price * qty * (1 - discount)".',
     inputSchema: { type: 'object', properties: { table: { type: 'string' }, name: { type: 'string' }, expression: { type: 'string' } }, required: ['table', 'name', 'expression'] },
@@ -93,6 +108,7 @@ function release(name) {
   const entry = tables.get(name);
   if (!entry) return;
   for (const t of entry.chain.reverse()) t.dispose();
+  entry.index?.dispose();
   tables.delete(name);
 }
 
@@ -117,21 +133,47 @@ const kindOf = (c) => (c.strings ? 'text' : c.dict ? 'category' : 'number');
 const clean = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === 'number' && !Number.isFinite(v) ? null : v])));
 const columnsOf = (t) => Object.fromEntries([...t.cols].map(([n, c]) => [n, kindOf(c)]));
 
+// JSON lines with an array-of-numbers field: parse every line with JSON.parse
+// (slower, but the embedding is needed), build the table and a vector index.
+async function loadWithEmbeddings(bytes, field, dim, kinds) {
+  const names = [...kinds].filter(([k, v]) => v && k !== field).map(([k]) => k);
+  const cols = Object.fromEntries(names.map((n) => [n, []]));
+  const vectors = [];
+  let skipped = 0;
+  for (const line of new TextDecoder().decode(bytes).split('\n')) {
+    if (!line.trim()) continue;
+    let o;
+    try { o = JSON.parse(line); } catch { skipped++; continue; }
+    const v = o?.[field];
+    if (!o || typeof o !== 'object' || !Array.isArray(v) || v.length !== dim) { skipped++; continue; }
+    vectors.push(v);
+    for (const n of names) {
+      const x = o[n];
+      cols[n].push(kinds.get(n) === 'number' ? (typeof x === 'number' ? x : typeof x === 'boolean' ? +x : typeof x === 'string' && x.trim() ? Number(x) : NaN) : x == null || typeof x === 'object' ? '' : String(x));
+    }
+  }
+  const table = engine.table(cols);
+  const index = await VectorIndex.create(engine, { vectors, dim, metric: 'cosine', columns: cols });
+  return { table, index, skipped, embedding: { field, dim } };
+}
+
 function loadJSONLines(bytes, types) {
   // column names and kinds from the first 1,000 lines
-  const kinds = new Map();
+  const kinds = new Map(), arrays = new Map();
   const text = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 1 << 20)));
   for (const line of text.split('\n').slice(0, 1000)) {
     let o;
     try { o = JSON.parse(line); } catch { continue; }
     if (!o || typeof o !== 'object' || Array.isArray(o)) continue;
     for (const [k, v] of Object.entries(o)) {
+      if (Array.isArray(v) && v.length && v.every((x) => typeof x === 'number')) { if (!arrays.has(k)) arrays.set(k, v.length); }
       if (v === null || typeof v === 'object') { if (!kinds.has(k)) kinds.set(k, null); continue; }
       const kind = typeof v === 'number' || typeof v === 'boolean' ? 'number' : 'category';
       if (kinds.get(k) !== 'category') kinds.set(k, kind);
     }
   }
   for (const [k, v] of Object.entries(types ?? {})) kinds.set(k, v === 'number' ? 'number' : 'category');
+  if (arrays.size) { const [field, dim] = arrays.entries().next().value; return loadWithEmbeddings(bytes, field, dim, kinds); }
   const names = [...kinds].filter(([, v]) => v).map(([k]) => k);
   if (!names.length) throw new ToolError('no JSON objects with plain values found in the first lines');
   const r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)));
@@ -140,17 +182,17 @@ function loadJSONLines(bytes, types) {
 }
 
 const handlers = {
-  load_file({ path, name, types }) {
+  async load_file({ path, name, types }) {
     const real = safePath(path);
     const ext = extname(real).toLowerCase();
     const tname = name || basename(real, extname(real)).replace(/[^A-Za-z0-9_]/g, '_');
     const bytes = new Uint8Array(readFileSync(real));
-    let table, skipped = 0;
-    if (ext === '.jsonl' || ext === '.ndjson') ({ table, skipped } = loadJSONLines(bytes, types));
+    let table, skipped = 0, index = null, embedding = null;
+    if (ext === '.jsonl' || ext === '.ndjson') ({ table, skipped, index = null, embedding = null } = await loadJSONLines(bytes, types));
     else table = engine.parseCSV(bytes, { types: types ?? {}, delimiter: ext === '.tsv' ? '\t' : ',' });
     release(tname);
-    tables.set(tname, { table, source: path, chain: [table] });
-    return { table: tname, rows: table.length, columns: columnsOf(table), sample: clean(table.toRows(5)), ...(skipped ? { skipped_lines: skipped } : {}) };
+    tables.set(tname, { table, source: path, chain: [table], index });
+    return { table: tname, rows: table.length, columns: columnsOf(table), sample: clean(table.toRows(5)), ...(embedding ? { embedding } : {}), ...(skipped ? { skipped_lines: skipped } : {}) };
   },
   list_tables() {
     return [...tables].map(([name, { table, source }]) => ({ table: name, source, rows: table.length, columns: columnsOf(table) }));
@@ -195,6 +237,21 @@ const handlers = {
     t?.dispose();
     return { matching_rows: matching, returned: rows.length, rows };
   },
+  async search_similar({ table: name, like, vector, k = 10, filter }) {
+    const entry = getTable(name);
+    if (!entry.index) throw new ToolError(`table "${name}" has no embeddings (load a JSON-lines file with an array-of-numbers field)`);
+    let q = vector;
+    if (!q) {
+      if (!like?.column) throw new ToolError('give like: { column, value } or vector');
+      const value = typeof like.value === 'string' ? `'${like.value.replaceAll("'", '')}'` : Number(like.value);
+      const dims = Array.from({ length: entry.index.dim }, (_, j) => `v${j}`);
+      const [row] = entry.index.table.filter(`${like.column} == ${value}`).select(...dims).toRows(1);
+      if (!row) throw new ToolError(`no row where ${like.column} is ${JSON.stringify(like.value)}`);
+      q = dims.map((d) => row[d]);
+    }
+    const hits = await entry.index.searchAsync(q, { k: Math.max(1, Math.min(MAX_ROWS, Math.floor(k))), filter });
+    return { returned: hits.length, rows: clean(hits) };
+  },
   add_column({ table: name, name: col, expression }) {
     const entry = getTable(name);
     const derived = entry.table.derive(col, expression); // shares the old columns
@@ -212,7 +269,7 @@ const handlers = {
 // ---- JSON-RPC over stdio ----------------------------------------------------------
 const send = (msg) => process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...msg })}\n`);
 
-function handle(msg) {
+async function handle(msg) {
   const { id, method, params } = msg;
   const reply = (result) => id !== undefined && send({ id, result });
   const error = (code, message) => id !== undefined && send({ id, error: { code, message } });
@@ -238,7 +295,7 @@ function handle(msg) {
       if (!fn) return error(-32602, `unknown tool: ${params?.name}`);
       try {
         const t0 = performance.now();
-        const result = fn(params.arguments ?? {});
+        const result = await fn(params.arguments ?? {});
         const ms = Math.round((performance.now() - t0) * 100) / 100;
         const body = Array.isArray(result) ? { tables: result, ms } : { ...result, ms };
         return reply({ content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body, isError: false });
@@ -253,12 +310,13 @@ function handle(msg) {
   }
 }
 
+let queue = Promise.resolve();
 const rl = createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   if (!line.trim()) return;
   let msg;
   try { msg = JSON.parse(line); } catch { return send({ id: null, error: { code: -32700, message: 'parse error' } }); }
-  for (const m of Array.isArray(msg) ? msg : [msg]) handle(m);
+  for (const m of Array.isArray(msg) ? msg : [msg]) queue = queue.then(() => handle(m)); // one call at a time, in order
 });
-rl.on('close', () => engine.close().then(() => process.exit(0)));
+rl.on('close', () => queue.then(() => engine.close()).then(() => process.exit(0)));
 log(`ready; data folder ${ROOT}`);
