@@ -33,7 +33,7 @@ if (role === 'producer' && BINARY) {
   const B = 65_536;
   const batch = { ts: new Float64Array(B), price: new Float64Array(B), qty: new Float64Array(B), region: { codes: new Uint32Array(B), labels: REG } };
   for (let i = 0; i < B; i++) { batch.ts[i] = 1_700_000_000_000 + i; batch.price[i] = Math.round(rnd() * 1e5) / 100; batch.qty[i] = 1 + Math.floor(rnd() * 9); batch.region.codes[i] = Math.floor(rnd() * 8); }
-  const feed = await Emitter.listen({ format: FORMAT, columns: { ts: 'number', price: 'number', qty: 'number', region: 'category' } });
+  const feed = await Emitter.listen({ format: FORMAT, threads: Number(process.env.EMIT_THREADS ?? 1), columns: { ts: 'number', price: 'number', qty: 'number', region: 'category' } });
   process.send({ port: feed.port, rowsPerBuffer: B, bytesPerBuffer: B * 28 });
   for (;;) await feed.write(batch); // waits while no collector is connected or all are full
 }

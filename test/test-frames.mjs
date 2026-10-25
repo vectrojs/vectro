@@ -73,6 +73,28 @@ for (let trial = 0; trial < 60; trial++) {
   checks++;
   if (JSON.stringify(got[0]) !== JSON.stringify(Array.from(codes, (c) => labels[c])) || JSON.stringify(got[1]) !== '["US","new"]' || JSON.stringify(got[2]) !== '["","EU"]') fail('codes + labels input');
 }
+// frames come from memory that isn't zero-filled: every padding byte must
+// still be zero (no stale memory goes out on the network)
+{
+  for (let trial = 0; trial < 50; trial++) {
+    globalThis.Buffer.allocUnsafeSlow(1 << 20).fill(0xab); // dirty some memory first
+    const e = new BatchEncoder({ x: 'number', r: 'category', y: 'number' });
+    const n = 1 + (trial * 37) % 101;
+    const labels = Array.from({ length: n }, (_, i) => 'L'.repeat(1 + ((i * 13 + trial) % 11)) + i);
+    const f = e.encode({ x: Float64Array.from({ length: n }, (_, i) => i), r: labels, y: new Float64Array(n) });
+    const dv = new DataView(f.buffer, f.byteOffset, f.byteLength);
+    const pad = [];
+    pad.push([5, 8], [12, 16]);
+    let at = 16 + n * 8; // x (n*8 is a multiple of 8)
+    const count = dv.getUint32(at, true);
+    pad.push([at + 4, at + 8]);
+    at += 8;
+    for (let i = 0; i < count; i++) { const len = dv.getUint32(at, true); pad.push([at + 4 + len, at + ((4 + len + 7) & ~7)]); at += (4 + len + 7) & ~7; }
+    pad.push([at + n * 4, at + ((n * 4 + 7) & ~7)]);
+    checks++;
+    if (pad.some(([a, z]) => f.subarray(a, z).some((v) => v !== 0))) fail(`padding not zero (trial ${trial})`);
+  }
+}
 // labels are sent once per connection: the second batch carries only new ones
 {
   const e = new BatchEncoder({ r: 'category' });

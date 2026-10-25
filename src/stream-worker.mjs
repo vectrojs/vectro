@@ -11,6 +11,8 @@ import { ZONE_ROWS } from './zones.mjs';
 import { FrameReader } from './frames.mjs';
 import { ArrowReader } from './arrow.mjs';
 
+const REDIRECT = 0x44525856; // 'VXRD' (see emitter.mjs)
+
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
 // Parsing happens in its own event-loop turn, one batch per turn, never while
@@ -344,9 +346,31 @@ export function createStreams(getEngine) {
       const s = get(id);
       if (url) return connectWebSocket(s, url);
       const net = await import('node:net');
+      const binary = s.format === 'vectro' || s.format === 'arrow';
       return new Promise((resolve, reject) => {
         const socket = net.connect({ host, port }, () => resolve(true));
-        if (s.format === 'vectro' || s.format === 'arrow') { const reader = frameReceiver(s); socket.on('data', (chunk) => receiveFrames(s, reader, chunk)); } else
+        if (binary) {
+          // A threaded Emitter may first answer 'VXRD' + port: connect there instead.
+          const reader = frameReceiver(s);
+          let head = new Uint8Array(0);
+          socket.on('data', (chunk) => {
+            if (head) {
+              const all = new Uint8Array(head.length + chunk.length);
+              all.set(head); all.set(chunk, head.length);
+              if (all.length < 8) { head = all; return; }
+              head = null;
+              const dv = new DataView(all.buffer);
+              if (dv.getUint32(0, true) === REDIRECT) {
+                socket.destroy();
+                s.sockets = s.sockets.filter((x) => x !== socket);
+                handlers.streamConnect({ id, host, port: dv.getUint32(4, true) }).catch((err) => { s.error ??= err.message; });
+                return;
+              }
+              chunk = all;
+            }
+            receiveFrames(s, reader, chunk);
+          });
+        } else
         socket.on('data', (chunk) => receive(s, chunk));
         socket.on('end', () => { if (s.partial) { queue(s, concat([s.partial, Uint8Array.of(NL)])); s.partial = null; } flush(s); });
         socket.on('error', (err) => { s.error ??= err.message; reject(err); });

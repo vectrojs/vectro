@@ -64,48 +64,55 @@ export class BatchEncoder {
         return { bytes: new Uint8Array(f.buffer, f.byteOffset, f.byteLength) };
       }
       // category: codes on this connection, new labels sent once
-      const map = this.codes[k], codes = new Uint32Array(rows), fresh = [];
+      const map = this.codes[k], fresh = [];
+      const code = (label) => {
+        let c = map.get(label);
+        if (c === undefined) { c = map.size; map.set(label, c); fresh.push(enc.encode(String(label))); }
+        return c;
+      };
+      let codes;
       if (values.codes) { // codes + labels: map each label once, then the codes
-        const lut = new Uint32Array(values.labels.length);
-        values.labels.forEach((label, j) => {
-          let c = map.get(label);
-          if (c === undefined) { c = map.size; map.set(label, c); fresh.push(enc.encode(String(label))); }
-          lut[j] = c;
-        });
-        const src = values.codes;
-        for (let i = 0; i < rows; i++) codes[i] = lut[src[i]];
-        return { fresh, codes };
+        const lut = Uint32Array.from(values.labels, code), src = values.codes;
+        if (src instanceof Uint32Array && lut.every((c, j) => c === j)) codes = src; // same numbering: no copy
+        else { codes = new Uint32Array(rows); for (let i = 0; i < rows; i++) codes[i] = lut[src[i]]; }
+      } else {
+        codes = new Uint32Array(rows);
+        for (let i = 0; i < rows; i++) codes[i] = code(values[i]);
       }
-      for (let i = 0; i < rows; i++) {
-        const s = values[i];
-        let c = map.get(s);
-        if (c === undefined) { c = map.size; map.set(s, c); fresh.push(enc.encode(String(s))); }
-        codes[i] = c;
-      }
-      return { fresh, codes };
+      return { fresh, bytes: new Uint8Array(codes.buffer, codes.byteOffset, codes.byteLength) };
     });
     let size = 16; // header + rows + reserved
-    for (const p of parts) {
-      if (p.bytes) size += pad8(p.bytes.length);
-      else size += 8 + p.fresh.reduce((a, l) => a + pad8(4 + l.length), 0) + pad8(p.codes.byteLength);
-    }
-    const out = new Uint8Array(size);
-    const dv = new DataView(out.buffer);
+    for (const p of parts) size += (p.fresh ? 8 + p.fresh.reduce((a, l) => a + pad8(4 + l.length), 0) : 0) + pad8(p.bytes.length);
+    const out = alloc(size); // not zero-filled: every byte is written below
+    const dv = new DataView(out.buffer, out.byteOffset, size);
     dv.setUint32(0, size - 4, true);
-    out[4] = BATCH;
+    dv.setUint32(4, BATCH, true); // kind + 3 reserved zero bytes
     dv.setUint32(8, rows, true);
+    dv.setUint32(12, 0, true);
     let at = 16;
+    const put = (bytes) => { out.set(bytes, at); const end = at + pad8(bytes.length); out.fill(0, at + bytes.length, end); at = end; };
     for (const p of parts) {
-      if (p.bytes) { out.set(p.bytes, at); at += pad8(p.bytes.length); continue; }
-      dv.setUint32(at, p.fresh.length, true);
-      at += 8;
-      for (const l of p.fresh) { dv.setUint32(at, l.length, true); out.set(l, at + 4); at += pad8(4 + l.length); }
-      out.set(new Uint8Array(p.codes.buffer), at);
-      at += pad8(p.codes.byteLength);
+      if (p.fresh) {
+        dv.setUint32(at, p.fresh.length, true);
+        dv.setUint32(at + 4, 0, true);
+        at += 8;
+        for (const l of p.fresh) {
+          const end = at + pad8(4 + l.length);
+          dv.setUint32(at, l.length, true);
+          out.set(l, at + 4);
+          out.fill(0, at + 4 + l.length, end);
+          at = end;
+        }
+      }
+      put(p.bytes);
     }
     return out;
   }
 }
+
+// Frame memory: Node's Buffer.allocUnsafeSlow skips zero-filling (the
+// encoder writes every byte, padding included); elsewhere a Uint8Array.
+const alloc = globalThis.Buffer?.allocUnsafeSlow ? (n) => globalThis.Buffer.allocUnsafeSlow(n) : (n) => new Uint8Array(n);
 
 // Reads frames from bytes that arrive in pieces cut anywhere. Calls
 // onSchema(columns), onBatch(rows, columns) with columns[k] =

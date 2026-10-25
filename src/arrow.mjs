@@ -621,16 +621,23 @@ function recordBatch(rows, nodes, buffers) {
 // One message: { bytes, metaLength (with its 8-byte prefix), bodyLength }.
 function message(type, header, buffers = [], bodyLength = 0) {
   const meta = new FlatWriter().finish(tbl(['i16', V5], ['u8', type], ['off', header], ['i64', bodyLength]));
-  const bytes = new Uint8Array(8 + meta.length + bodyLength);
-  const dv = new DataView(bytes.buffer);
+  const bytes = alloc(8 + meta.length + bodyLength); // not zero-filled: every byte is written below
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
   dv.setUint32(0, 0xffffffff, true);
   dv.setInt32(4, meta.length, true);
   bytes.set(meta, 8);
   let at = 8 + meta.length;
-  for (const b of buffers) { bytes.set(b, at); at += pad8(b.length); }
+  for (const b of buffers) {
+    bytes.set(b, at);
+    const end = at + pad8(b.length);
+    bytes.fill(0, at + b.length, end);
+    at = end;
+  }
   return { bytes, metaLength: 8 + meta.length, bodyLength };
 }
 
+// Node's Buffer.allocUnsafeSlow skips zero-filling; elsewhere a Uint8Array.
+const alloc = globalThis.Buffer?.allocUnsafeSlow ? (n) => globalThis.Buffer.allocUnsafeSlow(n) : (n) => new Uint8Array(n);
 const asBytes = (a) => new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
 
 // Builds Arrow IPC stream messages for one connection or file: number columns
@@ -670,7 +677,8 @@ export class ArrowEncoder {
         buffers.push(new Uint8Array(0), asBytes(f));
         return;
       }
-      const map = this.labels[k], codes = new Int32Array(len), fresh = [];
+      const map = this.labels[k], fresh = [];
+      let codes;
       const code = (label) => {
         let c = map.get(label);
         if (c === undefined) { c = map.size; map.set(label, c); fresh.push(String(label)); }
@@ -678,8 +686,12 @@ export class ArrowEncoder {
       };
       if (values.codes) {
         const lut = values.labels.map(code), src = values.codes;
-        for (let i = 0; i < len; i++) codes[i] = lut[src[i]];
-      } else for (let i = 0; i < len; i++) codes[i] = code(values[i]);
+        if ((src instanceof Uint32Array || src instanceof Int32Array) && lut.every((c, j) => c === j)) codes = src; // same numbering: no copy
+        else { codes = new Int32Array(len); for (let i = 0; i < len; i++) codes[i] = lut[src[i]]; }
+      } else {
+        codes = new Int32Array(len);
+        for (let i = 0; i < len; i++) codes[i] = code(values[i]);
+      }
       buffers.push(new Uint8Array(0), asBytes(codes));
       if (fresh.length || !this.sent[k]) out.push(this.#dictionary(k, fresh));
     });
