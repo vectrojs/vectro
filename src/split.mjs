@@ -378,40 +378,56 @@ export class SplitTable {
   async countAsync(expr, params) { return (await this.aggAsync({ v: expr ? `count(${expr})` : 'count()' }, params)).v; }
 
   groupBy(key) {
-    if (!this.meta.names.includes(key)) throw new Error(`vectro: no column "${key}"`);
-    return { aggAsync: (spec, params = {}) => this.#groupAgg(key, spec, params) };
+    const keys = Array.isArray(key) ? key : [key];
+    if (!keys.length) throw new Error('vectro: groupBy needs at least one key column');
+    for (const k of keys) if (!this.meta.names.includes(k)) throw new Error(`vectro: no column "${k}"`);
+    return { aggAsync: (spec, params = {}) => this.#groupAgg(keys, spec, params) };
   }
 
   // Each worker groups its slice; partial groups are merged here by key and
   // returned as a normal (small) table on the page.
-  async #groupAgg(key, spec, params) {
+  async #groupAgg(keys, spec, params) {
     const { ask, outs } = plan(spec);
     const askKeys = Object.keys(ask);
-    const parts = await this.#all('groupBy', { key, spec: ask, params });
+    const parts = await this.#all('groupBy', { keys, spec: ask, params });
     const index = new Map();
     const acc = askKeys.map(() => []);
     const fnOf = askKeys.map((k) => outs.find((o) => o.out === k)?.fn ?? (k.startsWith('__np_n_') ? 'count' : 'sum'));
-    const keys = [];
-    for (const { keys: ks, cols } of parts) {
-      for (let r = 0; r < ks.length; r++) {
-        let g = index.get(ks[r]);
+    const groups = []; // key tuples
+    const one = keys.length === 1;
+    for (const { keyCols, cols } of parts) {
+      const rows = keyCols[0].length;
+      for (let r = 0; r < rows; r++) {
+        const tuple = keyCols.map((c) => c[r]);
+        const id = one ? tuple[0] : tuple.map((v) => (typeof v === 'string' ? JSON.stringify(v) : String(v))).join(','); // exact: NaN, -0, Infinity kept apart
+        let g = index.get(id);
         if (g === undefined) {
-          g = keys.length;
-          index.set(ks[r], g);
-          keys.push(ks[r]);
+          g = groups.length;
+          index.set(id, g);
+          groups.push(tuple);
           askKeys.forEach((_, j) => acc[j].push(START[fnOf[j]]));
         }
         askKeys.forEach((k, j) => { acc[j][g] = COMBINE[fnOf[j]](acc[j][g], cols[k][r]); });
       }
     }
-    // Same group order as a normal table: dictionary order for text, ascending
-    // numbers. Streams have no shared dictionary: their labels sort A to Z.
-    const dict = this.meta.dicts[key];
-    const rank = dict ? new Map(dict.map((s, i) => [s, i])) : null;
-    const byLabel = !rank && typeof keys[0] === 'string';
-    const order = keys.map((_, g) => g).sort((a, b) => (rank ? rank.get(keys[a]) - rank.get(keys[b]) : byLabel ? (keys[a] < keys[b] ? -1 : keys[a] > keys[b] ? 1 : 0) : keys[a] - keys[b]));
+    // Same group order as a normal table: dictionary order for text, numbers
+    // ascending (NaN last), earlier keys first. Streams have no shared
+    // dictionary: their labels sort A to Z.
+    const ranks = keys.map((k) => { const d = this.meta.dicts[k]; return d ? new Map(d.map((s, i) => [s, i])) : null; });
+    const cmp = (x, y, rank) => {
+      if (rank) { x = rank.get(x); y = rank.get(y); }
+      if (x === y) return 0;
+      if (typeof x === 'number' && x !== x) return y !== y ? 0 : 1;
+      if (typeof y === 'number' && y !== y) return -1;
+      return x < y ? -1 : 1;
+    };
+    const order = groups.map((_, g) => g).sort((a, b) => {
+      for (let k = 0; k < keys.length; k++) { const c = cmp(groups[a][k], groups[b][k], ranks[k]); if (c) return c; }
+      return 0;
+    });
     const col = (k) => order.map((g) => acc[askKeys.indexOf(k)][g]);
-    const columns = { [key]: order.map((g) => keys[g]) };
+    const columns = {};
+    keys.forEach((key, k) => { columns[key] = order.map((g) => groups[g][k]); });
     for (const { out, fn } of outs) {
       if (fn === 'mean') {
         const s = col(`__np_sum_${out}`), n = col(`__np_n_${out}`);

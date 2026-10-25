@@ -27,8 +27,17 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
 - **Tables:** `engine.table({ price: Float64Array, region: string[] })`,
   `engine.readCSV(path)`, `engine.parseCSV(text | bytes)`.
 - **Queries:** `filter(expr)` (lazy), `agg({ name: 'sum(expr)' | 'mean' | 'min' | 'max' | 'count()' })`,
-  `sum/mean/min/max/count(expr)`, `groupBy(key).agg(...)`, `derive(name, expr)`,
+  `sum/mean/min/max/count(expr)`, `groupBy(keys).agg(...)`, `derive(name, expr)`,
   `collect()`, `toRows(limit)`.
+- **Group by any keys:** `groupBy('region')`, `groupBy(['region', 'day'])`,
+  `groupBy('account_id')`. Keys are category columns or any numbers (big IDs,
+  amounts, negatives; NaN is its own group, -0 groups with 0). Small keys (a
+  category, or whole numbers below 16.7M, alone or combined) are group numbers
+  as they are and run on all cores: `region + day` (2,920 pairs) on 10M rows
+  took 12 ms vs DuckDB's 84 ms. Other keys are numbered by a hash table first,
+  which runs on one thread: on 10M rows, 100K price groups took ~0.4 s and 1M
+  account IDs ~2 s, where DuckDB takes 0.09 s and 0.15 s (a parallel hash
+  kernel is the next step; `compare/bench-groupby.mjs`).
 - **Text functions** on category columns: `startsWith(col, 'x')`,
   `endsWith`, `contains`, `in(col, 'a', 'b')` and `like(col, 'EU-%')`. They run
   once per distinct label (not per row) and become a few range checks on the

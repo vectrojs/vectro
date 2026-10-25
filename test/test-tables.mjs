@@ -127,7 +127,9 @@ for (const type of [Float64Array, Float32Array]) {
   expectThrow('text vs number column', () => t.filter("price == 'EU'"));
   expectThrow('text ordering', () => t.filter("region < 'EU'").count());
   expectThrow('bad aggregation', () => t.agg({ x: 'price * 2' }));
-  expectThrow('groupBy non-integer', () => t.groupBy('price').agg({ n: 'count()' }) && e.table({ p: [1.5] }).groupBy('p').agg({ n: 'count()' }));
+  expectThrow('groupBy unknown key', () => t.groupBy(['region', 'cost']));
+  expectThrow('groupBy repeated key', () => t.groupBy(['region', 'region']));
+  expectThrow('aggregation named like a key', () => t.groupBy('region').agg({ region: 'count()' }));
   expectThrow('bad column name', () => e.table({ 'my col': [1] }));
   expectThrow('param clashes with column', () => t.filter('price > region', { region: 1 }));
 }

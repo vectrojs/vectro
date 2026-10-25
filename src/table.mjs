@@ -221,39 +221,148 @@ export class Table {
     return { fn: ast.fn, arg: this.#bind(toSource(ast.args[0]), params).src };
   }
 
+  // Group by one key or several: groupBy('region'), groupBy(['region', 'day']).
+  // Keys can be category columns or any numbers (IDs, prices, NaN groups).
+  // Groups come out sorted by key: text in dictionary order, numbers
+  // ascending (NaN last), earlier keys first.
   groupBy(key) {
-    const c = this.cols.get(key);
-    if (!c) throw new Error(`vectro: no column "${key}"`);
-    if (c.strings) throw new Error(`vectro: can't group by free-text column "${key}" (load it as types: { ${key}: 'category' })`);
+    const keys = Array.isArray(key) ? key : [key];
+    if (!keys.length) throw new Error('vectro: groupBy needs at least one key column');
+    if (new Set(keys).size !== keys.length) throw new Error(`vectro: groupBy got the same key twice (${keys.join(', ')})`);
+    for (const k of keys) {
+      const c = this.cols.get(k);
+      if (!c) throw new Error(`vectro: no column "${k}"`);
+      if (c.strings) throw new Error(`vectro: can't group by free-text column "${k}" (load it as types: { ${k}: 'category' })`);
+    }
     return {
-      agg: (spec, params = {}) => this.engine._drive(this.#groupAggG(key, spec, params)),
-      aggAsync: (spec, params = {}) => this.engine._driveAsync(this.#groupAggG(key, spec, params)),
+      agg: (spec, params = {}) => this.engine._drive(this.#groupAggG(keys, spec, params)),
+      aggAsync: (spec, params = {}) => this.engine._driveAsync(this.#groupAggG(keys, spec, params)),
     };
   }
 
-  *#groupAggG(key, spec, params) {
+  *#groupAggG(keys, spec, params) {
     const narrow = this.#narrow();
-    if (narrow !== this) return yield* narrow.#groupAggG(key, spec, params);
-    const { engine } = this;
+    if (narrow !== this) return yield* narrow.#groupAggG(keys, spec, params);
     const merged = this.#mergeParams(params);
-    const keyCol = this.cols.get(key);
-
-    // Number of groups: the dictionary size, or max+1 for integer keys.
-    let K, label;
-    if (keyCol.dict) {
-      K = keyCol.dict.length;
-      label = (g) => keyCol.dict[g];
-    } else {
-      const [lo, hi, frac] = yield* engine.evalG(['min(k)', 'max(k)', 'count(k != floor(k))'], { k: keyCol.data });
-      if (this.n && (lo < 0 || frac > 0 || !(hi < 2 ** 24))) {
-        throw new Error(`vectro: groupBy("${key}") needs a text column or whole numbers from 0 to 16,777,215`);
-      }
-      K = this.n ? hi + 1 : 0;
-      label = (g) => g;
-    }
-
-    // Kernel items: a hidden row count, then each aggregation (mean = sum / count).
     const items = Object.entries(spec).map(([out, src]) => ({ out, ...this.#aggItem(src, merged) }));
+    for (const it of items) if (keys.includes(it.out)) throw new Error(`vectro: aggregation "${it.out}" has the same name as a key`);
+    const direct = yield* this.#directGroups(keys, items.length + 1);
+    if (direct) {
+      try { return yield* this.#runGroupsG(keys, direct, items, merged); } finally { if (direct.owned) this.engine.free(direct.data); }
+    }
+    // Hash path: keep the matching rows, number their distinct keys 0..K-1
+    // (in order of first appearance), then group by that number.
+    const t = yield* this.#collectG();
+    const ids = t.#hashGroups(keys);
+    try {
+      return yield* t.#runGroupsG(keys, ids, items, merged);
+    } finally {
+      this.engine.free(ids.data);
+      if (t !== this) t.dispose();
+    }
+  }
+
+  // Keys small enough to be group numbers as they are: a text column's codes
+  // or whole numbers 0..2^24, several combined as k1 * size2 + k2..., while
+  // the accumulators stay small (or no larger than the rows). Else null.
+  *#directGroups(keys, J) {
+    const { engine } = this;
+    const sizes = [];
+    for (const key of keys) {
+      const c = this.cols.get(key);
+      if (c.dict) { sizes.push(c.dict.length); continue; }
+      if (!this.n) { sizes.push(0); continue; }
+      const [lo, hi, frac] = yield* engine.evalG(['min(k)', 'max(k)', 'count(k != floor(k))'], { k: c.data });
+      if (lo < 0 || frac > 0 || !(hi < 2 ** 24)) return null;
+      sizes.push(hi + 1);
+    }
+    const K = sizes.reduce((a, b) => a * b, 1);
+    const C = engine.jit && K <= 1024 ? 4 : 1;
+    if (K > 2 ** 24 || engine.T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (K > 65_536 && K > this.n)) return null;
+    const values = (g) => { // group number -> key values
+      const out = new Array(keys.length);
+      for (let k = keys.length - 1; k >= 0; k--) {
+        const code = g % sizes[k];
+        g = Math.floor(g / sizes[k]);
+        const c = this.cols.get(keys[k]);
+        out[k] = c.dict ? c.dict[code] : code;
+      }
+      return out;
+    };
+    if (keys.length === 1) return { K, data: this.cols.get(keys[0]).data, values, owned: false, sorted: true };
+    let expr = keys[0];
+    for (let k = 1; k < keys.length; k++) expr = `(${expr}) * ${sizes[k]} + ${keys[k]}`;
+    const data = engine.alloc(this.type, this.n);
+    yield* engine.evalG(expr, this.#vars({}), data);
+    return { K, data, values, owned: true, sorted: true };
+  }
+
+  // Number each row's distinct key (tuple) with a hash table: { K, data
+  // (group number per row, in engine memory), values(g), sorted: false }.
+  // Each group's key values are kept side by side (no trips back to its first
+  // row), and keys are hashed on their bits (-0 as 0, every NaN alike).
+  #hashGroups(keys) {
+    const { engine, n } = this;
+    if (this.type === Float32Array && n > 2 ** 24) throw new RangeError('vectro: groupBy on a float32 table is limited to 16,777,216 rows on the hash path');
+    const nk = keys.length, f32 = this.type === Float32Array, W = f32 ? 1 : 2; // 32-bit words per value
+    const data = engine.alloc(this.type, n);
+    const cols = keys.map((k) => engine.live(this.cols.get(k).data));
+    const words = cols.map((c) => new Uint32Array(c.buffer, c.byteOffset, c.length * W));
+    const ids = engine.live(data);
+    let cap = 1024, slots = new Int32Array(cap).fill(-1), hashes = new Int32Array(cap);
+    let kv = new Float64Array(1024 * nk); // group g's keys: kv[g * nk + k]
+    let K = 0;
+    for (let i = 0; i < n; i++) {
+      let h = 0x811c9dc5;
+      for (let k = 0; k < nk; k++) {
+        const v = cols[k][i];
+        if (v === v && v !== 0) {
+          h = Math.imul(h ^ words[k][i * W], 0x01000193);
+          if (W === 2) h = Math.imul(h ^ words[k][i * 2 + 1], 0x01000193);
+        } else h = Math.imul(h ^ (v === 0 ? 0 : 0x7ff8), 0x01000193); // 0 and -0; NaN
+      }
+      h ^= h >>> 15; h = Math.imul(h, 0x2c1b3c6d); h ^= h >>> 12;
+      const mask = cap - 1;
+      let slot = h & mask, g = slots[slot];
+      while (g !== -1) {
+        if (hashes[slot] === h) {
+          let k = 0;
+          for (; k < nk; k++) { const a = kv[g * nk + k], b = cols[k][i]; if (a !== b && (a === a || b === b)) break; }
+          if (k === nk) break;
+        }
+        slot = (slot + 1) & mask;
+        g = slots[slot];
+      }
+      if (g === -1) {
+        g = K++;
+        if ((g + 1) * nk > kv.length) { const bigger = new Float64Array(kv.length * 2); bigger.set(kv); kv = bigger; }
+        for (let k = 0; k < nk; k++) { const v = cols[k][i]; kv[g * nk + k] = v === 0 ? 0 : v; }
+        slots[slot] = g;
+        hashes[slot] = h;
+        if (K * 2 > cap) { // grow: rehash every group
+          cap *= 2;
+          const s2 = new Int32Array(cap).fill(-1), h2 = new Int32Array(cap);
+          for (let x = 0; x < slots.length; x++) {
+            if (slots[x] === -1) continue;
+            let y = hashes[x] & (cap - 1);
+            while (s2[y] !== -1) y = (y + 1) & (cap - 1);
+            s2[y] = slots[x]; h2[y] = hashes[x];
+          }
+          slots = s2; hashes = h2;
+        }
+      }
+      ids[i] = g;
+    }
+    const dicts = keys.map((k) => this.cols.get(k).dict);
+    const values = (g) => keys.map((_, k) => (dicts[k] ? dicts[k][kv[g * nk + k]] : kv[g * nk + k]));
+    const sortKey = (g, k) => kv[g * nk + k]; // codes for text: dictionary order
+    return { K, data, values, sortKey, owned: true, sorted: false };
+  }
+
+  // Run the group kernel over group numbers `groups.data` (0..K-1).
+  *#runGroupsG(keys, groups, items, merged) {
+    const { engine } = this;
+    const { K } = groups;
     const sources = ['count(1)', ...items.map((it) => `${it.fn === 'mean' ? 'sum' : it.fn}(${it.arg ?? 1})`)];
     const analysis = analyze(sources);
     const predAst = this.pred ? parse(this.pred) : null;
@@ -268,68 +377,116 @@ export class Table {
     // Few groups: 4 rotating copies per group (see generateGroupBy). The
     // interpreter's precompiled scatter kernels use one slot per group.
     const C = engine.jit && K <= 1024 ? 4 : 1;
-    if (T * J * K * C > MAX_GROUP_SLOTS) throw new RangeError(`vectro: too many groups (${K.toLocaleString()}) for groupBy("${key}")`);
-
-    // Accumulators: one block per thread, padded to 256 bytes so two threads
-    // never update the same cache line. Every slot starts at its identity.
-    const block = Math.ceil((J * K * C) / 32) * 32; // in float64s
-    const acc = engine.alloc(Float64Array, Math.max(1, T * block));
-    const slots = (s, j) => [s * block + j * K * C, s * block + (j + 1) * K * C];
-    analysis.items.forEach((it, j) => {
-      for (let s = 0; s < T; s++) acc.fill(IDENTITY[it.reduce], ...slots(s, j));
-    });
-    if (engine.jit) {
-      const cacheKey = `group|${t}|${C}|${sources.join(';')}|${this.pred}|${arrayNames}|${scalarNames}`;
-      engine._tableKernels ??= new Map();
-      let v = engine._tableKernels.get(cacheKey);
-      if (!v) {
-        v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, C, engine.isShared));
-        engine._tableKernels.set(cacheKey, v);
-      }
-      const arrays = [...arrayNames.map((nm) => this.cols.get(nm).data), keyCol.data];
-      yield* engine._groupG(v, this.n, arrays, scalarNames.map((nm) => merged[nm]), acc.byteOffset, block * 8, K);
+    let totals;
+    if (T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS)) {
+      totals = yield* this.#scatterG(groups.data, K, analysis.items, sources, merged); // too many groups for per-thread accumulators
     } else {
-      // the calling thread fills thread 0's block
-      const cols = Object.fromEntries(arrayNames.map((nm) => [nm, this.cols.get(nm).data]));
-      interpretGroup(engine, t, analysis.items, predAst, cols, merged, keyCol.data, acc, K, this.n);
-    }
-
-    // Combine threads (and copies) into one value per group and aggregation.
-    const totals = [];
-    for (const [j, it] of analysis.items.entries()) {
-      const op = it.reduce === 'min' ? Math.min : it.reduce === 'max' ? Math.max : (a, b) => a + b;
-      if (C > 1 || T === 1 || !engine.jit) { // a plain loop is enough
-        const a = engine.live(acc);
-        const out = new Float64Array(K).fill(IDENTITY[it.reduce]);
-        for (let s = 0; s < T; s++) {
-          const [lo] = slots(s, j);
-          for (let g = 0; g < K; g++) for (let c = 0; c < C; c++) out[g] = op(out[g], a[lo + g * C + c]);
+      // Accumulators: one block per thread, padded to 256 bytes so two threads
+      // never update the same cache line. Every slot starts at its identity.
+      const block = Math.ceil((J * K * C) / 32) * 32; // in float64s
+      const acc = engine.alloc(Float64Array, Math.max(1, T * block));
+      const slots = (s, j) => [s * block + j * K * C, s * block + (j + 1) * K * C];
+      analysis.items.forEach((it, j) => {
+        for (let s = 0; s < T; s++) acc.fill(IDENTITY[it.reduce], ...slots(s, j));
+      });
+      if (engine.jit) {
+        const cacheKey = `group|${t}|${C}|${sources.join(';')}|${this.pred}|${arrayNames}|${scalarNames}`;
+        engine._tableKernels ??= new Map();
+        let v = engine._tableKernels.get(cacheKey);
+        if (!v) {
+          v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, C, engine.isShared));
+          engine._tableKernels.set(cacheKey, v);
         }
-        totals.push(out);
-        continue;
+        const arrays = [...arrayNames.map((nm) => this.cols.get(nm).data), groups.data];
+        yield* engine._groupG(v, this.n, arrays, scalarNames.map((nm) => merged[nm]), acc.byteOffset, block * 8, K);
+      } else {
+        // the calling thread fills thread 0's block
+        const cols = Object.fromEntries(arrayNames.map((nm) => [nm, this.cols.get(nm).data]));
+        interpretGroup(engine, t, analysis.items, predAst, cols, merged, groups.data, acc, K, this.n);
       }
-      // many groups: one fused pass over all thread blocks, written into thread 0's
-      const vars = {};
-      for (let s = 0; s < T; s++) vars[`t${s}`] = acc.subarray(...slots(s, j));
-      const names = Object.keys(vars);
-      const expr = it.reduce === 'min' || it.reduce === 'max'
-        ? names.slice(1).reduce((e, nm) => `${it.reduce}(${e}, ${nm})`, names[0])
-        : names.join(' + ');
-      yield* engine.evalG(expr, vars, vars.t0);
-      totals.push(vars.t0);
+
+      // Combine threads (and copies) into one value per group and aggregation.
+      totals = [];
+      for (const [j, it] of analysis.items.entries()) {
+        const op = it.reduce === 'min' ? Math.min : it.reduce === 'max' ? Math.max : (a, b) => a + b;
+        if (C > 1 || T === 1 || !engine.jit) { // a plain loop is enough
+          const a = engine.live(acc);
+          const out = new Float64Array(K).fill(IDENTITY[it.reduce]);
+          for (let s = 0; s < T; s++) {
+            const [lo] = slots(s, j);
+            for (let g = 0; g < K; g++) for (let c = 0; c < C; c++) out[g] = op(out[g], a[lo + g * C + c]);
+          }
+          totals.push(out);
+          continue;
+        }
+        // many groups: one fused pass over all thread blocks, written into thread 0's
+        const vars = {};
+        for (let s = 0; s < T; s++) vars[`t${s}`] = acc.subarray(...slots(s, j));
+        const vnames = Object.keys(vars);
+        const expr = it.reduce === 'min' || it.reduce === 'max'
+          ? vnames.slice(1).reduce((e, nm) => `${it.reduce}(${e}, ${nm})`, vnames[0])
+          : vnames.join(' + ');
+        yield* engine.evalG(expr, vars, vars.t0);
+        totals.push(Float64Array.from(engine.live(vars.t0)));
+      }
+      engine.free(acc);
     }
 
-    // Keep groups that have rows.
+    // Keep groups that have rows, sorted by key.
     const counts = totals[0];
     const keep = [];
     for (let g = 0; g < K; g++) if (counts[g] > 0) keep.push(g);
-    const columns = { [key]: keep.map(label) };
+    if (!groups.sorted) {
+      const nk = keys.length;
+      keep.sort((a, b) => {
+        for (let k = 0; k < nk; k++) {
+          const x = groups.sortKey(a, k), y = groups.sortKey(b, k);
+          if (x === y) continue;
+          if (x !== x) { if (y !== y) continue; return 1; }
+          if (y !== y) return -1;
+          return x < y ? -1 : 1;
+        }
+        return 0;
+      });
+    }
+    const vals = keep.map((g) => groups.values(g));
+    const columns = {};
+    keys.forEach((key, k) => { columns[key] = vals.map((v) => v[k]); });
     items.forEach((it, i) => {
-      const vals = totals[i + 1];
-      columns[it.out] = it.fn === 'mean' ? keep.map((g) => vals[g] / counts[g]) : keep.map((g) => vals[g]);
+      const v = totals[i + 1];
+      columns[it.out] = it.fn === 'mean' ? keep.map((g) => v[g] / counts[g]) : keep.map((g) => v[g]);
     });
-    engine.free(acc);
+    if (!keep.length) for (const key of keys) if (this.cols.get(key).dict) columns[key] = []; // (no rows)
     return Table.fromColumns(engine, columns, { type: Float64Array });
+  }
+
+  // Many groups (more than per-thread accumulators allow): evaluate each
+  // aggregation's argument as a column (on all threads), then add up per
+  // group on this thread. `groups` has no filter here (rows were collected).
+  *#scatterG(groupData, K, kernelItems, sources, merged) {
+    const { engine } = this;
+    const ids = Float64Array.from(engine.live(groupData).subarray(0, this.n));
+    const totals = [];
+    for (const [j, it] of kernelItems.entries()) {
+      const out = new Float64Array(K).fill(IDENTITY[it.reduce]);
+      const ast = parse(sources[j]);
+      const arg = ast.args[0];
+      let vals = null;
+      if (!(arg.t === 'num' && arg.v === 1 && it.reduce === 'count')) {
+        const src = it.reduce === 'count' ? `(${toSource(arg)}) ${isMask(arg) ? '' : '!= 0'} ? 1 : 0` : toSource(arg);
+        const col = engine.alloc(this.type, this.n);
+        yield* engine.evalG(src, this.#vars(merged), col);
+        vals = Float64Array.from(engine.live(col));
+        engine.free(col);
+      }
+      const n = this.n;
+      if (!vals) for (let i = 0; i < n; i++) out[ids[i]]++;
+      else if (it.reduce === 'min') for (let i = 0; i < n; i++) out[ids[i]] = Math.min(out[ids[i]], vals[i]);
+      else if (it.reduce === 'max') for (let i = 0; i < n; i++) out[ids[i]] = Math.max(out[ids[i]], vals[i]);
+      else for (let i = 0; i < n; i++) out[ids[i]] += vals[i];
+      totals.push(out);
+    }
+    return totals;
   }
 
   // Materialize the filter: a new table holding only the matching rows.

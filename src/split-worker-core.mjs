@@ -109,16 +109,19 @@ export function serveSplitWorker(post, listen) {
     agg({ id, preds, spec, params }) {
       return view(id, preds).agg(spec, params);
     },
-    // Partial group results, as columns: keys (labels for text keys) + one array per aggregate.
-    groupBy({ id, preds, key, spec, params }) {
-      const g = view(id, preds).groupBy(key).agg(spec, params);
+    // Partial group results, as columns: one per key (labels for text keys)
+    // + one array per aggregate.
+    groupBy({ id, preds, keys, spec, params }) {
+      const g = view(id, preds).groupBy(keys).agg(spec, params);
       try {
-        const k = g.cols.get(key);
-        const codes = engine.live(k.data);
-        const keys = k.dict ? Array.from(codes, (c) => k.dict[c]) : Float64Array.from(codes);
+        const keyCols = keys.map((key) => {
+          const k = g.cols.get(key);
+          const codes = engine.live(k.data);
+          return k.dict ? Array.from(codes, (c) => k.dict[c]) : Float64Array.from(codes);
+        });
         const cols = {};
         for (const out of Object.keys(spec)) cols[out] = Float64Array.from(engine.live(g.cols.get(out).data));
-        return { keys, cols };
+        return { keyCols, cols };
       } finally {
         g.dispose();
       }
@@ -186,6 +189,7 @@ function transferList(value) {
   const out = [];
   if (value && typeof value === 'object') {
     if (ArrayBuffer.isView(value.keys)) out.push(value.keys.buffer);
+    if (value.keyCols) for (const k of value.keyCols) if (ArrayBuffer.isView(k)) out.push(k.buffer);
     if (value.cols) for (const c of Object.values(value.cols)) out.push(c.buffer);
     if (ArrayBuffer.isView(value.segs)) out.push(value.segs.buffer);
     if (value.columns) for (const c of Object.values(value.columns)) if (ArrayBuffer.isView(c) || ArrayBuffer.isView(c.codes)) out.push((c.codes ?? c).buffer);
