@@ -134,6 +134,20 @@ const i64c = (v) => { // signed LEB128 of a BigInt
 const f64c = (v) => [0x44, ...new Uint8Array(Float64Array.of(v).buffer)];
 const CANON_NAN = 0x7ff8000000000000n, MIX = -0x61c8864680b583ebn; // 0x9E3779B97F4A7C15 as signed
 
+// Key bits of the current row (params 0..nk-1 point at it) and its first
+// slot. Shared by the numbering and lookup kernels, so both hash alike.
+function keyHash(f, t, nk, bits, v, h, mk, slot) {
+  const ty = TY[t];
+  f.emit(i64c(MIX), set(h));
+  for (let k = 0; k < nk; k++) {
+    f.emit(get(k), ty.load, t === 'f32' ? [0xbb] : [], f64c(0), op(0xa0), set(v)); // v = key + 0 (-0 -> 0)
+    f.emit(get(v), op(0xbd), i64c(CANON_NAN), get(v), get(v), op(0x61), op(0x1b), set(bits[k])); // NaN -> one NaN
+    f.emit(get(h), get(bits[k]), op(0x85), i64c(MIX), op(0x7e), set(h));
+  }
+  f.emit(get(h), get(h), i64c(32n), op(0x88), op(0x85), i64c(MIX), op(0x7e), set(h));
+  f.emit(get(h), get(h), i64c(29n), op(0x88), op(0x85), op(0xa7), get(mk), i32and, set(slot));
+}
+
 export function generateHashGroups(t, nk, shared = true) {
   const ty = TY[t];
   const ids = nk, n = nk + 1, S = nk + 2; // S..S+4: slotsBase, mask, keysBase, limit, counter (f64)
@@ -148,15 +162,7 @@ export function generateHashGroups(t, nk, shared = true) {
   f.emit(get(n), i32c(ty.bytes), i32mul, get(ids), i32add, set(stop));
   f.emit(i32c(0), set(next), i32c(0), set(last), i32c(1), set(batch)); // no numbers reserved yet
   f.emit(block, loop, get(ids), get(stop), i32geu, brIf(1));
-  // key bits and hash
-  f.emit(i64c(MIX), set(h));
-  for (let k = 0; k < nk; k++) {
-    f.emit(get(k), ty.load, t === 'f32' ? [0xbb] : [], f64c(0), op(0xa0), set(v)); // v = key + 0 (-0 -> 0)
-    f.emit(get(v), op(0xbd), i64c(CANON_NAN), get(v), get(v), op(0x61), op(0x1b), set(bits[k])); // NaN -> one NaN
-    f.emit(get(h), get(bits[k]), op(0x85), i64c(MIX), op(0x7e), set(h));
-  }
-  f.emit(get(h), get(h), i64c(32n), op(0x88), op(0x85), i64c(MIX), op(0x7e), set(h));
-  f.emit(get(h), get(h), i64c(29n), op(0x88), op(0x85), op(0xa7), get(mk), i32and, set(slot));
+  keyHash(f, t, nk, bits, v, h, mk, slot);
   // probe
   f.emit(block, loop);
   f.emit(get(slot), i32c(2), op(0x74), get(sb), i32add, set(addr));
@@ -191,4 +197,37 @@ function uleb(n) {
   const out = [];
   do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n);
   return out;
+}
+
+// Lookup in a table filled by generateHashGroups (no inserts): out[i] = the
+// group number of row i's key, or -1 if no row of the build side has it. A
+// key with a NaN part never matches (as NULL in SQL).
+// Signature: (key ptrs..., out ptr (int32), n, slotsBase, mask, keysBase).
+export function generateHashProbe(t, nk, shared = true) {
+  const ty = TY[t];
+  const out = nk, n = nk + 1, [sb, mk, kb] = [nk + 2, nk + 3, nk + 4];
+  const f = new Fn('k', [...Array(nk).fill(I32), I32, I32, I32, I32, I32], []);
+  const stop = f.local(I32), slot = f.local(I32), s = f.local(I32), g = f.local(I32), kaddr = f.local(I32);
+  const v = f.local(F64), h = f.local(I64);
+  const bits = Array.from({ length: nk }, () => f.local(I64));
+  f.emit(get(n), i32c(4), i32mul, get(out), i32add, set(stop));
+  f.emit(block, loop, get(out), get(stop), i32geu, brIf(1));
+  keyHash(f, t, nk, bits, v, h, mk, slot);
+  f.emit(i32c(-1), set(g));
+  f.emit(block); // -> found or not
+  for (let k = 0; k < nk; k++) f.emit(get(bits[k]), i64c(CANON_NAN), op(0x51), brIf(0)); // NaN: no match
+  f.emit(loop);
+  f.emit(get(slot), i32c(2), op(0x74), get(sb), i32add, [0x28, 2, 0], set(s)); // i32.load
+  f.emit(get(s), i32c(-1), op(0x46), brIf(1)); // empty slot: not there
+  f.emit(get(s), i32c(nk * 8), i32mul, get(kb), i32add, set(kaddr));
+  f.emit(block);
+  for (let k = 0; k < nk; k++) f.emit(get(kaddr), [0x29, 3, ...uleb(k * 8)], get(bits[k]), op(0x52), brIf(0));
+  f.emit(get(s), set(g), br(2)); // same key
+  f.emit(end);
+  f.emit(get(slot), i32c(1), i32add, get(mk), i32and, set(slot), br(0));
+  f.emit(end, end);
+  f.emit(get(out), get(g), [0x36, 2, 0]); // i32.store
+  for (let k = 0; k < nk; k++) f.emit(get(k), i32c(ty.bytes), i32add, set(k));
+  f.emit(get(out), i32c(4), i32add, set(out), br(0), end, end);
+  return buildModule([f], shared);
 }

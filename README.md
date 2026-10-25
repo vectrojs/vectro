@@ -47,6 +47,22 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
 
   With millions of groups, about half of Vectro's time is sorting the groups
   by key (DuckDB returns them unsorted) on one thread.
+- **Joins:** `orders.join(customers, { on: 'customer_id' })`, several keys
+  (`on: ['region', 'day']`), different names (`on: { left: 'cust', right: 'id' }`),
+  `how: 'inner'` (default) or `'left'`. Put the smaller table on the right: its
+  keys go into one hash table built on every thread, then every left row looks
+  its key up on every thread, and the joined columns are gathered on every
+  thread. Text keys match by label; a missing (NaN) key never matches; a left
+  join fills unmatched right columns with NaN or `''`. Rows come in left-table
+  order. On 10M orders vs DuckDB (`compare/bench-join.mjs`, joined table built
+  in full, answers checked):
+
+  | Join | Vectro | DuckDB |
+  |---|---|---|
+  | × 100K customers | 118 ms | 195 ms |
+  | × 1M accounts | 231 ms | 254 ms |
+  | left join, half the keys match | 170 ms | 194 ms |
+  | two keys: region + day (2,920 rows) | 85 ms | 183 ms |
 - **Text functions** on category columns: `startsWith(col, 'x')`,
   `endsWith`, `contains`, `in(col, 'a', 'b')` and `like(col, 'EU-%')`. They run
   once per distinct label (not per row) and become a few range checks on the
@@ -356,8 +372,9 @@ answers.
 
 ## Not done yet
 
-Joins, integer/date types, missing values and persistence. Split tables have
-`topAsync` but no full sort.
+Integer/date types, missing values and persistence. Joins are for normal
+tables (not split tables or streams yet), inner and left only. Split tables
+have `topAsync` but no full sort.
 Binary streams have number and category columns only; Arrow ZSTD compression isn't supported.
 Streams take flat records only (no nested JSON fields), and windows group by
 at most one category column. Memory is capped at 4 GB per engine and freed with `dispose()`.

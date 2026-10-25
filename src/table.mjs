@@ -12,6 +12,7 @@ import { generateGroupBy, generateCompact, generateHashGroups } from './table-ke
 import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
 import { sortPermG, gatherG } from './parallel-sort.mjs';
+import { joinTablesG } from './join.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
 
@@ -837,6 +838,26 @@ export class Table {
     }
     if (t !== this) t.dispose();
     return rows;
+  }
+
+  // Hash join: orders.join(customers, { on: 'customer_id', how: 'inner' | 'left' }).
+  // on: a column both tables have, several (['region', 'day']), or
+  // { left: 'cust', right: 'id' }. Put the smaller table on the right (it is
+  // the one hashed). Rows come in left-table order, each with its matches in
+  // right-table order; right columns named like a left column get `suffix`
+  // (default '_right'). See join.mjs.
+  join(other, opts) { return this.engine._drive(this.#joinG(other, opts)); }
+  joinAsync(other, opts) { return this.engine._driveAsync(this.#joinG(other, opts)); }
+
+  *#joinG(other, opts) {
+    if (!(other instanceof Table)) throw new TypeError('vectro: join needs another table of the same engine');
+    const l = yield* this.#collectG(), r = yield* other.#collectG();
+    try {
+      return yield* joinTablesG(l, r, opts, (cols, n) => new Table(this.engine, cols, n, { owned: [...cols.keys()] }));
+    } finally {
+      if (l !== this) l.dispose();
+      if (r !== other) r.dispose();
+    }
   }
 
   // Free the columns this table allocated (shared columns stay alive).
