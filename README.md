@@ -41,9 +41,9 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   | Keys | Vectro | DuckDB |
   |---|---|---|
   | region + day (2,920 pairs) | 8 ms | 34 ms |
-  | price (100K amounts) | 35 ms | 41 ms |
-  | account (1M big IDs) | 190 ms | 63 ms |
-  | account + region (5.7M pairs) | 639 ms | 116 ms |
+  | price (100K amounts) | 38 ms | 41 ms |
+  | account (1M big IDs) | 153 ms | 65 ms |
+  | account + region (5.7M pairs) | 647 ms | 119 ms |
 
   With millions of groups, about half of Vectro's time is sorting the groups
   by key (DuckDB returns them unsorted) on one thread.

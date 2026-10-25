@@ -122,7 +122,7 @@ for (const [label, make] of engines) {
     ['300K keys, table starts tiny', ['many'], (i) => String(many[i]), (r) => String(r.many), 16],
     ['two keys', ['other', 'many'], (i) => `${other[i]}|${many[i]}`, (r) => `${r.other}|${r.many}`],
   ];
-  for (const [label, make] of [['threads', () => new Engine()], ['threads, float32', () => new Engine()], ['single thread', () => new Engine({ threads: 1 })]]) {
+  for (const [label, make] of [['threads', () => new Engine()], ['threads, float32', () => new Engine()], ['single thread', () => new Engine({ threads: 1 })], ['2 threads', () => new Engine({ threads: 2 })], ['4 threads', () => new Engine({ threads: 4 })]]) {
     const e = make();
     const f32 = label.includes('float32');
     const t = e.table({ few, many: f32 ? many.map((x) => (x - 1e12) * 2) : many, other, val }, f32 ? { type: Float32Array } : {});

@@ -164,7 +164,7 @@ export function generateHashGroups(t, nk, shared = true) {
   f.emit(get(s), i32c(-1), op(0x46), IF); // empty: try to claim it
   f.emit(get(addr), i32c(-1), i32c(-2), ATOMIC.cmpxchg, i32c(-1), op(0x46), IF);
   f.emit(get(next), get(last), op(0x46), IF, get(ctr), get(batch), ATOMIC.add, set(next), get(next), get(batch), i32add, set(last)); // reserve more
-  f.emit(get(batch), i32c(1), op(0x74), set(batch), get(batch), i32c(64), get(batch), i32c(64), op(0x4b), op(0x1b), set(batch), end); // batch = min(2 * batch, 64)
+  f.emit(get(batch), i32c(1), op(0x74), set(batch), i32c(64), get(batch), get(batch), i32c(64), op(0x4b), op(0x1b), set(batch), end); // batch = min(2 * batch, 64): select(64, batch, batch > 64)
   f.emit(get(next), set(g), get(next), i32c(1), i32add, set(next));
   f.emit(get(g), get(lim), i32geu, IF, get(addr), i32c(-3), ATOMIC.store, f64c(1), RETURN, end);
   f.emit(get(g), i32c(nk * 8), i32mul, get(kb), i32add, set(kaddr));

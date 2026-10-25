@@ -10,6 +10,7 @@ import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
 import { parse, toSource, walk, analyze, isMask } from './fuse.mjs';
 import { generateGroupBy, generateCompact, generateHashGroups } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
+import { maxUnits } from './kernels.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
 
@@ -373,7 +374,7 @@ export class Table {
     engine._tableKernels ??= new Map();
     let v = engine._tableKernels.get(cacheKey);
     if (!v) { v = engine._register(generateHashGroups(t, nk, engine.isShared)); engine._tableKernels.set(cacheKey, v); }
-    const slack = 64 * 16 * Math.max(1, engine.T); // group numbers reserved but unused: < 64 per unit
+    const slack = 64 * maxUnits(Math.max(1, engine.T)); // group numbers reserved but unused: < 64 per unit
     for (;;) {
       const room = limit + slack;
       let cap = 1024;
