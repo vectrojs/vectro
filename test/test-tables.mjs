@@ -134,6 +134,14 @@ for (const type of [Float64Array, Float32Array]) {
   expectThrow('param clashes with column', () => t.filter('price > region', { region: 1 }));
 }
 
+// a column made from a constant (folded to one value) gets it on every row
+{
+  const t = e.table({ x: [1, 2, 3, 4, 5] });
+  const d = t.derive('one', '1 + 1').derive('p', 'k * 2', { k: 3 });
+  expect('constant column', d.sum('one'), 10);
+  expect('constant from a param', d.sum('p'), 30);
+}
+
 await e.close();
 console.log(failures ? `${failures} failures out of ${checks} checks` : `[${MODE}] all ${checks} table checks passed`);
 process.exit(failures ? 1 : 0);

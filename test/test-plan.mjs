@@ -109,5 +109,16 @@ for (const [label, make] of [['threads', () => new Engine()], ['single thread', 
   checks++; if (orders.count() !== 5000 || customers.count() !== 50) fail('source tables damaged');
   await e.close();
 }
+// text with newlines, tabs, backslashes or double quotes survives the plan
+{
+  const e = new Engine();
+  const labels = ['two\nlines', 'tab\there', 'back\\slash', 'say "hi"', "it's"];
+  const t = e.table({ k: Array.from({ length: 50 }, (_, i) => labels[i % 5]), v: Array.from({ length: 50 }, (_, i) => i) });
+  for (const l of labels) {
+    const lit = l.includes("'") ? `"${l}"` : `'${l}'`;
+    checks++; if (t.lazy().filter(`k == ${lit}`).count() !== 10 || t.lazy().filter(`k != ${lit}`).derive('w', 'v * 2').agg({ s: 'sum(w)' }).s !== t.filter(`k != ${lit}`).sum('v * 2')) fail(`text ${JSON.stringify(l)} in a lazy filter`);
+  }
+  await e.close();
+}
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} lazy-query checks passed`);
 process.exit(failures ? 1 : 0);

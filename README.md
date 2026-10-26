@@ -169,6 +169,54 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
   comparisons, `&& || !`, `? :`, `abs sqrt floor ceil min max`. There is no
   `eval`, so formulas typed by users or AI models are safe to run.
 
+## Tables bigger than memory (datasets)
+
+A dataset is a table kept on disk, in one file, read a chunk at a time. Its
+size has no limit from memory (an engine holds at most 4 GB), and it opens
+instantly. Node only.
+
+```js
+engine.csvToDataset('orders.csv', 'orders.vectro');     // a CSV of any size, read in pieces
+const w = engine.createDataset('events.vectro');         // or append tables (or { column: values })
+w.append(todaysEvents); w.close();
+engine.writeDataset('eu.vectro', orders.filter("region == 'EU'")); // a table, or a query
+
+const orders = engine.openDataset('orders.vectro');
+orders.filter("ts >= '2024-06-01'").groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
+await orders.lazy().join(customers, { on: 'cust' }).top(10, '-price').toRowsAsync();
+sql('SELECT region, COUNT(DISTINCT cust) FROM orders GROUP BY region', { orders }).toRows();
+```
+
+- **The file:** chunks of 4M rows. Each column of each chunk is stored
+  compressed exactly as it sits in memory (see compressed columns), so a chunk
+  loads with one read per column and no parsing; columns that count up at a
+  fixed step (row numbers, times every second) take no space at all. The
+  footer holds the schema, one dictionary per text column and the min / max
+  of every column for each chunk and each 64K-row block.
+- **Queries** are the usual lazy plans, run chunk by chunk with the same
+  kernels on every core: only the columns a query uses are read, and chunks
+  and blocks the filters rule out are not read at all. Totals add up across
+  chunks (a mean is a sum and a count), groups merge by key, `top(k)` keeps
+  the best k so far and passes the k-th value to later chunks as a filter,
+  `limit` stops reading once it has its rows. With the `…Async` calls the
+  next chunk is read while the current one is computed.
+- **Many groups:** keys that are labels or whole-number IDs add straight into
+  one array per aggregation (each thread its own range of groups); exact
+  distinct counts of IDs use one bitmap. Other keys keep partial groups in
+  memory and, past 8M groups, **spill** them to disk split by key range; each
+  range is merged on its own (split again if still too big), in key order.
+- **Joins:** the other table (or a dataset's matching rows) is the build
+  side, hashed once for all chunks.
+- **Results** come back as normal tables. `writeDataset(path, query)` writes
+  a query's result as a new dataset chunk by chunk, so it needn't fit in
+  memory either; a full `sort` written this way is an external sort (by
+  ranges of the first key).
+- **Also:** `append: true` adds to an existing dataset; `ds.lastRun` tells
+  how many chunks and bytes a query read; `explain()` shows the plan; the MCP
+  server opens `.vectro` files.
+
+DATASET_NUMBERS
+
 ## For AI assistants (MCP server)
 
 `mcp/server.mjs` lets Claude, ChatGPT or any MCP client analyze your data
@@ -452,9 +500,11 @@ answers.
 
 ## Not done yet
 
-64-bit integers beyond 2^53, time zones other than UTC, and persistence. Joins are for normal
+64-bit integers beyond 2^53 and time zones other than UTC. Datasets are
+Node-only and written by one writer at a time; a join's right side must fit
+in memory, and `approxDistinct` on a dataset counts exactly. Joins are for normal
 tables (not split tables or streams yet), inner and left only. Split tables
 have `topAsync` but no full sort.
 Binary streams have number and category columns only; Arrow ZSTD compression isn't supported.
 Streams take flat records only (no nested JSON fields), and windows group by
-at most one category column. Memory is capped at 4 GB per engine and freed with `dispose()`.
+at most one category column. Memory is capped at 4 GB per engine (datasets go past it) and freed with `dispose()`.

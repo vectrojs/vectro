@@ -29,7 +29,7 @@ const log = (...a) => process.stderr.write(`[vectro-mcp] ${a.join(' ')}\n`);
 const TOOLS = [
   {
     name: 'load_file',
-    description: 'Load a CSV, TSV or JSON-lines file (one flat JSON object per line) from the data folder into a named table. Returns its columns, their kinds and a few sample rows. Text columns become categories (filterable, groupable).',
+    description: 'Load a CSV, TSV or JSON-lines file (one flat JSON object per line) from the data folder into a named table, or open a Vectro dataset (.vectro: a table on disk, any size; queries read it in chunks). Returns its columns, their kinds and a few sample rows. Text columns become categories (filterable, groupable).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -118,7 +118,7 @@ class ToolError extends Error {}
 function release(name) {
   const entry = tables.get(name);
   if (!entry) return;
-  for (const t of entry.chain.reverse()) t.dispose();
+  for (const t of entry.chain.reverse()) { if (t.isDataset) t.close(); else t.dispose(); }
   entry.index?.dispose();
   tables.delete(name);
 }
@@ -205,8 +205,14 @@ const handlers = {
     const real = safePath(path);
     const ext = extname(real).toLowerCase();
     const tname = name || basename(real, extname(real)).replace(/[^A-Za-z0-9_]/g, '_');
-    const bytes = new Uint8Array(readFileSync(real));
+    const bytes = ext === '.vectro' ? null : new Uint8Array(readFileSync(real));
     let table, skipped = 0, index = null, embedding = null;
+    if (ext === '.vectro') { // a dataset on disk: opened, not loaded
+      table = engine.openDataset(real);
+      release(tname);
+      tables.set(tname, { table, source: path, chain: [table], index: null });
+      return { table: tname, rows: table.length, on_disk: true, columns: columnsOf(table), sample: clean(table.toRows(5)) };
+    }
     if (ext === '.jsonl' || ext === '.ndjson') ({ table, skipped, index = null, embedding = null } = await loadJSONLines(bytes, types));
     else table = engine.parseCSV(bytes, { types: types ?? {}, delimiter: ext === '.tsv' ? '\t' : ',' });
     release(tname);
@@ -222,7 +228,8 @@ const handlers = {
     for (const [col, c] of table.cols) {
       if (c.strings) { out[col] = { kind: 'text' }; continue; }
       if (c.dict) {
-        const g = table.groupBy(col).agg({ rows: 'count()' });
+        const grouped = table.groupBy(col).agg({ rows: 'count()' });
+        const g = table.isDataset ? grouped.collect() : grouped;
         const top = clean(g.top(10, ['-rows', col]).toRows());
         out[col] = { kind: 'category', distinct: g.length, most_common: top };
         g.dispose();
@@ -241,11 +248,13 @@ const handlers = {
   query({ table: name, filter, group_by: groupBy, aggregates, sort, limit = DEFAULT_ROWS }) {
     const entry = getTable(name);
     const lim = Math.max(1, Math.min(MAX_ROWS, Math.floor(limit)));
-    const view = filter ? entry.table.filter(filter) : entry.table;
+    const ds = entry.table.isDataset; // (a dataset: a lazy query, read in chunks)
+    const view = ds ? (filter ? entry.table.filter(filter) : entry.table.lazy()) : filter ? entry.table.filter(filter) : entry.table;
     const hasAgg = aggregates && Object.keys(aggregates).length;
     if (groupBy) {
       if (!hasAgg) throw new ToolError('group_by needs aggregates, e.g. { "orders": "count()" }');
-      const g = view.groupBy(groupBy).agg(aggregates);
+      const grouped = view.groupBy(groupBy).agg(aggregates);
+      const g = ds ? grouped.collect() : grouped;
       try {
         const groups = g.length;
         const t = sort ? g.top(lim, sort) : null;
@@ -255,6 +264,7 @@ const handlers = {
       } finally { g.dispose(); }
     }
     if (hasAgg) return { rows: clean([view.agg(aggregates)]) };
+    if (ds) return (() => { const rows = clean((sort ? view.top(lim, sort) : view.limit(lim)).toRows()); return { matching_rows: filter ? view.count() : entry.table.length, returned: rows.length, rows }; })();
     const matching = filter ? view.count() : view.length;
     const t = sort ? view.top(lim, sort) : null;
     const rows = clean((t ?? view).toRows(lim));
@@ -278,6 +288,7 @@ const handlers = {
   },
   add_column({ table: name, name: col, expression }) {
     const entry = getTable(name);
+    if (entry.table.isDataset) throw new ToolError(`"${name}" is a dataset on disk; use the expression directly in query or sql instead of adding a column`);
     const derived = entry.table.derive(col, expression); // shares the old columns
     entry.table = derived;
     entry.chain.push(derived);

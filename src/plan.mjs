@@ -28,7 +28,7 @@
 import { parse, toSource, walk } from './fuse.mjs';
 import { DATE_RESULT } from './dates.mjs';
 
-const vars = (ast) => { const out = new Set(); walk(ast, (n) => { if (n.t === 'var') out.add(n.name); }); return out; };
+export const vars = (ast) => { const out = new Set(); walk(ast, (n) => { if (n.t === 'var') out.add(n.name); }); return out; };
 const and = (a, b) => (a ? { t: 'bin', op: '&&', l: a, r: b } : b);
 function conjuncts(ast) { return ast.t === 'bin' && ast.op === '&&' ? [...conjuncts(ast.l), ...conjuncts(ast.r)] : [ast]; }
 
@@ -94,8 +94,8 @@ export class Query {
   // ---- running --------------------------------------------------------------------
   collect() { return runSync(this.#final()); }
   collectAsync() { return runAsync(this.#final()); }
-  toRows(limit = Infinity) { const t = this.collect(); try { return t.toRows(limit); } finally { t.dispose(); } }
-  async toRowsAsync(limit = Infinity) { const t = await this.collectAsync(); try { return await t.toRowsAsync(limit); } finally { t.dispose(); } }
+  toRows(limit = Infinity) { const t = this.#limited(limit).collect(); try { return t.toRows(limit); } finally { t.dispose(); } }
+  async toRowsAsync(limit = Infinity) { const t = await this.#limited(limit).collectAsync(); try { return await t.toRowsAsync(limit); } finally { t.dispose(); } }
   agg(spec, params = {}) { return runSync(this.#aggNode(spec, params)); }
   aggAsync(spec, params = {}) { return runAsync(this.#aggNode(spec, params)); }
   count() { return this.agg({ n: 'count()' }).n; }
@@ -105,6 +105,8 @@ export class Query {
   explain() { return describe(optimize(this.#final().node)); }
 
   #final() { return new Query({ op: 'output', input: this.node }); }
+  // (on a dataset, only the rows asked for are read)
+  #limited(limit) { return Number.isFinite(limit) && findDataset(this.node) ? this.limit(limit) : this; }
   #aggNode(spec, params) {
     return new Query({ op: 'total', input: this.node, spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) });
   }
@@ -113,7 +115,7 @@ export class Query {
 // ---- optimizing: move filters down --------------------------------------------------
 
 // Column names a node produces (null: unknown, e.g. a table we haven't seen).
-function namesOf(node) {
+export function namesOf(node) {
   switch (node.op) {
     case 'scan': return node.table.columnNames;
     case 'filter': case 'sort': case 'limit': case 'output': return namesOf(node.input);
@@ -126,7 +128,7 @@ function namesOf(node) {
 }
 
 // Output names of a join, and where each comes from.
-function joinNames(node) {
+export function joinNames(node) {
   const left = namesOf(node.left), right = namesOf(node.right);
   const { on, suffix = '_right' } = node.opts;
   const [lk, rk] = typeof on === 'string' || Array.isArray(on) ? [[on].flat(), [on].flat()] : [[on?.left].flat(), [on?.right].flat()];
@@ -266,6 +268,12 @@ function* execG(node, needed, temps) {
       const out = yield { table: t.select(...s.visible), method: 'collect', args: [] };
       return out.columnNames.length === s.visible.length ? out : out.select(...s.visible); // (a filter's columns came along: drop them)
     }
+    case 'groupInto': { // (datasets) add one chunk's matching rows into running group totals
+      const asts = [node.group, ...node.sources];
+      const s = yield* execG(node.input, new Set(asts.flatMap((a) => [...vars(a)])), temps);
+      const src = (a) => toSource(inline(a, s.derived));
+      return yield { table: s.table, method: '_groupInto', args: [src(node.group), node.K, node.sources.map(src), node.state] };
+    }
     case 'total': {
       const asts = Object.values(node.spec);
       const s = yield* execG(node.input, new Set(asts.flatMap((a) => [...vars(a)])), temps);
@@ -335,9 +343,31 @@ function call(req, sync) {
 // at the end unless the result uses their columns.
 const record = (temps, req, out) => { if (out && out !== req.table && out.cols && !temps.includes(out)) temps.push(out); return out; };
 
+// A dataset (tables on disk, see dataset.mjs) in the plan: it runs the plan
+// chunk by chunk.
+export function findDataset(node) {
+  if (node.op === 'scan') return node.table.isDataset ? node.table : null;
+  return node.op === 'join' ? findDataset(node.left) ?? findDataset(node.right) : findDataset(node.input);
+}
+
 function runSync(q) {
+  const plan = optimize(q.node);
+  const ds = findDataset(plan);
+  return ds ? ds.runPlan(plan, true) : execute(plan, true);
+}
+
+function runAsync(q) {
+  const plan = optimize(q.node);
+  const ds = findDataset(plan);
+  return ds ? ds.runPlan(plan, false) : execute(plan, false);
+}
+
+// Run an optimized plan over tables in memory (sync: the result; else a promise).
+export function execute(plan, sync) { return sync ? executeSync(plan) : executeAsync(plan); }
+
+function executeSync(plan) {
   const temps = [];
-  const g = execG(optimize(q.node), null, temps);
+  const g = execG(plan, null, temps);
   let result;
   try {
     let step = g.next();
@@ -347,9 +377,9 @@ function runSync(q) {
   } finally { release(result, temps); }
 }
 
-async function runAsync(q) {
+async function executeAsync(plan) {
   const temps = [];
-  const g = execG(optimize(q.node), null, temps);
+  const g = execG(plan, null, temps);
   let result;
   try {
     let step = g.next();
@@ -363,7 +393,7 @@ async function runAsync(q) {
 function describe(node, depth = 0) {
   const pad = '  '.repeat(depth);
   switch (node.op) {
-    case 'scan': return `${pad}scan [${node.table.columnNames.join(', ')}]`;
+    case 'scan': return node.table.isDataset ? `${pad}scan dataset ${node.table.path} (${node.table.chunkCount} chunks, read one at a time; chunks the filters rule out are skipped) [${node.table.columnNames.join(', ')}]` : `${pad}scan [${node.table.columnNames.join(', ')}]`;
     case 'filter': return `${describe(node.input, depth)}\n${pad}filter ${toSource(node.ast)}`;
     case 'derive': return `${describe(node.input, depth)}\n${pad}derive ${node.name} = ${toSource(node.ast)} (inlined where used)`;
     case 'select': return `${describe(node.input, depth)}\n${pad}select ${node.names.join(', ')}`;

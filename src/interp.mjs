@@ -229,6 +229,11 @@ export function interpretMap(engine, t, ast, cols, params, out, n) {
   const p = new Program(t);
   let reg = p.emit(ast, isColumnOf(cols));
   if (reg.k !== 'tmp') reg = p.emit({ t: 'bin', op: '*', l: ast, r: { t: 'num', v: 1 } }, isColumnOf(cols)); // a copy: x * 1 keeps -0 and NaN
+  if (reg.k === 'const') { // a constant (folded): every row gets it
+    const c = p.consts[reg.i];
+    engine.live(out).fill('param' in c ? params[c.param] : c.value, 0, n);
+    return out;
+  }
   const run = new Runner(engine, p, cols, params, n);
   const outRef = { k: 'out', ptr: engine.live(out).byteOffset };
   try {

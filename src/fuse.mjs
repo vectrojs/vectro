@@ -96,11 +96,18 @@ const isReduction = (n) => n.t === 'call' && REDUCTIONS.has(n.fn) && n.args.leng
 // Masks are true/false values (comparisons and logic); everything else is a number.
 export const isMask = (n) => (n.t === 'bin' && (CMP[n.op] || n.op === '&&' || n.op === '||')) || (n.t === 'un' && n.op === '!');
 
+// Text as the tokenizer reads it back exactly (no escapes inside quotes).
+export function quoteText(v) {
+  if (!v.includes("'")) return `'${v}'`;
+  if (!v.includes('"')) return `"${v}"`;
+  throw new SyntaxError(`vectro: text with both ' and " can't be used in an expression: ${JSON.stringify(v)}`);
+}
+
 // Turn an AST back into source (fully parenthesized), e.g. after rewriting it.
 export function toSource(n) {
   switch (n.t) {
     case 'num': return Number.isNaN(n.v) ? 'NaN' : n.v === Infinity ? 'Infinity' : n.v === -Infinity ? '(-Infinity)' : n.v < 0 ? `(${n.v})` : String(n.v);
-    case 'str': return JSON.stringify(n.v);
+    case 'str': return quoteText(n.v);
     case 'var': return n.name;
     case 'un': return `${n.op}(${toSource(n.x)})`;
     case 'bin': return `(${toSource(n.l)} ${n.op} ${toSource(n.r)})`;

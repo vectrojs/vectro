@@ -6,6 +6,7 @@ import { openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { Engine as CoreEngine } from './engine.mjs';
 import { loadBytes, loadBytesAsync } from './csv.mjs';
+import { Dataset, DatasetWriter, writeDataset, csvToDataset } from './dataset.mjs';
 
 export const nodePlatform = {
   cpus: () => availableParallelism(),
@@ -61,9 +62,20 @@ export class Engine extends CoreEngine {
       await file.close();
     }
   }
+
+  // ---- datasets: tables bigger than memory, on disk (see dataset.mjs) ----------
+  // Open one for queries (filter, groupBy, join, sql... read it chunk by chunk).
+  openDataset(path) { return new Dataset(this, path); }
+  // A writer: append(table or columns) as often as needed, then close().
+  createDataset(path, opts) { return new DatasetWriter(this, path, opts); }
+  // A table, a query (over a dataset: written chunk by chunk) or columns.
+  writeDataset(path, source, opts) { return writeDataset(this, path, source, opts); }
+  // A CSV file of any size, read in pieces.
+  csvToDataset(csvPath, path, opts) { return csvToDataset(this, csvPath, path, opts); }
 }
 
 export { canCompileWasm } from './engine.mjs';
+export { Dataset, DatasetWriter } from './dataset.mjs';
 export { Table } from './table.mjs';
 
 // ---- split tables and streams: each worker thread owns its rows --------------

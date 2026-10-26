@@ -16,6 +16,7 @@
 // Text values can be compared, matched and grouped, not computed.
 
 import { Query } from './plan.mjs';
+import { quoteText } from './fuse.mjs';
 
 const KEYWORDS = new Set(['SELECT', 'DISTINCT', 'FROM', 'AS', 'JOIN', 'INNER', 'LEFT', 'OUTER', 'ON', 'USING', 'WHERE', 'GROUP', 'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'AND', 'OR', 'NOT', 'BETWEEN', 'IN', 'LIKE', 'IS', 'NULL', 'TRUE', 'FALSE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'NULLS', 'FIRST', 'LAST', 'CAST', 'DATE', 'TIMESTAMP', 'INTERVAL', 'EXTRACT', 'ALL']);
 
@@ -560,7 +561,7 @@ export function sql(text, tables = {}) {
 function toSourceAst(n) {
   switch (n.t) {
     case 'num': return Number.isNaN(n.v) ? 'NaN' : n.v === Infinity ? 'Infinity' : n.v === -Infinity ? '(-Infinity)' : n.v < 0 ? `(${n.v})` : String(n.v);
-    case 'str': return JSON.stringify(n.v);
+    case 'str': return quoteText(n.v);
     case 'var': return n.name;
     case 'un': return `${n.op}(${toSourceAst(n.x)})`;
     case 'bin': return `(${toSourceAst(n.l)} ${n.op} ${toSourceAst(n.r)})`;

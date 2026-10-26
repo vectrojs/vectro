@@ -17,6 +17,13 @@ const rows = Array.from({ length: 5000 }, (_, i) => ({ id: i, price: (i * 37) % 
 writeFileSync(join(dir, 'data', 'orders.csv'), 'id,price,qty,region\n' + rows.map((r) => `${r.id},${r.price},${r.qty},${r.region}`).join('\n') + '\n');
 writeFileSync(join(dir, 'data', 'events.jsonl'), rows.map((r) => JSON.stringify({ ...r, extra: { nested: true } })).join('\n') + '\nnot json\n');
 writeFileSync(join(dir, 'secret.csv'), 'a\n1\n');
+// the same orders as a dataset on disk (small chunks: several of them)
+{
+  const { Engine } = await import('../src/node.mjs');
+  const e = new Engine({ threads: 1 });
+  e.writeDataset(join(dir, 'data', 'big.vectro'), e.table({ id: rows.map((r) => r.id), price: rows.map((r) => r.price), qty: rows.map((r) => r.qty), region: rows.map((r) => r.region) }), { rowsPerChunk: 700 });
+  await e.close();
+}
 // documents with 8-number embeddings
 let seed = 3;
 const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff) - 0.5;
@@ -68,6 +75,23 @@ r = await call('query', { table: 'orders', aggregates: { total: 'sum(revenue)' }
 expect('use added column', !r.error && r.data.rows[0].total === sum(() => true), r.text);
 r = await call('describe_table', { table: 'orders' });
 expect('describe', !r.error && r.data.columns.region.distinct === 3 && r.data.columns.price.min === 0, r.text);
+
+// a dataset on disk answers like the loaded table
+r = await call('load_file', { path: 'big.vectro' });
+expect('open dataset', !r.error && r.data.rows === 5000 && r.data.on_disk && r.data.columns.region === 'category' && r.data.sample.length === 5, r.text);
+r = await call('query', { table: 'big', filter: "region == 'EU' && price > 500", aggregates: { revenue: 'sum(price * qty)', n: 'count()' } });
+expect('dataset aggregate', !r.error && r.data.rows[0].revenue === sum((x) => x.region === 'EU' && x.price > 500), r.text);
+r = await call('query', { table: 'big', group_by: 'region', aggregates: { revenue: 'sum(price * qty)' }, sort: '-revenue' });
+expect('dataset group + sort', !r.error && JSON.stringify(r.data.rows) === JSON.stringify(byRegion) && r.data.groups === 3, r.text);
+r = await call('query', { table: 'big', filter: 'qty == 5', sort: ['-price', 'id'], limit: 3 });
+expect('dataset rows sorted', !r.error && JSON.stringify(r.data.rows.map((x) => x.id)) === JSON.stringify(top3) && r.data.matching_rows === 1000, r.text);
+r = await call('sql', { query: 'SELECT region, SUM(price * qty) AS revenue FROM big GROUP BY region ORDER BY revenue DESC' });
+expect('dataset sql', !r.error && JSON.stringify(r.data.rows) === JSON.stringify(byRegion), r.text);
+r = await call('describe_table', { table: 'big' });
+expect('dataset describe', !r.error && r.data.columns.region.distinct === 3 && r.data.columns.price.min === 0, r.text);
+r = await call('add_column', { table: 'big', name: 'x', expression: 'price * 2' });
+expect('dataset add_column refused', r.error && r.text.includes('dataset on disk'), r.text);
+r = await call('drop_table', { table: 'big' });
 
 // mistakes come back as tool errors the model can read
 for (const [label, name, args, text] of [

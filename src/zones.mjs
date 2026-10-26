@@ -29,7 +29,7 @@ export function computeZones(data, n, B = ZONE_ROWS) {
 }
 
 // `column <op> value` conditions every matching row must meet.
-function conditions(pred, cols, params) {
+export function conditions(pred, cols, params) {
   const out = [];
   const value = (m) => {
     if (m.t === 'num') return m.v;
@@ -48,7 +48,7 @@ function conditions(pred, cols, params) {
   return out;
 }
 
-const mayMatch = (op, lo, hi, v) =>
+export const mayMatch = (op, lo, hi, v) =>
   op === '>' ? hi > v : op === '>=' ? hi >= v : op === '<' ? lo < v : op === '<=' ? lo <= v : lo <= v && v <= hi;
 
 // The rows [lo, hi) that can match `pred`, or null when zone maps can't

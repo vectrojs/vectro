@@ -288,7 +288,7 @@ export class Table {
     const merged = this.#mergeParams(params);
     const { src } = this.#bind(expr, merged);
     const pred = this.pred ? `(${this.pred}) && (${src})` : src;
-    return new Table(this.engine, this.cols, this.n, { pred, params: merged });
+    return new Table(this.engine, this.cols, this.n, { pred, params: merged, zones: this.zones });
   }
 
   // New column computed for every row, in one fused pass.
@@ -672,6 +672,50 @@ export class Table {
     return Table.fromColumns(engine, columns, { type: Float64Array, dates: keys.filter((k) => this.cols.get(k).date) });
   }
 
+  // (datasets, see dataset.mjs) Add the rows that match this table's filter
+  // into running per-group totals: state.acc holds J * K float64s for the J
+  // reductions in `sources` ('count(1)', 'sum(x)', 'min(x)'... at most 8,
+  // missing-value rules already applied), for K groups numbered 0..K-1 by
+  // the expression `group`. Each thread adds up its own range of groups;
+  // packed columns are read as they are.
+  _groupInto(group, K, sources, state) { return this.engine._drive(this.#groupIntoG(group, K, sources, state)); }
+  _groupIntoAsync(group, K, sources, state) { return this.engine._driveAsync(this.#groupIntoG(group, K, sources, state)); }
+
+  *#groupIntoG(group, K, sources, state) {
+    const { engine } = this;
+    const merged = this.params;
+    const bound = sources.map((src) => this.#bind(src, merged).src);
+    const analysis = analyze(bound);
+    if (analysis.items.length !== bound.length || bound.length > 8) throw new Error('vectro: internal: up to 8 different reductions per pass');
+    const J = bound.length;
+    if (!state.acc) {
+      state.acc = engine.alloc(Float64Array, J * K);
+      analysis.items.forEach((it, j) => engine.live(state.acc).fill(IDENTITY[it.reduce], j * K, (j + 1) * K));
+    }
+    if (!this.n) return;
+    const gData = engine.alloc(this.type, this.n);
+    try {
+      yield* engine.evalG(this.#bind(group, merged).src, this.#vars(merged), gData);
+      const predAst = this.pred ? parse(this.pred) : null;
+      const names = [...analysis.vars];
+      if (predAst) walk(predAst, (m) => { if (m.t === 'var' && !names.includes(m.name)) names.push(m.name); });
+      const arrayNames = names.filter((nm) => this.cols.has(nm)), scalarNames = names.filter((nm) => !this.cols.has(nm));
+      const t = this.type === Float32Array ? 'f32' : 'f64';
+      const encs = arrayNames.map((nm) => this.cols.get(nm).enc ?? null);
+      const cacheKey = `grouprange|${t}|${bound.join(';')}|${this.pred}|${arrayNames}|${scalarNames}|${JSON.stringify([encs, null])}`;
+      engine._tableKernels ??= new Map();
+      let v = engine._tableKernels.get(cacheKey);
+      if (!v) {
+        v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, 1, engine.isShared, true, encs, null));
+        engine._tableKernels.set(cacheKey, v);
+      }
+      const arrays = [...arrayNames.map((nm) => this.cols.get(nm).data), gData];
+      yield* engine._groupRangeG(v, this.n, arrays, scalarNames.map((nm) => merged[nm]), engine.live(state.acc).byteOffset, K);
+    } finally {
+      engine.free(gData);
+    }
+  }
+
   // Per group number (0..K-1): [row counts, then one array per item]. A
   // kernel takes at most 8 reductions (the row count is one): more items run
   // in several passes.
@@ -913,7 +957,7 @@ export class Table {
     for (const nm of keep) if (!this.cols.has(nm)) throw new Error(`vectro: no column "${nm}"`);
     if (this.pred) walk(parse(this.pred), (m) => { if (m.t === 'var' && this.cols.has(m.name)) keep.add(m.name); });
     const cols = new Map([...keep].map((nm) => [nm, this.cols.get(nm)])); // in the order asked (then the filter's columns)
-    return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params });
+    return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params, zones: this.zones });
   }
 
   // ---- sorting ---------------------------------------------------------------
@@ -1283,7 +1327,7 @@ function textCall(n, cols, src) {
 }
 
 // `region == 'EU'` -> `region == 3` (the code for 'EU', or -1 if absent).
-function rewriteText(ast, cols, src) {
+export function rewriteText(ast, cols, src) {
   const textCol = (n) => n.t === 'var' && cols.get(n.name)?.dict;
   const dateCol = (n) => n.t === 'var' && cols.get(n.name)?.date;
   const one = (n) => { if (n.args.length !== 1) throw new SyntaxError(`vectro: ${n.fn}() takes one value, in "${src}"`); return fix(n.args[0]); };
