@@ -116,6 +116,16 @@ for (const [label, make] of engines) {
   same(fds.toRows(), t.lazy().filter("region == 'MEA'").derive('rev', 'price * qty').select('ts', 'rev', 'region').toRows(), `${label} filtered dataset (${fs.chunks} chunks)`);
   writeDataset(e, file(`agg-${label}.vectro`), ds.groupBy('qty').agg({ n: 'count()' }));
   same(new Dataset(e, file(`agg-${label}.vectro`)).toRows(), t.lazy().groupBy('qty').agg({ n: 'count()' }).toRows(), `${label} aggregate as dataset`);
+  // whole-byte codes (bitPack: false) answer the same, in a bigger file
+  {
+    const bpath = file(`bytes-${label}.vectro`);
+    const sb = writeDataset(e, bpath, t, { rowsPerChunk: 7_000, bitPack: false });
+    const bds = new Dataset(e, bpath);
+    check(sb.bytes > summary.bytes && bds.meta.chunks.every((ch) => Object.values(ch.cols).every((m) => !m.bits)), `${label}: bytes file ${sb.bytes} vs ${summary.bytes}`);
+    for (const [name, q] of QUERIES.slice(0, 8)) same(q(bds, c), q(t, c), `${label} ${name} (whole bytes)`);
+    await bds.close();
+  }
+
   // a sorted dataset written in partitions (the sort needn't fit in memory)
   Object.assign(tuning, { partitionRows: 9000 });
   for (const [by, f] of [[['-price', 'ts'], 'qty > 3'], [['cust', '-ts'], 'qty > 0'], [['price'], 'qty > 8'], [['-noise'], 'qty > 100']]) {

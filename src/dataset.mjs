@@ -63,8 +63,10 @@ export const tuning = { mergeRows: 1 << 20, denseMin: undefined, spillRows: 1 <<
 export class DatasetWriter {
   // rowsPerChunk: rows per chunk (the last one may be shorter); append: add
   // to an existing dataset (same columns) instead of replacing it.
-  constructor(engine, path, { rowsPerChunk = CHUNK_ROWS, append = false } = {}) {
+  // bitPack: false stores packed codes in whole bytes (bigger files, no unpacking).
+  constructor(engine, path, { rowsPerChunk = CHUNK_ROWS, append = false, bitPack = true } = {}) {
     this.engine = engine;
+    this.bitPack = bitPack;
     this.path = path;
     this.rowsPerChunk = Math.max(1, Math.floor(rowsPerChunk));
     this.pending = null; // rows waiting for a full chunk (a table this writer owns)
@@ -198,7 +200,7 @@ export class DatasetWriter {
         const d = engine.live(c.data);
         const seq = c.enc && !chunk.cols[name].missing ? sequence(d, n) : null;
         if (seq) { Object.assign(chunk.cols[name], { off: 0, len: 0, enc: c.enc, seq }); continue; } // (nothing to store: rebuilt on read)
-        const plan = c.enc ? bitPlan(d, n, KINDS[c.enc.kind].nan, KINDS[c.enc.kind].bytes * 8) : null;
+        const plan = c.enc && this.bitPack ? bitPlan(d, n, KINDS[c.enc.kind].nan, KINDS[c.enc.kind].bytes * 8) : null;
         if (plan) { // each code in only the bits it needs
           Object.assign(chunk.cols[name], this.#write(packBits(d, n, plan)), { enc: c.enc, bits: plan.bits, bbase: plan.base }, plan.missing !== null ? { bmissing: plan.missing } : {});
           continue;
@@ -484,9 +486,10 @@ export class Dataset {
       if (!n) continue;
       if (!engine.jit) { unpackBits(engine.live(words), n, plan, engine.live(data)); continue; }
       engine._bitKernels ??= new Map();
-      let v = engine._bitKernels.get(width);
-      if (!v) engine._bitKernels.set(width, (v = engine._register(unpackModule(width, engine.isShared))));
-      yield* engine._unitsG(v, n, [engine.live(words).byteOffset, engine.live(data).byteOffset, plan.bits, plan.base, plan.missing !== null ? 1 : 0, plan.missing ?? 0]);
+      const key = `${width}|${plan.bits}`;
+      let v = engine._bitKernels.get(key);
+      if (!v) engine._bitKernels.set(key, (v = engine._register(unpackModule(width, plan.bits, engine.isShared))));
+      yield* engine._unitsG(v, n, [engine.live(words).byteOffset, engine.live(data).byteOffset, plan.base, plan.missing !== null ? 1 : 0, plan.missing ?? 0]);
     }
   }
 
