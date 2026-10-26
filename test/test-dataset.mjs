@@ -137,6 +137,12 @@ for (const [label, make] of engines) {
   const ads = new Dataset(e, apath);
   same(ads.toRows(), [{ k: 'a', v: 1 }, { k: 'b', v: 2 }, { k: 'c', v: 3 }, { k: 'a', v: NaN }, { k: 'd', v: 5 }], `${label} append`);
   same(ads.groupBy('k').agg({ s: 'sum(v)', n: 'count(v)' }).toRows(), [{ k: 'a', s: 1, n: 1 }, { k: 'b', s: 2, n: 1 }, { k: 'c', s: 3, n: 1 }, { k: 'd', s: 5, n: 1 }], `${label} append groups`);
+  // a join hashes the other table once for all chunks (not once per chunk)
+  for (const how of ['inner', 'left']) {
+    const b0 = e._joinBuildCount ?? 0;
+    ds.lazy().filter('qty > 3').join(c, { on: 'cust', how }).groupBy('tier').agg({ n: 'count()' }).toRows();
+    check((e._joinBuildCount ?? 0) - b0 === 1 && ds.lastRun.read > 5, `${label}: ${how} join built ${(e._joinBuildCount ?? 0) - b0} times over ${ds.lastRun.read} chunks`);
+  }
   // queries don't leave engine memory behind
   const before = e.sizes?.size;
   for (let i = 0; i < 5; i++) for (const [, q] of QUERIES) q(ds, c);

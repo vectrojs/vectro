@@ -48,7 +48,8 @@ export function* joinTablesG(L, R, { on, how = 'inner', suffix = '_right' } = {}
   // engine._joinBuilds (freed when the run ends).
   const cache = engine._joinBuilds ?? null;
   const cacheKey = `${how}|${rk.join(',')}|${lk.map((n) => dictId(L.cols.get(n)?.dict)).join(',')}`;
-  let build = cache?.get(R)?.get(cacheKey) ?? null, ownBuild = false;
+  const target = R.cols.get(rk[0])?.data ?? R; // (views of one table share its arrays: one build for all of them)
+  let build = cache?.get(target)?.get(`${cacheKey}|${rk.map((n) => arrayId(R.cols.get(n)?.data)).join(',')}`) ?? null, ownBuild = false;
   try {
     const leftKeys = [];
     for (let k = 0; k < nk; k++) {
@@ -61,7 +62,7 @@ export function* joinTablesG(L, R, { on, how = 'inner', suffix = '_right' } = {}
     }
     if (!build) {
       build = yield* buildRight(engine, t, L, R, lk, rk, how);
-      if (cache) { if (!cache.has(R)) cache.set(R, new Map()); cache.get(R).set(cacheKey, build); } else ownBuild = true;
+      if (cache) { if (!cache.has(target)) cache.set(target, new Map()); cache.get(target).set(`${cacheKey}|${rk.map((n) => arrayId(R.cols.get(n)?.data)).join(',')}`, build); } else ownBuild = true;
     }
     const { K, start, rows } = build;
 
@@ -90,7 +91,7 @@ export function* joinTablesG(L, R, { on, how = 'inner', suffix = '_right' } = {}
       if (sameKey.has(name)) continue;
       let src = c.data, dict = c.dict, codes = c.codes;
       if (how === 'left') { // one more row at the end: the value for "no match"
-        let x = build.extended.get(name);
+        let x = build.extended.get(`${name}|${arrayId(c.data)}`);
         if (!x) {
           const ext = engine.alloc(R.type, nR + 1);
           build.arrays.push(ext);
@@ -101,7 +102,7 @@ export function* joinTablesG(L, R, { on, how = 'inner', suffix = '_right' } = {}
             if (e === undefined) { dict = [...dict, '']; codes = new Map(codes).set('', dict.length - 1); e = dict.length - 1; }
             s[nR] = e;
           } else s[nR] = NaN;
-          build.extended.set(name, (x = { data: ext, dict, codes }));
+          build.extended.set(`${name}|${arrayId(c.data)}`, (x = { data: ext, dict, codes }));
         }
         ({ data: src, dict, codes } = x);
       }
@@ -116,6 +117,94 @@ export function* joinTablesG(L, R, { on, how = 'inner', suffix = '_right' } = {}
     if (ownBuild) freeBuild(engine, build);
   }
 }
+
+// Unique right keys (each key one right row, e.g. an ID column), as a view:
+// an inner join keeps the left rows that have a match and a left join keeps
+// them all, so instead of pairing rows, the right columns are looked up for
+// every left row (in group-number order, "no match" last), and the left
+// columns stay as they are (packed ones too). An inner join's "has a match"
+// becomes the result's filter (column __vectro_found). Used chunk after
+// chunk by datasets (opts.view). Returns null when the right keys repeat.
+//   collectLeft(): the left table's matching rows (a generator)
+//   makeView(cols, n, pred, left): the result, which takes over `left`'s columns
+export const FOUND = '__vectro_found';
+export function* joinViewG(L, R, { on, how = 'inner', suffix = '_right' } = {}, collectLeft, makeView) {
+  const engine = L.engine;
+  if (R.engine !== engine || L.type !== R.type || (how !== 'inner' && how !== 'left')) return null;
+  const [lk, rk] = parseOn(on);
+  if (!lk.length || lk.length !== rk.length) return null;
+  for (let k = 0; k < lk.length; k++) {
+    const a = L.cols.get(lk[k]), b = R.cols.get(rk[k]);
+    if (!a || !b || a.strings || b.strings || !a.dict !== !b.dict) return null; // (the normal path reports it)
+  }
+  const t = L.type === Float32Array ? 'f32' : 'f64';
+  const cache = engine._joinBuilds ?? null;
+  const cacheKey = `${how}|${rk.join(',')}|${lk.map((n) => dictId(L.cols.get(n)?.dict)).join(',')}`;
+  const target = R.cols.get(rk[0])?.data ?? R; // (views of one table share its arrays: one build for all of them)
+  let build = cache?.get(target)?.get(`${cacheKey}|${rk.map((n) => arrayId(R.cols.get(n)?.data)).join(',')}`) ?? null, ownBuild = false;
+  const made = [];
+  const alloc = (Type, n) => { const a = engine.alloc(Type, n); made.push(a); return a; };
+  try {
+    if (!build) {
+      build = yield* buildRight(engine, t, L, R, lk, rk, how);
+      if (cache) { if (!cache.has(target)) cache.set(target, new Map()); cache.get(target).set(`${cacheKey}|${rk.map((n) => arrayId(R.cols.get(n)?.data)).join(',')}`, build); } else ownBuild = true;
+    }
+    if (!build.rowOf || !engine.jit) return null;
+    const left = yield* collectLeft();
+    const n = left.n, K = build.K;
+    // left keys as plain numbers for the probe (packed keys decoded)
+    const keys = [];
+    for (const name of lk) {
+      const c = left.cols.get(name);
+      if (!c.enc) { keys.push(c.data); continue; }
+      const plain = alloc(L.type, n);
+      if (n) yield* engine.evalG('x', { x: { data: c.data, enc: c.enc, n, type: t } }, plain);
+      keys.push(plain);
+    }
+    const lid = alloc(Int32Array, n);
+    if (n) yield* probeG(engine, t, build, keys, lid);
+    const idx = alloc(Uint32Array, n);
+    noMatchAt(engine.live(lid), engine.live(idx), n, K);
+    // right columns in group-number order (made once per build), then looked up
+    const byGroup = (name, c) => {
+      let x = build.byGroup?.get(name);
+      if (x) return x;
+      build.byGroup ??= new Map();
+      const data = engine.alloc(R.type, K + 1);
+      build.arrays.push(data);
+      let dict = c?.dict ?? null, codes = c?.codes ?? null, missing = NaN;
+      if (dict && how === 'left') { // "no match" reads as ''
+        missing = codes.get('');
+        if (missing === undefined) { dict = [...dict, '']; codes = new Map(codes).set('', dict.length - 1); missing = dict.length - 1; }
+      }
+      const d = engine.live(data), src = c ? engine.live(c.data) : null, rowOf = build.rowOf;
+      for (let g = 0; g < K; g++) { const r = rowOf[g]; d[g] = r < 0 ? missing : src ? src[r] : 1; }
+      d[K] = missing;
+      build.byGroup.set(name, (x = { data, dict, codes, date: c?.date }));
+      return x;
+    };
+    const cols = new Map(left.cols);
+    const sameKey = new Set(rk.filter((name, k) => lk[k] === name));
+    const looked = [];
+    for (const [name, c] of R.cols) {
+      if (sameKey.has(name)) continue;
+      let outName = name;
+      while (cols.has(outName)) outName += suffix;
+      const x = byGroup(`c:${name}|${arrayId(c.data)}`, c);
+      cols.set(outName, { data: null, dict: x.dict, codes: x.codes, date: x.date });
+      looked.push([outName, x]);
+    }
+    if (how === 'inner') looked.push([FOUND, byGroup('found', null)]), cols.set(FOUND, { data: null, dict: null, codes: null });
+    for (const [outName, x] of looked) cols.get(outName).data = yield* gatherG(engine, x.data, idx, n, t);
+    for (const c of cols.values()) c.data = engine.live(c.data);
+    return makeView(cols, n, how === 'inner' ? `${FOUND} == 1` : null, left, looked.map(([nm]) => nm));
+  } finally {
+    for (const a of made) engine.free(a);
+    if (ownBuild) freeBuild(engine, build);
+  }
+}
+
+function noMatchAt(lid, idx, n, K) { for (let i = 0; i < n; i++) { const g = lid[i]; idx[i] = g < 0 ? K : g; } }
 
 // (plain functions: hot loops run faster outside generators)
 function countPairs(found, nL, start, rowOf, left) {
@@ -149,9 +238,10 @@ function makePairs(f, nL, nR, start, rows, rowOf, left, a, b) {
   }
 }
 
-const dictIds = new WeakMap();
-let nextDictId = 1;
-const dictId = (d) => { if (!d) return 0; let id = dictIds.get(d); if (!id) dictIds.set(d, (id = nextDictId++)); return id; };
+const ids = new WeakMap();
+let nextId = 1;
+const idOf = (x) => { if (!x) return 0; let id = ids.get(x); if (!id) ids.set(x, (id = nextId++)); return id; };
+const dictId = idOf, arrayId = idOf;
 
 export function freeBuild(engine, build) { for (const a of build?.arrays ?? []) engine.free(a); }
 
@@ -163,6 +253,7 @@ function* buildRight(engine, t, L, R, lk, rk, how) {
   const arrays = [];
   const alloc = (Type, n) => { const a = engine.alloc(Type, n); arrays.push(a); return a; };
   const build = { arrays, extended: new Map(), K: 0, start: null, rows: null, rightKeys: [] };
+  engine._joinBuildCount = (engine._joinBuildCount ?? 0) + 1; // (tests: a dataset hashes the right side once)
   try {
     for (let k = 0; k < nk; k++) {
       const a = L.cols.get(lk[k]), b = R.cols.get(rk[k]);

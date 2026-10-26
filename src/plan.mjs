@@ -260,7 +260,7 @@ function* execG(node, needed, temps) {
       const sl = yield* execG(node.left, needL, temps), sr = yield* execG(node.right, needR, temps);
       const lt = yield* materializeG(sl, needL, temps, [], true), rt = yield* materializeG(sr, needR, temps, [], true);
       const j = yield { table: lt, method: 'join', args: [rt, node.opts] };
-      return { table: j, derived: new Map(), visible: j.columnNames };
+      return { table: j, derived: new Map(), visible: j.columnNames.filter((n) => n !== '__vectro_found') }; // (a view join's match flag)
     }
     case 'output': {
       const s = yield* execG(node.input, null, temps);

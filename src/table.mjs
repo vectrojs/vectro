@@ -12,7 +12,7 @@ import { generateGroupBy, generateCompact, generateHashGroups } from './table-ke
 import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
 import { sortPermG, gatherG } from './parallel-sort.mjs';
-import { joinTablesG } from './join.mjs';
+import { joinTablesG, joinViewG } from './join.mjs';
 import { Query } from './plan.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
@@ -1197,6 +1197,20 @@ export class Table {
   joinAsync(other, opts) { return this.engine._driveAsync(this.#joinG(other, opts)); }
 
   *#joinG(other, opts) {
+    if (opts?.view && other instanceof Table && !other.pred && !other.#hasPacked()) { // (datasets: unique right keys as a view, see joinViewG)
+      let collected = null, view = null;
+      try {
+        view = yield* joinViewG(this, other, opts, function* () { collected = yield* this.#collectG(); return collected; }.bind(this), (cols, n, pred, left, made) => {
+          const owned = [...made];
+          const ownedBuffers = [];
+          if (left !== this) { owned.push(...left.owned); ownedBuffers.push(...left.ownedBuffers); left.owned = []; left.ownedBuffers = []; } // (the view keeps the collected rows)
+          return new Table(this.engine, cols, n, { pred, owned, ownedBuffers, zones: false });
+        });
+      } finally {
+        if (!view && collected && collected !== this) collected.dispose();
+      }
+      if (view) return view;
+    }
     if (this.#hasPacked()) return yield* this.#viaPlainG((t) => t.#joinG(other, opts));
     if (other instanceof Table && other.#hasPacked()) { const o = yield* other.#decodedG(); try { return yield* this.#joinG(o, opts); } finally { o.dispose(); } }
     if (!(other instanceof Table)) throw new TypeError('vectro: join needs another table of the same engine');

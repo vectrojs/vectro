@@ -555,6 +555,13 @@ const BLOCKING = { aggregate: 'group', total: 'total', limit: 'head', sort: 'gat
 const union = (a, b) => new Set([...a, ...b]);
 const onKeys = (on) => (typeof on === 'string' || Array.isArray(on) ? [[on].flat(), [on].flat()] : [[on?.left].flat(), [on?.right].flat()]);
 
+// The joins in a per-chunk plan, marked to return views (scans kept as they are).
+function viewJoins(node) {
+  if (node.op === 'scan') return node;
+  if (node.op === 'join') return { ...node, opts: { ...node.opts, view: true }, left: viewJoins(node.left) };
+  return { ...node, input: viewJoins(node.input) };
+}
+
 // node with `target` (the same object) replaced by `repl`
 function substitute(node, target, repl) {
   if (node === target) return repl;
@@ -677,6 +684,7 @@ function* runChunksG(plan, path, sink) {
     const round = ds.type === Float32Array ? Math.fround : (v) => v;
     for (const c of conditions(rewritten, ds.cols, {})) conds.push({ ...c, v: round(c.v) });
   }
+  const viewTop = viewJoins(top); // (joins on each chunk: unique right keys as views, see joinViewG)
   const pieces = ds._piecesFor(conds);
   ds.lastRun.skipped = ds.chunkCount - pieces.length;
   const list = pieces.length ? pieces : [{ i: -1, lo: 0, hi: 0 }]; // (no rows, but the plan still runs once for the result's shape)
@@ -693,7 +701,7 @@ function* runChunksG(plan, path, sink) {
       ds.lastRun.read += list[k].i >= 0 ? 1 : 0;
       ds.lastRun.rows += chunk.n;
       try {
-        yield* acc.chunk(substitute(top, scan, { op: 'scan', table: chunk }), chunk);
+        yield* acc.chunk(substitute(viewTop, scan, { op: 'scan', table: chunk }), chunk);
       } finally {
         chunk.dispose();
       }
