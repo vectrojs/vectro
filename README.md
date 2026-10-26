@@ -223,22 +223,21 @@ formulas exact in both, answers compared; best of 3, busy laptop):
 
 | Query | 100M rows: Vectro | DuckDB | 1 billion rows: Vectro | DuckDB |
 |---|---|---|---|---|
-| scan everything (count, revenue) | 64 ms | 72 ms | 1.58 s | 0.86 s |
-| filter: region and quantity | 62 ms | 79 ms | 1.97 s | 0.79 s |
-| the last day (1 chunk read) | 1 ms | 1 ms | 2 ms | 5 ms |
-| group by region | 104 ms | 137 ms | 1.71 s | 1.47 s |
-| top 10 of 1M customers | 529 ms | 551 ms | 5.97 s | 7.47 s |
-| top 10 rows by price | 284 ms | 91 ms | 4.72 s | 1.23 s |
-| join 1M customers, group by tier | 314 ms | 74 ms | 2.96 s | 1.88 s |
-| distinct customers per region | 251 ms | 610 ms | 2.60 s | 11.0 s |
-| file on disk | 0.9 GB | 0.5 GB | 9.3 GB | 5.4 GB |
-| peak memory (RSS) | 387 MB | 2.9 GB | **324 MB** | 5.0 GB |
+| scan everything (count, revenue) | 66 ms | 84 ms | 549 ms | 812 ms |
+| filter: region and quantity | 111 ms | 90 ms | 825 ms | 839 ms |
+| the last day (1 chunk read) | 2 ms | 1 ms | 1 ms | 4 ms |
+| group by region | 137 ms | 157 ms | 1.35 s | 1.42 s |
+| top 10 of 1M customers | 549 ms | 563 ms | 6.44 s | 6.73 s |
+| top 10 rows by price | 339 ms | 121 ms | 3.88 s | 1.00 s |
+| join 1M customers, group by tier | 327 ms | 79 ms | 3.19 s | 0.83 s |
+| distinct customers per region | 276 ms | 606 ms | 2.81 s | 10.6 s |
+| file on disk | 0.5 GB | 0.5 GB | 5.1 GB | 5.4 GB |
+| peak memory (RSS) | 439 MB | 3.3 GB | **393 MB** | 4.5 GB |
 
 A billion rows would take 37 GB as plain columns in memory (this laptop has
-16 GB); Vectro's engine never used more than 191 MB for them. At that size
-full scans are limited by reading the file, and DuckDB's file is smaller
-(it packs values to the bit, Vectro to the byte), so DuckDB scans faster;
-Vectro is faster on time ranges, many groups and distinct counts.
+16 GB); Vectro's engine never used more than 245 MB for them. Vectro is
+level or faster on 6 of the 8 queries; DuckDB is still faster at picking
+the top rows and at joins on data this big.
 
 ## For AI assistants (MCP server)
 
