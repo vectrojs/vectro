@@ -94,7 +94,8 @@ for (const [label, make] of engines) {
   ds.filter("ts >= '2024-01-20' && ts < '2024-01-25'").count();
   check(ds.lastRun.skipped >= ds.chunkCount - 3 && ds.lastRun.read <= 3, `${label}: skipped ${JSON.stringify(ds.lastRun)}`);
   ds.agg({ q: 'sum(qty)' });
-  check(ds.lastRun.bytesRead === N, `${label}: one byte per qty, read ${ds.lastRun.bytesRead}`);
+  check(ds.lastRun.bytesRead <= N / 2 + 4 * ds.chunkCount, `${label}: four bits per qty (1..9), read ${ds.lastRun.bytesRead}`);
+  check(ds.meta.chunks.every((ch) => ch.cols.qty.bits === 4 && ch.cols.cust.bits === 12 && ch.cols.price.bits === 17 && ch.cols.price.bmissing !== undefined), `${label}: bit widths ${JSON.stringify(ds.meta.chunks[0].cols.price)}`);
   ds.lazy().limit(3).toRows();
   check(ds.lastRun.read <= 2, `${label}: limit read ${ds.lastRun.read} chunks`);
   // async (the next chunk is read during the current one) gives the same

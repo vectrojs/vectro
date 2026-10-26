@@ -43,11 +43,14 @@ import { conditions, mayMatch, computeZones } from './zones.mjs';
 import { STR_SHIFT, STR_ESCAPED } from './csv-kernel.mjs';
 import { inspectCSV, loadBytes } from './csv.mjs';
 import { freeBuild } from './join.mjs';
+import { OP } from './kernels.mjs';
+import { bitPlan, packBits, unpackBits, unpackModule } from './bitpack.mjs';
 
 const MAGIC = new TextEncoder().encode('VECTRODS');
-const VERSION = 1;
+const VERSION = 2; // (2: bit-packed columns; version 1 files read too)
 const HEADER = 16, TAIL = 24, ALIGN = 64;
-const SLACK = 16; // bytes after packed codes (SIMD loads read a little past the end)
+const SLACK = 16;
+const READ_PIECE = 1 << 20; // reads are cut into pieces this big, read by several threads at once // bytes after packed codes (SIMD loads read a little past the end)
 export const CHUNK_ROWS = 1 << 22;
 const BLOCK = 1 << 16; // min / max per block of rows inside a chunk: a query reads only the blocks that can match
 // partial groups are merged again once this many pile up (tests make it small)
@@ -72,6 +75,10 @@ export class DatasetWriter {
       this.fd = fd;
       this.meta = meta;
       this.pos = footerStart; // new chunks overwrite the old footer
+      const v = new Uint8Array(4);
+      new DataView(v.buffer).setUint32(0, VERSION, true);
+      writeSync(fd, v, 0, 4, 8); // (new chunks may use this version's features)
+      meta.version = VERSION;
       for (const c of meta.columns) if (c.kind === 'category') this.labels.set(c.name, { dict: c.dict, codes: new Map(c.dict.map((s, i) => [s, i])) });
     } else {
       this.fd = openSync(path, 'w');
@@ -191,6 +198,11 @@ export class DatasetWriter {
         const d = engine.live(c.data);
         const seq = c.enc && !chunk.cols[name].missing ? sequence(d, n) : null;
         if (seq) { Object.assign(chunk.cols[name], { off: 0, len: 0, enc: c.enc, seq }); continue; } // (nothing to store: rebuilt on read)
+        const plan = c.enc ? bitPlan(d, n, KINDS[c.enc.kind].nan, KINDS[c.enc.kind].bytes * 8) : null;
+        if (plan) { // each code in only the bits it needs
+          Object.assign(chunk.cols[name], this.#write(packBits(d, n, plan)), { enc: c.enc, bits: plan.bits, bbase: plan.base }, plan.missing !== null ? { bmissing: plan.missing } : {});
+          continue;
+        }
         const bytes = c.enc ? KINDS[c.enc.kind].bytes * n : d.BYTES_PER_ELEMENT * n;
         Object.assign(chunk.cols[name], this.#write(new Uint8Array(d.buffer, d.byteOffset, bytes)), c.enc ? { enc: c.enc } : {});
       }
@@ -338,7 +350,7 @@ function readFooter(path, flags) {
     readFully(fd, tail, size - TAIL);
     if (!MAGIC.every((b, i) => head[i] === b && tail[16 + i] === b)) throw new Error(`vectro: ${path} is not a Vectro dataset (or wasn't closed)`);
     const version = new DataView(head.buffer).getUint32(8, true);
-    if (version !== VERSION) throw new Error(`vectro: ${path} is dataset version ${version}; this Vectro reads version ${VERSION}`);
+    if (version < 1 || version > VERSION) throw new Error(`vectro: ${path} is dataset version ${version}; this Vectro reads versions 1 to ${VERSION}`);
     const dv = new DataView(tail.buffer);
     const footerStart = dv.getFloat64(0, true), len = dv.getFloat64(8, true);
     const json = new Uint8Array(len);
@@ -432,53 +444,94 @@ export class Dataset {
     const { engine } = this;
     const ch = i < 0 ? { rows: 0, cols: {} } : this.meta.chunks[i];
     const n = hi - lo;
-    const cols = new Map(), owned = [], ownedBuffers = [], reads = [], seqs = [];
+    const cols = new Map(), owned = [], ownedBuffers = [], reads = [], seqs = [], unpacks = [], temps = [];
     for (const name of names) {
       const m = ch.cols[name], base = this.cols.get(name);
       if (base.strings) {
         const data = engine.alloc(Float64Array, n), strings = engine.alloc(Uint8Array, m?.slen ?? 0);
         cols.set(name, { data, dict: null, codes: null, strings });
         ownedBuffers.push(strings);
-        if (m) reads.push([name, 'data', m.off + lo * 8, n * 8], [name, 'strings', m.soff, m.slen]);
+        if (m) reads.push([data, m.off + lo * 8, n * 8], [strings, m.soff, m.slen]);
       } else if (m?.enc) {
         const k = KINDS[m.enc.kind];
-        cols.set(name, { data: engine.alloc(k.Type, n + SLACK / k.bytes), dict: base.dict, codes: base.codes, date: base.date, enc: m.enc, plainType: this.type, rows: n });
+        const data = engine.alloc(k.Type, n + SLACK / k.bytes);
+        cols.set(name, { data, dict: base.dict, codes: base.codes, date: base.date, enc: m.enc, plainType: this.type, rows: n });
         if (m.seq) seqs.push([name, m.seq]);
-        else reads.push([name, 'data', m.off + lo * k.bytes, n * k.bytes]);
+        else if (m.bits) { // bit-packed: the words holding rows lo..hi, unpacked after the read
+          const w0 = (lo * m.bits) / 32, w1 = Math.ceil((hi * m.bits) / 32); // (lo is a multiple of 65,536: whole words)
+          const words = engine.alloc(Uint8Array, (w1 - w0) * 4 + 8);
+          temps.push(words);
+          reads.push([words, m.off + w0 * 4, (w1 - w0) * 4]);
+          unpacks.push([words, data, n, { bits: m.bits, base: m.bbase, missing: m.bmissing ?? null }, k.bytes]);
+        } else reads.push([data, m.off + lo * k.bytes, n * k.bytes]);
       } else {
-        const w = this.type.BYTES_PER_ELEMENT;
-        cols.set(name, { data: engine.alloc(this.type, n), dict: base.dict, codes: base.codes, date: base.date });
-        if (m) reads.push([name, 'data', m.off + lo * w, n * w]);
+        const w = this.type.BYTES_PER_ELEMENT, data = engine.alloc(this.type, n);
+        cols.set(name, { data, dict: base.dict, codes: base.codes, date: base.date });
+        if (m) reads.push([data, m.off + lo * w, n * w]);
       }
       owned.push(name);
     }
     for (const c of cols.values()) { c.data = engine.live(c.data); if (c.strings) c.strings = engine.live(c.strings); }
     for (const [name, { first, step }] of seqs) { const d = cols.get(name).data; for (let j = 0; j < n; j++) d[j] = first + (lo + j) * step; }
     const table = new Table(engine, cols, n, { owned, ownedBuffers, zones: false });
-    return { table, reads, bytes: reads.reduce((a, r) => a + r[3], 0) };
+    return { table, reads, unpacks, temps, bytes: reads.reduce((a, r) => a + r[2], 0) };
+  }
+
+  // Bit-packed columns back to their codes, on every thread (a generator).
+  *#unpackG(unpacks) {
+    const { engine } = this;
+    for (const [words, data, n, plan, width] of unpacks) {
+      if (!n) continue;
+      if (!engine.jit) { unpackBits(engine.live(words), n, plan, engine.live(data)); continue; }
+      engine._bitKernels ??= new Map();
+      let v = engine._bitKernels.get(width);
+      if (!v) engine._bitKernels.set(width, (v = engine._register(unpackModule(width, engine.isShared))));
+      yield* engine._unitsG(v, n, [engine.live(words).byteOffset, engine.live(data).byteOffset, plan.bits, plan.base, plan.missing !== null ? 1 : 0, plan.missing ?? 0]);
+    }
+  }
+
+  // The reads in pieces of at most READ_PIECE bytes: [array, file position, bytes, offset in array].
+  #pieces(reads) {
+    const out = [];
+    for (const [arr, off, len] of reads) for (let at = 0; at < len; at += READ_PIECE) out.push([arr, off + at, Math.min(READ_PIECE, len - at), at]);
+    return out;
   }
 
   _readSync(piece, names) {
-    const { table, reads, bytes } = this.#allocChunk(piece, names);
+    const { table, reads, unpacks, temps, bytes } = this.#allocChunk(piece, names);
+    const { engine } = this;
     try {
-      for (const [name, field, off, len] of reads) readFully(this.fd, bytesOf(this.engine.live(table.cols.get(name)[field]), len), off);
-    } catch (err) { table.dispose(); throw err; }
+      const pieces = this.#pieces(reads);
+      if (engine.W > 0 && engine.canBlock !== false && pieces.length > 1) { // every thread reads pieces straight into engine memory
+        const jobs = engine.alloc(Float64Array, pieces.length * 4);
+        try {
+          const j = engine.live(jobs);
+          pieces.forEach(([arr, off, len, at], u) => { j.set([this.fd, off, len, engine.live(arr).byteOffset + at], u * 4); });
+          engine._drive((function* () {
+            yield { op: OP.READ, n: pieces.length, arrays: [jobs], F: (J, u) => readFully(J[u * 4], new Uint8Array(engine.memory.buffer, J[u * 4 + 3], J[u * 4 + 2]), J[u * 4 + 1]) };
+          })());
+        } finally { engine.free(jobs); }
+      } else for (const [arr, off, len] of reads) readFully(this.fd, bytesOf(engine.live(arr), len), off);
+      this.engine._drive(this.#unpackG(unpacks));
+    } catch (err) { table.dispose(); throw err; } finally { for (const t of temps) this.engine.free(t); }
     if (this.lastRun) this.lastRun.bytesRead += bytes;
     return table;
   }
 
   async _readAsync(piece, names) {
-    const { table, reads, bytes } = this.#allocChunk(piece, names);
+    const { table, reads, unpacks, temps, bytes } = this.#allocChunk(piece, names);
     try {
       this.fh ??= openFile(this.path, 'r');
       const fh = await this.fh;
-      await Promise.all(reads.map(async ([name, field, off, len]) => {
-        if (this.engine.isShared) return readFullyAsync(fh, bytesOf(this.engine.live(table.cols.get(name)[field]), len), off); // straight into engine memory
+      await Promise.all(this.#pieces(reads).map(async ([arr, off, len, at]) => { // (in pieces: Node's I/O threads read them at once)
+        const view = () => new Uint8Array(this.engine.live(arr).buffer, this.engine.live(arr).byteOffset + at, len);
+        if (this.engine.isShared) return readFullyAsync(fh, view(), off); // straight into engine memory
         const buf = new Uint8Array(len); // (plain memory may move while the read runs)
         await readFullyAsync(fh, buf, off);
-        bytesOf(this.engine.live(table.cols.get(name)[field]), len).set(buf);
+        view().set(buf);
       }));
-    } catch (err) { table.dispose(); throw err; }
+      await this.engine._driveAsync(this.#unpackG(unpacks));
+    } catch (err) { table.dispose(); throw err; } finally { for (const t of temps) this.engine.free(t); }
     if (this.lastRun) this.lastRun.bytesRead += bytes;
     return table;
   }

@@ -87,6 +87,11 @@ export async function workerLoop({ ctrlBuf, scalarBuf, resultBuf, spin, module, 
       A = decodeArgs(ctrl, bufferFor);
       F = usesKernel(op) ? fused(ctrl[C.KERNEL])
         : op === OP.CSV_PARSE ? (msg) => host.post(msg) // results go back to the main thread
+        : op === OP.READ ? (jobs, u) => { // a file read straight into engine memory (Node: host.read)
+          const dst = jobs[u * 4 + 3], len = jobs[u * 4 + 2];
+          if (memory.buffer.byteLength < dst + len) memory.grow(0);
+          host.read(jobs[u * 4], new Uint8Array(memory.buffer, dst, len), jobs[u * 4 + 1]);
+        }
         : null;
     } catch (err) {
       if (Atomics.load(ctrl, C.SEQ) !== s) continue;

@@ -188,9 +188,11 @@ sql('SELECT region, COUNT(DISTINCT cust) FROM orders GROUP BY region', { orders 
 ```
 
 - **The file:** chunks of 4M rows. Each column of each chunk is stored
-  compressed exactly as it sits in memory (see compressed columns), so a chunk
-  loads with one read per column and no parsing; columns that count up at a
-  fixed step (row numbers, times every second) take no space at all. The
+  compressed (see compressed columns) and packed to the bit: a quantity 1..9
+  takes 4 bits, a price in cents up to 999.99 takes 17, a column that counts
+  up at a fixed step (row numbers, times every second) takes none. A chunk
+  loads with one read per column, then every thread unpacks the bits back to
+  the 1-, 2- or 4-byte codes the kernels read; nothing is parsed. The
   footer holds the schema, one dictionary per text column and the min / max
   of every column for each chunk and each 64K-row block.
 - **Queries** are the usual lazy plans, run chunk by chunk with the same

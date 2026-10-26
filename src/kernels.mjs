@@ -6,7 +6,7 @@ import { countPattern } from './bytes.mjs';
 
 export const OP = {
   EXIT: 0, SUM: 1, MIN: 2, MAX: 3, ADD: 4, SCALE: 5, DOT: 6, HEAVY: 7,
-  COUNT_GT: 8, SORT_CHUNK: 9, MERGE: 10, COUNT_BYTES: 11, COPY: 12, FUSED: 13, GROUP: 14, COMPACT: 15, CSV_SCAN: 16, CSV_PARSE: 17, GROUP_RANGE: 18, UNITS: 19,
+  COUNT_GT: 8, SORT_CHUNK: 9, MERGE: 10, COUNT_BYTES: 11, COPY: 12, FUSED: 13, GROUP: 14, COMPACT: 15, CSV_SCAN: 16, CSV_PARSE: 17, GROUP_RANGE: 18, UNITS: 19, READ: 20,
 };
 
 // Layout of the shared control block (Int32 slots).
@@ -52,7 +52,7 @@ export const TAG_SHIFT = 20;
 export const tagOf = (seq) => seq & 0xfff;
 
 export function unitCount(op, T, n, sc) {
-  if (op === OP.CSV_SCAN || op === OP.CSV_PARSE) return n; // n = number of chunks
+  if (op === OP.CSV_SCAN || op === OP.CSV_PARSE || op === OP.READ) return n; // n = number of chunks (READ: of file reads)
   if (op === OP.SORT_CHUNK) return sc[1];
   if (op === OP.GROUP_RANGE) return T; // a range of groups per thread
   if (op === OP.MERGE) return Math.ceil(sc[1] / (2 * sc[0]));
@@ -108,6 +108,8 @@ function runUnit(op, u, units, T, n, A, sc, ctrl, W, res, F, self) {
       res[u] = csvScan(u, A, sc);
     } else if (op === OP.CSV_PARSE) {
       csvParse(u, A, sc, F); // F reports each chunk's text dictionary
+    } else if (op === OP.READ) {
+      F(A[0], u); // read job u: [fd, file position, bytes, memory offset] (datasets, Node)
     } else if (op === OP.SORT_CHUNK) {
       A[0].subarray(chunkStart(u, units, n), chunkStart(u + 1, units, n)).sort();
     } else if (op === OP.MERGE) {
