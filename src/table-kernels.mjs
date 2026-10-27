@@ -88,27 +88,38 @@ export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, 
 // Compact: copy the rows that pass `pred` from source columns to destination
 // columns. copyFrom[d] is the index (into arrayNames) that destination d copies.
 // Signature: (src ptrs..., n, dst ptrs..., scalars...)
-export function generateCompact(pred, t, arrayNames, copyFrom, scalarNames, shared = true) {
+export function generateCompact(pred, t, arrayNames, copyFrom, scalarNames, shared = true, encs = [], rowNumbers = false) {
+  // rowNumbers: one more destination (uint32) gets each kept row's number,
+  // from how far the first source pointer has moved (its start comes as one
+  // more scalar after the others). encs[i]: packed sources, decoded as read.
   const ty = TY[t];
-  const A = arrayNames.length, D = copyFrom.length;
+  const A = arrayNames.length, D = copyFrom.length + (rowNumbers ? 1 : 0);
   const n = A;
   const dst = Array.from({ length: D }, (_, d) => A + 1 + d);
-  const f = new Fn('k', [...Array(A).fill(I32), I32, ...Array(D).fill(I32), ...Array(scalarNames.length).fill(F64)], []);
+  const S = scalarNames.length;
+  const f = new Fn('k', [...Array(A).fill(I32), I32, ...Array(D).fill(I32), ...Array(S + (rowNumbers ? 1 : 0)).fill(F64)], []);
   const env = bindValues(f, t, arrayNames, A + 1 + D, scalarNames);
+  arrayNames.forEach((name, i) => { env.arrays.get(name).enc = encs[i] ?? null; });
+  env.t = t; env.raw = f.local(ty.val); env.tmp = f.local(ty.val);
   const em = new Emitter(f, t, env);
-  const stop = f.local(I32);
+  em.prepare([pred]);
+  const stop = f.local(I32), start0 = f.local(I32);
   const srcLocals = arrayNames.map((name) => env.arrays.get(name));
+  const bytes0 = encs[0] ? PACKED_BYTES[encs[0].kind] : ty.bytes;
+  if (rowNumbers) f.emit(get(A + 1 + D + S), [0xfc, 0x03], set(start0)); // (f64 -> u32)
 
-  f.emit(get(n), i32c(ty.bytes), [0x6c], get(0), i32add, set(stop));
+  f.emit(get(n), i32c(bytes0), [0x6c], get(0), i32add, set(stop));
   f.emit(block, loop, get(0), get(stop), i32geu, brIf(1));
   loadRow(f, ty, env);
   f.emit(block);
   em.scaMask(pred);
   f.emit(I32_EQZ, brIf(0));
   copyFrom.forEach((src, d) => f.emit(get(dst[d]), get(srcLocals[src].sca), ty.store));
-  advance(f, ty, dst);
+  if (rowNumbers) f.emit(get(dst[D - 1]), get(0), get(start0), [0x6b], i32c(Math.log2(bytes0)), [0x76], [0x36, 2, 0]); // (ptr0 - start0) >> log2(bytes): i32.store
+  advance(f, ty, dst.slice(0, copyFrom.length));
+  if (rowNumbers) f.emit(get(dst[D - 1]), i32c(4), i32add, set(dst[D - 1]));
   f.emit(end);
-  advance(f, ty, srcLocals.map((a) => a.ptr));
+  advance(f, ty, srcLocals.map((a) => a.ptr), encs);
   f.emit(br(0), end, end);
   return buildModule([f], shared);
 }

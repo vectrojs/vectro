@@ -44,7 +44,7 @@ import { STR_SHIFT, STR_ESCAPED } from './csv-kernel.mjs';
 import { inspectCSV, loadBytes } from './csv.mjs';
 import { freeBuild } from './join.mjs';
 import { OP } from './kernels.mjs';
-import { bitPlan, packBits, unpackBits, unpackModule } from './bitpack.mjs';
+import { bitPlan, packBits, unpackBits, unpackModule, seqModule } from './bitpack.mjs';
 
 const MAGIC = new TextEncoder().encode('VECTRODS');
 const VERSION = 2; // (2: bit-packed columns; version 1 files read too)
@@ -474,7 +474,7 @@ export class Dataset {
       owned.push(name);
     }
     for (const c of cols.values()) { c.data = engine.live(c.data); if (c.strings) c.strings = engine.live(c.strings); }
-    for (const [name, { first, step }] of seqs) { const d = cols.get(name).data; for (let j = 0; j < n; j++) d[j] = first + (lo + j) * step; }
+    for (const [name, { first, step }] of seqs) unpacks.push(['seq', cols.get(name).data, n, { first: first + lo * step, step }, KINDS[cols.get(name).enc.kind].bytes]);
     const table = new Table(engine, cols, n, { owned, ownedBuffers, zones: false });
     return { table, reads, unpacks, temps, bytes: reads.reduce((a, r) => a + r[2], 0) };
   }
@@ -484,6 +484,14 @@ export class Dataset {
     const { engine } = this;
     for (const [words, data, n, plan, width] of unpacks) {
       if (!n) continue;
+      if (words === 'seq') { // fixed-step column: rebuilt (on every thread)
+        if (!engine.jit) { const d = engine.live(data); for (let j = 0; j < n; j++) d[j] = plan.first + j * plan.step; continue; }
+        engine._bitKernels ??= new Map();
+        let v = engine._bitKernels.get(`seq|${width}`);
+        if (!v) engine._bitKernels.set(`seq|${width}`, (v = engine._register(seqModule(width, engine.isShared))));
+        yield* engine._unitsG(v, n, [engine.live(data).byteOffset, plan.first, plan.step]);
+        continue;
+      }
       if (!engine.jit) { unpackBits(engine.live(words), n, plan, engine.live(data)); continue; }
       engine._bitKernels ??= new Map();
       const key = `${width}|${plan.bits}`;
@@ -809,11 +817,8 @@ function accumulator(kind, B, engine, sink, ds, derived) {
       let node;
       if (kind === 'top') {
         node = { op: 'output', input: { op: 'limit', n: k, offset: 0, input: { ...B.input, input: P } } };
-        if (cutoff !== null) {
-          const input = { op: 'filter', ast: parse(`(${first.expr}) ${first.desc ? '>=' : '<='} ${toSource({ t: 'num', v: cutoff })}`), input: P };
-          const { c } = yield { run: { op: 'total', spec: { c: parse('count()') }, input } };
-          // few candidates: just keep them (the merge picks the best); else the top k of them
-          node = c <= 65_536 ? { op: 'output', input } : { op: 'output', input: { op: 'limit', n: k, offset: 0, input: { ...B.input, input } } };
+        if (cutoff !== null) { // only rows at least as good as the k-th so far: keep them all (the merge picks the best)
+          node = { op: 'output', input: { op: 'filter', ast: parse(`(${first.expr}) ${first.desc ? '>=' : '<='} ${toSource({ t: 'num', v: cutoff })}`), input: P } };
         }
       }
       else if (kind === 'head') node = { op: 'output', input: { op: 'limit', n: B.n + (B.offset ?? 0) - rows, offset: 0, input: P } };

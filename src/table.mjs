@@ -246,23 +246,33 @@ export class Table {
   *#collectPackedG() {
     const { engine, n } = this;
     const T = this.type, t = T === Float32Array ? 'f32' : 'f64';
-    const mask = engine.alloc(T, n), rows = engine.alloc(T, n);
+    const predAst = parse(this.pred);
+    const arrayNames = [];
+    walk(predAst, (m) => { if (m.t === 'var' && this.cols.has(m.name) && !arrayNames.includes(m.name)) arrayNames.push(m.name); });
+    if (!arrayNames.length) return yield* this.#viaPlainG((x) => x.#collectG()); // (a filter on no column)
+    // the matching row numbers, in one fused pass that reads packed columns as they are
+    const { parts, units } = yield* engine.compile(`count(${this.pred})`).runPartsG(this.#vars(this.params));
+    const offsets = engine.alloc(Float64Array, units);
+    let m = 0;
+    for (let u = 0; u < units; u++) { offsets[u] = m; m += parts[u]; }
+    const scalarNames = [];
+    walk(predAst, (x) => { if (x.t === 'var' && !this.cols.has(x.name) && !scalarNames.includes(x.name)) scalarNames.push(x.name); });
+    const encs = arrayNames.map((nm) => this.cols.get(nm).enc ?? null);
+    const cacheKey = `compactrows|${t}|${this.pred}|${arrayNames}|${scalarNames}|${JSON.stringify(encs)}`;
+    engine._tableKernels ??= new Map();
+    let v = engine._tableKernels.get(cacheKey);
+    if (!v) engine._tableKernels.set(cacheKey, (v = engine._register(generateCompact(predAst, t, arrayNames, [], scalarNames, engine.isShared, encs, true))));
+    let perm;
     try {
-      yield* engine.evalG(`(${this.pred}) ? 1 : 0`, this.#vars(this.params), mask);
-      const r = engine.live(rows);
-      for (let i = 0; i < n; i++) r[i] = i;
-      const tmp = new Table(engine, new Map([['__m', { data: engine.live(mask), dict: null, codes: null }], ['__r', { data: engine.live(rows), dict: null, codes: null }]]), n, { pred: '__m != 0', zones: false });
-      const hit = yield* tmp.#collectG();
-      const m = hit.n, perm = engine.alloc(Uint32Array, Math.max(1, m));
-      perm.set(engine.live(hit.cols.get('__r').data).subarray(0, m));
-      hit.dispose();
-      try {
-        const out = new Map();
-        for (const [name, c] of this.cols) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, m, t, c.enc), zones: undefined, ...(c.enc ? { rows: m } : {}) });
-        for (const c of out.values()) c.data = engine.live(c.data);
-        return new Table(engine, out, m, { owned: [...out.keys()] });
-      } finally { engine.free(perm); }
-    } finally { engine.free(mask); engine.free(rows); }
+      perm = engine.alloc(Uint32Array, Math.max(1, m));
+      const first = engine.live(this.cols.get(arrayNames[0]).data);
+      yield* engine._compactG(v, n, arrayNames.map((nm) => this.cols.get(nm).data), [perm], offsets, [...scalarNames.map((nm) => this.params[nm]), first.byteOffset], units);
+      // every column gathered by those rows (packed columns stay packed)
+      const out = new Map();
+      for (const [name, c] of this.cols) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, m, t, c.enc), zones: undefined, ...(c.enc ? { rows: m } : {}) });
+      for (const c of out.values()) c.data = engine.live(c.data);
+      return new Table(engine, out, m, { owned: [...out.keys()] });
+    } finally { engine.free(offsets); if (perm) engine.free(perm); }
   }
 
   // Run op on the decoded table (packed columns read as plain numbers).

@@ -117,3 +117,19 @@ function i64c(x) { // i64.const, signed LEB128
     o.push(b | 0x80);
   }
 }
+
+// seq(start, end, unit, dst, first, step): dst[i] = first + i * step as
+// `width`-byte integers (a column that counts up at a fixed step, rebuilt on
+// every thread; first already includes the piece's first row).
+export function seqModule(width, shared) {
+  const f = new Fn('k', [I32, I32, I32, I32, I32, I32], []);
+  const [start, stop, , dst, first, step] = [0, 1, 2, 3, 4, 5];
+  const i = f.local(I32), v = f.local(I32), out = f.local(I32);
+  f.emit(get(start), set(i));
+  f.emit(get(i), get(step), [0x6c], get(first), i32add, set(v));
+  f.emit(get(i), i32c(SHIFT[width]), [0x74], get(dst), i32add, set(out));
+  f.emit(block, loop, get(i), get(stop), i32geu, brIf(1));
+  f.emit(get(out), get(v), STORE[width]);
+  f.emit(get(v), get(step), i32add, set(v), get(out), i32c(width), i32add, set(out), get(i), i32c(1), i32add, set(i), br(0), end, end);
+  return buildModule([f], shared);
+}

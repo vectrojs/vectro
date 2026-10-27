@@ -17,6 +17,7 @@
 import { generateHashGroups, generateHashProbe } from './table-kernels.mjs';
 import { gatherG } from './parallel-sort.mjs';
 import { maxUnits } from './kernels.mjs';
+import { I32, F64, Fn, buildModule, get, set, i32c, block, loop, end, br, brIf, i32add, i32geu } from './wasm.mjs';
 
 function kernel(engine, name, make) {
   engine._tableKernels ??= new Map();
@@ -161,10 +162,13 @@ export function* joinViewG(L, R, { on, how = 'inner', suffix = '_right' } = {}, 
       if (n) yield* engine.evalG('x', { x: { data: c.data, enc: c.enc, n, type: t } }, plain);
       keys.push(plain);
     }
-    const lid = alloc(Int32Array, n);
-    if (n) yield* probeG(engine, t, build, keys, lid);
     const idx = alloc(Uint32Array, n);
-    noMatchAt(engine.live(lid), engine.live(idx), n, K);
+    if (build.lut) { if (n) yield* probeG(engine, t, build, keys, idx, K); } // (misses go straight to slot K)
+    else {
+      const lid = alloc(Int32Array, n);
+      if (n) yield* probeG(engine, t, build, keys, lid);
+      noMatchAt(engine.live(lid), engine.live(idx), n, K);
+    }
     // right columns in group-number order (made once per build), then looked up
     const byGroup = (name, c) => {
       let x = build.byGroup?.get(name);
@@ -290,6 +294,19 @@ function* buildRight(engine, t, L, R, lk, rk, how) {
       Object.assign(build, { index, K: index.size });
     }
     const ids = engine.live(rid), K = build.K;
+    if (nk === 1 && engine.jit) { // whole-number keys in a small range: a direct lookup array too
+      const keys = engine.live(build.rightKeys[0]);
+      let lo = Infinity, hi = -Infinity, whole = true;
+      for (let r = 0; r < nR && whole; r++) { const v = keys[r]; if (v !== v) continue; if (v !== Math.floor(v)) whole = false; if (v < lo) lo = v; if (v > hi) hi = v; }
+      const size = hi - lo + 1;
+      if (whole && lo !== Infinity && size <= Math.max(4 * nR, 1 << 16) && size <= 2 ** 26) {
+        const lut = alloc(Int32Array, size);
+        const L = engine.live(lut), k2 = engine.live(build.rightKeys[0]), g2 = engine.live(rid);
+        L.fill(-1);
+        for (let r = 0; r < nR; r++) { const v = k2[r]; if (v === v) L[v - lo] = g2[r]; }
+        Object.assign(build, { lut, lutMin: lo, lutSize: size });
+      }
+    }
     const start = new Int32Array(K + 1);
     for (let r = 0; r < nR; r++) start[ids[r] + 1]++;
     for (let g = 0; g < K; g++) start[g + 1] += start[g];
@@ -312,10 +329,37 @@ function* buildRight(engine, t, L, R, lk, rk, how) {
 }
 
 // Step 2 on every thread: look up the left keys (no inserts).
-function* probeG(engine, t, build, leftKeys, lid) {
+function* probeG(engine, t, build, leftKeys, lid, miss = -1) {
   const p = (a) => engine.live(a).byteOffset;
+  if (build.lut) { // whole-number keys in a small range: a direct lookup (lut[key - min])
+    const k = kernel(engine, `denseprobe|${t}`, () => denseProbeModule(t, engine.isShared));
+    yield* engine._unitsG(k, engine.live(lid).length, [p(leftKeys[0]), p(build.lut), p(lid), build.lutMin, build.lutSize, miss]);
+    return true;
+  }
   const probe = kernel(engine, `hashprobe|${t}|${leftKeys.length}`, () => generateHashProbe(t, leftKeys.length, engine.isShared));
   yield* engine._fusedG(probe, engine.live(lid).length, [...leftKeys, lid], [p(build.slots), build.cap - 1, p(build.keyBits)], 0);
+  return false;
+}
+
+// probe(start, end, unit, keys, lut, out, min, size, miss): out[i] = lut[key - min]
+// for a whole-number key in [min, min + size) that the right table has
+// (lut holds -1 for keys it lacks), else miss.
+function denseProbeModule(t, shared) {
+  const f = new Fn('k', [I32, I32, I32, I32, I32, I32, F64, I32, I32], []);
+  const [start, stop, , keys, lut, out, min, size, miss] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+  const i = f.local(I32), v = f.local(F64), g = f.local(I32), ok = f.local(I32), x = f.local(I32);
+  const bytes = t === 'f32' ? 4 : 8;
+  f.emit(get(start), set(i));
+  f.emit(block, loop, get(i), get(stop), i32geu, brIf(1));
+  f.emit(get(i), i32c(Math.log2(bytes)), [0x74], get(keys), i32add, t === 'f32' ? [0x2a, 2, 0, 0xbb] : [0x2b, 3, 0], get(min), [0xa1], set(v)); // v = key - min
+  f.emit(get(v), [0xfc, 0x02], set(g)); // g = trunc_sat(v)
+  f.emit(get(g), get(size), [0x49], get(g), [0xb7], get(v), [0x61], [0x71], set(ok)); // ok = g < size (unsigned) && f64(g) == v
+  f.emit(get(g), i32c(0), get(ok), [0x1b], i32c(2), [0x74], get(lut), i32add, [0x28, 2, 0], set(x)); // x = lut[ok ? g : 0]
+  f.emit(get(i), i32c(2), [0x74], get(out), i32add); // address of out[i]
+  f.emit(get(x), get(miss), get(ok), get(x), i32c(0), [0x4e], [0x71], [0x1b]); // ok && x >= 0 ? x : miss
+  f.emit([0x36, 2, 0]);
+  f.emit(get(i), i32c(1), i32add, set(i), br(0), end, end);
+  return buildModule([f], shared);
 }
 
 // The same in plain JavaScript (engines without the WebAssembly compiler).
