@@ -31,10 +31,6 @@
 // File layout: 'VECTRODS', version (u32), 0 (u32); column blobs (64-byte
 // aligned); footer JSON; footer offset and length (f64 each); 'VECTRODS'.
 
-import { openSync, readSync, writeSync, closeSync, fstatSync, ftruncateSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join as joinPath } from 'node:path';
-import { open as openFile } from 'node:fs/promises';
 import { Table, rewriteText } from './table.mjs';
 import { Query, execute, findDataset, optimize, vars, namesOf, joinNames } from './plan.mjs';
 import { parse, toSource, isMask } from './fuse.mjs';
@@ -45,6 +41,17 @@ import { inspectCSV, loadBytes, loadBytesAsync } from './csv.mjs';
 import { freeBuild } from './join.mjs';
 import { OP } from './kernels.mjs';
 import { bitPlan, packBits, unpackBits, unpackModule, seqModule } from './bitpack.mjs';
+
+// Files: Node registers its own (files-node.mjs: paths, sync and worker-thread
+// reads, writing, temporary folders for spilling). Without them (browsers,
+// edge runtimes) datasets open from a File / Blob or a URL and are read
+// asynchronously; writing and spilling need Node.
+let files = null;
+export function setFiles(f) { files = f; }
+const need = (what) => {
+  if (!files) throw new Error(`vectro: ${what} needs Node (here, datasets open read-only from a File, Blob or URL: openDatasetAsync)`);
+  return files;
+};
 
 const MAGIC = new TextEncoder().encode('VECTRODS');
 const VERSION = 2; // (2: bit-packed columns; version 1 files read too)
@@ -72,22 +79,23 @@ export class DatasetWriter {
     this.pending = null; // rows waiting for a full chunk (a table this writer owns)
     this.meta = null;
     this.labels = new Map(); // category column -> { dict, codes }: one dictionary for the dataset
-    if (append && existsSync(path)) {
-      const { fd, meta, footerStart } = readFooter(path, 'r+');
-      this.fd = fd;
+    this.file = need('writing a dataset').openWrite(path, { append });
+    if (this.file.existed) {
+      let footer;
+      try { footer = readFooter(this.file); } catch (err) { this.file.close(); throw err; }
+      const { meta, footerStart } = footer;
       this.meta = meta;
       this.pos = footerStart; // new chunks overwrite the old footer
       const v = new Uint8Array(4);
       new DataView(v.buffer).setUint32(0, VERSION, true);
-      writeSync(fd, v, 0, 4, 8); // (new chunks may use this version's features)
+      this.file.write(v, 8); // (new chunks may use this version's features)
       meta.version = VERSION;
       for (const c of meta.columns) if (c.kind === 'category') this.labels.set(c.name, { dict: c.dict, codes: new Map(c.dict.map((s, i) => [s, i])) });
     } else {
-      this.fd = openSync(path, 'w');
       const head = new Uint8Array(HEADER);
       head.set(MAGIC);
       new DataView(head.buffer).setUint32(8, VERSION, true);
-      writeSync(this.fd, head, 0, HEADER, 0);
+      this.file.write(head, 0);
       this.pos = HEADER;
     }
   }
@@ -133,15 +141,15 @@ export class DatasetWriter {
       dv.setFloat64(0, off, true);
       dv.setFloat64(8, json.length, true);
       tail.set(MAGIC, 16);
-      writeSync(this.fd, tail, 0, TAIL, this.pos);
+      this.file.write(tail, this.pos);
       this.pos += TAIL;
-      ftruncateSync(this.fd, this.pos);
+      this.file.truncate(this.pos);
       this.summary = { path: this.path, rows: this.meta.rows, chunks: this.meta.chunks.length, bytes: this.pos };
       return this.summary;
     } finally {
       this.pending?.dispose();
       this.pending = null;
-      closeSync(this.fd);
+      this.file.close();
     }
   }
 
@@ -151,7 +159,7 @@ export class DatasetWriter {
     this.aborted = true;
     this.pending?.dispose();
     this.pending = null;
-    closeSync(this.fd);
+    this.file.close();
   }
 
   #schema(t) {
@@ -237,9 +245,9 @@ export class DatasetWriter {
 
   #write(u8) {
     const pad = (ALIGN - (this.pos % ALIGN)) % ALIGN;
-    if (pad) { writeSync(this.fd, new Uint8Array(pad), 0, pad, this.pos); this.pos += pad; }
+    if (pad) { this.file.write(new Uint8Array(pad), this.pos); this.pos += pad; }
     const off = this.pos;
-    for (let done = 0; done < u8.length; ) done += writeSync(this.fd, u8, done, u8.length - done, off + done);
+    this.file.write(u8, off);
     this.pos += u8.length;
     return { off, len: u8.length };
   }
@@ -342,52 +350,104 @@ export function copyRows(engine, parts) {
 
 // ---- reading --------------------------------------------------------------------------
 
-function readFooter(path, flags) {
-  const fd = openSync(path, flags);
-  try {
-    const size = fstatSync(fd).size;
-    const head = new Uint8Array(HEADER), tail = new Uint8Array(TAIL);
-    if (size < HEADER + TAIL) throw new Error(`vectro: ${path} is not a Vectro dataset (or wasn't closed)`);
-    readFully(fd, head, 0);
-    readFully(fd, tail, size - TAIL);
-    if (!MAGIC.every((b, i) => head[i] === b && tail[16 + i] === b)) throw new Error(`vectro: ${path} is not a Vectro dataset (or wasn't closed)`);
-    const version = new DataView(head.buffer).getUint32(8, true);
-    if (version < 1 || version > VERSION) throw new Error(`vectro: ${path} is dataset version ${version}; this Vectro reads versions 1 to ${VERSION}`);
-    const dv = new DataView(tail.buffer);
-    const footerStart = dv.getFloat64(0, true), len = dv.getFloat64(8, true);
-    const json = new Uint8Array(len);
-    readFully(fd, json, footerStart);
-    return { fd, meta: JSON.parse(new TextDecoder().decode(json)), footerStart, size };
-  } catch (err) {
-    closeSync(fd);
-    throw err;
+// The footer of a dataset file: { meta, footerStart, size }. A generator
+// that yields { read: bytes, pos } (filled by readFooter / readFooterAsync).
+function* footerG(file) {
+  const { size, name } = file;
+  const head = new Uint8Array(HEADER), tail = new Uint8Array(TAIL);
+  if (size < HEADER + TAIL) throw new Error(`vectro: ${name} is not a Vectro dataset (or wasn't closed)`);
+  yield { read: head, pos: 0 };
+  yield { read: tail, pos: size - TAIL };
+  if (!MAGIC.every((b, i) => head[i] === b && tail[16 + i] === b)) throw new Error(`vectro: ${name} is not a Vectro dataset (or wasn't closed)`);
+  const version = new DataView(head.buffer).getUint32(8, true);
+  if (version < 1 || version > VERSION) throw new Error(`vectro: ${name} is dataset version ${version}; this Vectro reads versions 1 to ${VERSION}`);
+  const dv = new DataView(tail.buffer);
+  const footerStart = dv.getFloat64(0, true), len = dv.getFloat64(8, true);
+  const json = new Uint8Array(len);
+  yield { read: json, pos: footerStart };
+  return { meta: JSON.parse(new TextDecoder().decode(json)), footerStart, size };
+}
+
+function readFooter(file) {
+  const g = footerG(file);
+  for (let step = g.next(); ; ) {
+    if (step.done) return step.value;
+    file.readSync(step.value.read, step.value.pos);
+    step = g.next();
   }
 }
 
-function readFully(fd, u8, pos) {
-  for (let done = 0; done < u8.length; ) {
-    const got = readSync(fd, u8, done, u8.length - done, pos + done);
-    if (got === 0) throw new Error('vectro: dataset file ended early');
-    done += got;
+async function readFooterAsync(file) {
+  const g = footerG(file);
+  for (let step = g.next(); ; ) {
+    if (step.done) return step.value;
+    await file.read(step.value.read, step.value.pos);
+    step = g.next();
   }
 }
 
-async function readFullyAsync(fh, u8, pos) {
-  for (let done = 0; done < u8.length; ) {
-    const { bytesRead } = await fh.read(u8, done, u8.length - done, pos + done);
-    if (bytesRead === 0) throw new Error('vectro: dataset file ended early');
-    done += bytesRead;
-  }
+// A dataset in a Blob or File (a browser's file input or drop; anything with
+// slice()): read-only, async.
+export function blobFile(blob, name = blob.name ?? 'dataset') {
+  return {
+    name,
+    size: blob.size,
+    async read(u8, pos) { u8.set(new Uint8Array(await blob.slice(pos, pos + u8.length).arrayBuffer())); },
+    close() {},
+  };
+}
+
+// A dataset at a URL, read with HTTP range requests (the server must answer
+// "Range: bytes=a-b" with 206): only the parts a query needs are fetched.
+export async function urlFile(url, { fetch: get = globalThis.fetch, headers = {} } = {}) {
+  const probe = await get(url, { headers: { ...headers, Range: 'bytes=0-0' } });
+  const range = probe.headers.get('content-range'); // bytes 0-0/12345
+  await probe.body?.cancel?.();
+  if (probe.status !== 206 || !range) throw new Error(`vectro: ${url} doesn't answer range requests (HTTP ${probe.status}); serve it with Range support, or download it first`);
+  const size = Number(range.split('/')[1]);
+  return {
+    name: url,
+    size,
+    pieceBytes: 8 << 20, // (fewer, bigger requests)
+    coalesce: 1 << 16,   // neighbouring reads closer than this become one request
+    async read(u8, pos) {
+      if (!u8.length) return;
+      const res = await get(url, { headers: { ...headers, Range: `bytes=${pos}-${pos + u8.length - 1}` } });
+      if (res.status !== 206) throw new Error(`vectro: ${url}: HTTP ${res.status} for a range request`);
+      const got = new Uint8Array(await res.arrayBuffer());
+      if (got.length !== u8.length) throw new Error(`vectro: ${url}: expected ${u8.length} bytes, got ${got.length}`);
+      u8.set(got);
+    },
+    close() {},
+  };
+}
+
+// A dataset from a path (Node), a URL, a File / Blob or a file object (see
+// blobFile): reads its footer and returns the Dataset.
+export async function openDatasetAsync(engine, source) {
+  let file = source;
+  if (typeof source === 'string') file = /^https?:/i.test(source) || !files ? await urlFile(source) : files.openRead(source);
+  else if (typeof Blob === 'function' && source instanceof Blob) file = blobFile(source);
+  let footer;
+  try { footer = file.readSync ? readFooter(file) : await readFooterAsync(file); } catch (err) { file.close(); throw err; }
+  return new Dataset(engine, file, footer);
 }
 
 const bytesOf = (a, len) => new Uint8Array(a.buffer, a.byteOffset, len);
 
 export class Dataset {
-  constructor(engine, path) {
-    const { fd, meta, size } = readFooter(path, 'r');
+  // source: a path (Node), or a file object from blobFile / urlFile (those
+  // need openDatasetAsync, which reads the footer first).
+  constructor(engine, source, footer = null) {
+    const file = typeof source === 'string' ? need('opening a dataset by path').openRead(source) : source;
+    if (!footer) {
+      if (!file.readSync) throw new Error('vectro: open this dataset with openDatasetAsync (it is read asynchronously)');
+      try { footer = readFooter(file); } catch (err) { file.close(); throw err; }
+    }
+    const { meta, size } = footer;
     this.engine = engine;
-    this.path = path;
-    this.fd = fd;
+    this.file = file;
+    this.path = file.name;
     this.meta = meta;
     this.bytes = size;
     this.isDataset = true;
@@ -397,7 +457,6 @@ export class Dataset {
       ? { dict: c.dict, codes: new Map(c.dict.map((s, i) => [s, i])) }
       : { dict: null, codes: null, date: c.kind === 'date', strings: c.kind === 'text' || undefined }]));
     this.lastRun = null; // { chunks, read, skipped, rows, bytesRead, ms } of the last query
-    this.fh = null;
   }
 
   get length() { return this.meta.rows; }
@@ -434,8 +493,7 @@ export class Dataset {
   runPlan(plan, sync) { return sync ? driveSync(runPlanG(plan)) : driveAsync(runPlanG(plan)); }
 
   async close() {
-    if (this.fd !== null) { closeSync(this.fd); this.fd = null; }
-    if (this.fh) { const fh = this.fh; this.fh = null; await (await fh).close(); }
+    if (this.file) { const f = this.file; this.file = null; f.close(); }
   }
 
   // ---- chunks -------------------------------------------------------------------------
@@ -503,26 +561,28 @@ export class Dataset {
 
   // The reads in pieces of at most READ_PIECE bytes: [array, file position, bytes, offset in array].
   #pieces(reads) {
-    const out = [];
-    for (const [arr, off, len] of reads) for (let at = 0; at < len; at += READ_PIECE) out.push([arr, off + at, Math.min(READ_PIECE, len - at), at]);
+    const out = [], size = this.file.pieceBytes ?? READ_PIECE;
+    for (const [arr, off, len] of reads) for (let at = 0; at < len; at += size) out.push([arr, off + at, Math.min(size, len - at), at]);
     return out;
   }
 
   _readSync(piece, names) {
+    const { file } = this;
+    if (!file?.readSync) throw new Error(file ? 'vectro: this dataset is read asynchronously (a File, Blob or URL): use toRowsAsync(), aggAsync(), collectAsync()...' : 'vectro: this dataset is closed');
     const { table, reads, unpacks, temps, bytes } = this.#allocChunk(piece, names);
     const { engine } = this;
     try {
       const pieces = this.#pieces(reads);
-      if (engine.W > 0 && engine.canBlock !== false && pieces.length > 1) { // every thread reads pieces straight into engine memory
+      if (file.fd !== undefined && engine.W > 0 && engine.canBlock !== false && pieces.length > 1) { // every thread reads pieces straight into engine memory
         const jobs = engine.alloc(Float64Array, pieces.length * 4);
         try {
           const j = engine.live(jobs);
-          pieces.forEach(([arr, off, len, at], u) => { j.set([this.fd, off, len, engine.live(arr).byteOffset + at], u * 4); });
+          pieces.forEach(([arr, off, len, at], u) => { j.set([file.fd, off, len, engine.live(arr).byteOffset + at], u * 4); });
           engine._drive((function* () {
-            yield { op: OP.READ, n: pieces.length, arrays: [jobs], F: (J, u) => readFully(J[u * 4], new Uint8Array(engine.memory.buffer, J[u * 4 + 3], J[u * 4 + 2]), J[u * 4 + 1]) };
+            yield { op: OP.READ, n: pieces.length, arrays: [jobs], F: (J, u) => file.readSync(new Uint8Array(engine.memory.buffer, J[u * 4 + 3], J[u * 4 + 2]), J[u * 4 + 1]) };
           })());
         } finally { engine.free(jobs); }
-      } else for (const [arr, off, len] of reads) readFully(this.fd, bytesOf(engine.live(arr), len), off);
+      } else for (const [arr, off, len] of reads) file.readSync(bytesOf(engine.live(arr), len), off);
       this.engine._drive(this.#unpackG(unpacks));
     } catch (err) { table.dispose(); throw err; } finally { for (const t of temps) this.engine.free(t); }
     if (this.lastRun) this.lastRun.bytesRead += bytes;
@@ -530,17 +590,30 @@ export class Dataset {
   }
 
   async _readAsync(piece, names) {
+    const { file } = this;
+    if (!file) throw new Error('vectro: this dataset is closed');
     const { table, reads, unpacks, temps, bytes } = this.#allocChunk(piece, names);
     try {
-      this.fh ??= openFile(this.path, 'r');
-      const fh = await this.fh;
-      await Promise.all(this.#pieces(reads).map(async ([arr, off, len, at]) => { // (in pieces: Node's I/O threads read them at once)
-        const view = () => new Uint8Array(this.engine.live(arr).buffer, this.engine.live(arr).byteOffset + at, len);
-        if (this.engine.isShared) return readFullyAsync(fh, view(), off); // straight into engine memory
-        const buf = new Uint8Array(len); // (plain memory may move while the read runs)
-        await readFullyAsync(fh, buf, off);
-        view().set(buf);
-      }));
+      const view = (arr, at, len) => new Uint8Array(this.engine.live(arr).buffer, this.engine.live(arr).byteOffset + at, len);
+      if (file.coalesce) { // (a URL: neighbouring reads as one request each)
+        const sorted = reads.filter((r) => r[2]).sort((a, b) => a[1] - b[1]), groups = [];
+        for (const r of sorted) {
+          const g = groups[groups.length - 1];
+          if (g && r[1] - g.end <= file.coalesce && r[1] + r[2] - g.start <= (file.pieceBytes ?? READ_PIECE)) { g.items.push(r); g.end = Math.max(g.end, r[1] + r[2]); } else groups.push({ start: r[1], end: r[1] + r[2], items: [r] });
+        }
+        await Promise.all(groups.map(async (g) => {
+          const buf = new Uint8Array(g.end - g.start);
+          await file.read(buf, g.start);
+          for (const [arr, off, len] of g.items) view(arr, 0, len).set(buf.subarray(off - g.start, off - g.start + len));
+        }));
+      } else {
+        await Promise.all(this.#pieces(reads).map(async ([arr, off, len, at]) => { // (in pieces: several reads at once)
+          if (this.engine.isShared) return file.read(view(arr, at, len), off); // straight into engine memory
+          const buf = new Uint8Array(len); // (plain memory may move while the read runs)
+          await file.read(buf, off);
+          view(arr, at, len).set(buf);
+        }));
+      }
       await this.engine._driveAsync(this.#unpackG(unpacks));
     } catch (err) { table.dispose(); throw err; } finally { for (const t of temps) this.engine.free(t); }
     if (this.lastRun) this.lastRun.bytesRead += bytes;
@@ -853,7 +926,7 @@ function* runChunksG(plan, path, sink) {
     const merged = yield* acc.finish();
     if (kind === 'total' || merged === null) return merged;
     if (merged.isDataset) { // spilled groups: the rest of the plan reads them from disk
-      try { return yield* runPlanG(substitute(plan, B, { op: 'scan', table: merged }), sink); } finally { merged.close(); rmSync(merged.temporary, { recursive: true, force: true }); }
+      try { return yield* runPlanG(substitute(plan, B, { op: 'scan', table: merged }), sink); } finally { merged.close(); files.remove(merged.temporary); }
     }
     finalTable = merged;
     const rest = substitute(plan, kind === 'group' ? B : top, { op: 'scan', table: merged });
@@ -948,10 +1021,10 @@ const PART = '__vectro_part';
 class Spill {
   constructor(engine, key, splitters) {
     this.engine = engine;
-    this.dir = mkdtempSync(joinPath(tmpdir(), 'vectro-spill-'));
+    this.dir = need('spilling to disk (too many groups, a big sort or join)').tempDir('vectro-spill-');
     const P = splitters.length + 2;
     this.partAst = parse(`(${key}) != (${key}) ? ${P - 1} : (0${splitters.map((v) => ` + ((${key}) >= ${toSource({ t: 'num', v })})`).join('')})`);
-    this.paths = Array.from({ length: P }, (_, j) => joinPath(this.dir, `part-${j}.vectro`));
+    this.paths = Array.from({ length: P }, (_, j) => files.join(this.dir, `part-${j}.vectro`));
     this.writers = this.paths.map((p) => new DatasetWriter(engine, p, { rowsPerChunk: 1 << 18 }));
     this.rows = 0;
   }
@@ -983,7 +1056,7 @@ class Spill {
     return this.paths.map((p, j) => (this.writers[j].meta ? p : null));
   }
 
-  cleanup() { for (const w of this.writers) w.abort(); rmSync(this.dir, { recursive: true, force: true }); }
+  cleanup() { for (const w of this.writers) w.abort(); files.remove(this.dir); }
 }
 
 // Up to P - 1 split points for a column, from the dataset's min / max per
@@ -1044,7 +1117,7 @@ function sortSpillAccumulator(B, engine, ds, derived, first) {
       spill ??= new Spill(engine, first.expr, []);
       const paths = spill.close();
       const ordered = first.desc ? [...paths.slice(0, -1).reverse(), paths[paths.length - 1]] : paths;
-      const outPath = joinPath(spill.dir, 'sorted.vectro');
+      const outPath = files.join(spill.dir, 'sorted.vectro');
       const out = new DatasetWriter(engine, outPath);
       let ok = false;
       try {
@@ -1239,7 +1312,7 @@ function groupAccumulator(kind, B, engine, ds, derived) {
   // A partition too big to merge in memory is split again by its first key.
   function* finishSpilled() {
     const paths = spill.close();
-    const outPath = joinPath(spill.dir, 'groups.vectro');
+    const outPath = files.join(spill.dir, 'groups.vectro');
     const out = new DatasetWriter(engine, outPath);
     let ok = false;
     try {
@@ -1470,34 +1543,34 @@ function countBits(bits, from, to) {
 // Read in pieces (pieceBytes, cut at row ends), each parsed on every thread
 // with the column types found in the first piece. Returns the writer's summary.
 export function csvToDataset(engine, csvPath, outPath, opts = {}) {
-  const fd = openSync(csvPath, 'r');
+  const file = need('csvToDataset').openRead(csvPath);
   try {
-    const gen = csvPiecesG(engine, fstatSync(fd).size, outPath, opts);
+    const gen = csvPiecesG(engine, file.size, outPath, opts);
     let step = gen.next();
     while (!step.done) {
       const v = step.value;
       let out, err = null;
-      try { out = v.read ? readFully(fd, v.read, v.pos) : loadBytes(engine, v.parse, v.opts); } catch (e) { err = e; }
+      try { out = v.read ? file.readSync(v.read, v.pos) : loadBytes(engine, v.parse, v.opts); } catch (e) { err = e; }
       step = err ? gen.throw(err) : gen.next(out);
     }
     return step.value;
-  } finally { closeSync(fd); }
+  } finally { file.close(); }
 }
 
 // The same without blocking: reads with async I/O, parses on the worker threads.
 export async function csvToDatasetAsync(engine, csvPath, outPath, opts = {}) {
-  const fh = await openFile(csvPath, 'r');
+  const file = need('csvToDatasetAsync').openRead(csvPath);
   try {
-    const gen = csvPiecesG(engine, (await fh.stat()).size, outPath, opts);
+    const gen = csvPiecesG(engine, file.size, outPath, opts);
     let step = gen.next();
     while (!step.done) {
       const v = step.value;
       let out, err = null;
-      try { out = v.read ? await readFullyAsync(fh, v.read, v.pos) : await loadBytesAsync(engine, v.parse, v.opts); } catch (e) { err = e; }
+      try { out = v.read ? await file.read(v.read, v.pos) : await loadBytesAsync(engine, v.parse, v.opts); } catch (e) { err = e; }
       step = err ? gen.throw(err) : gen.next(out);
     }
     return step.value;
-  } finally { await fh.close(); }
+  } finally { file.close(); }
 }
 
 // Yields { read: bytes, pos } (fill bytes from the file at pos) and

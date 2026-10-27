@@ -218,6 +218,23 @@ sql('SELECT region, COUNT(DISTINCT cust) FROM orders GROUP BY region', { orders 
   a query's result as a new dataset chunk by chunk, so it needn't fit in
   memory either; a full `sort` written this way is an external sort (by
   ranges of the first key).
+- **In the browser** (and other runtimes without Node's files), datasets open
+  read-only from a File the user picked or dropped, a Blob, or a URL (HTTP
+  range requests, neighbouring reads merged): only the chunks and columns a
+  query needs are fetched. Queries use the async calls.
+
+  ```js
+  import { Engine, sql } from 'vectrojs/browser';
+  const engine = new Engine();
+  const orders = await engine.openDataset('/data/orders.vectro');   // or input.files[0]
+  await sql('SELECT region, COUNT(*) FROM orders GROUP BY region', { orders }).toRowsAsync();
+  ```
+
+  A billion rows (a 5.1 GB file) open in a page in 51 ms; "the last day"
+  answers in 24 ms reading 0.3 MB; a full group-by streams 2.7 GB in 7 s
+  from a local server. Try `examples/dataset/` (serve it with
+  `node examples/browser-threads/serve.mjs 8780 --data <folder of .vectro files>`).
+  Writing datasets and spilling to disk need Node.
 - **Also:** `append: true` adds to an existing dataset; `ds.lastRun` tells
   how many chunks and bytes a query read; `explain()` shows the plan; the MCP
   server opens `.vectro` files.
@@ -530,7 +547,7 @@ answers.
 ## Not done yet
 
 64-bit integers beyond 2^53 and time zones other than UTC. Datasets are
-Node-only and written by one writer at a time; a join on text keys needs its
+written in Node (browsers read them) by one writer at a time; a join on text keys needs its
 other side to fit in memory, exact distinct counts of non-ID values don't
 spill, and `approxDistinct` on a dataset counts exactly. Joins are for normal
 tables (not split tables or streams yet), inner and left only. Split tables

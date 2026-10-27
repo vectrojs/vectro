@@ -252,6 +252,56 @@ for (const [label, make] of engines) {
   await e.close();
 }
 
+// read-only datasets from a Blob or a URL (as in browsers): async reads only
+{
+  const { createServer } = await import('node:http');
+  const { openDatasetAsync } = await import('../src/dataset.mjs');
+  const e = new Engine(), single = new PortableEngine({ threads: 1 });
+  const n = 300_000;
+  const t = e.table({ ts: Array.from({ length: n }, (_, i) => new Date(Date.UTC(2024, 0, 1) + i * 1000)), v: Float64Array.from({ length: n }, (_, i) => (i % 97) / 4), k: Array.from({ length: n }, (_, i) => ['a', 'b', 'c'][i % 3]) });
+  const path = file('remote.vectro');
+  writeDataset(e, path, t, { rowsPerChunk: 100_000 });
+  const bytes = readFileSync(path);
+  let requests = 0, served = 0;
+  const server = createServer((req, res) => { // (a static file server with Range support)
+    requests++;
+    const m = /bytes=(\d+)-(\d+)/.exec(req.headers.range ?? '');
+    if (!m) { res.writeHead(200, { 'content-length': bytes.length }); res.end(bytes); return; }
+    const a = +m[1], b = Math.min(+m[2], bytes.length - 1);
+    served += b - a + 1;
+    res.writeHead(206, { 'content-range': `bytes ${a}-${b}/${bytes.length}`, 'content-length': b - a + 1 });
+    res.end(bytes.subarray(a, b + 1));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/remote.vectro`;
+  const Q = [
+    (d) => d.filter("ts >= '2024-01-03T12:00:00Z' && k == 'b'").aggAsync({ n: 'count()', s: 'sum(v)' }),
+    (d) => d.lazy().groupBy('k').agg({ n: 'count()', m: 'max(v)' }).toRowsAsync(),
+    (d) => d.lazy().top(5, ['-v', 'ts']).toRowsAsync(),
+  ];
+  const want = [];
+  for (const q of Q) want.push(await q(t));
+  for (const [label, eng] of [['threads', e], ['single thread', single]]) {
+    for (const [kind, src] of [['blob', new Blob([bytes])], ['url', url]]) {
+      const d = await openDatasetAsync(eng, src);
+      for (let i = 0; i < Q.length; i++) same(await Q[i](d), want[i], `${label} ${kind} query ${i}`);
+      let msg = '';
+      try { d.agg({ n: 'count()' }); } catch (err) { msg = err.message; }
+      check(msg.includes('asynchronously'), `${label} ${kind}: sync call says use async (${msg})`);
+      await d.close();
+    }
+  }
+  // a time range reads a slice of the file, not all of it
+  served = 0;
+  const d = await openDatasetAsync(e, url);
+  same(await d.filter("ts >= '2024-01-04T00:00:00Z' && ts < '2024-01-04T01:00:00Z'").aggAsync({ n: 'count()' }), { n: 3600 }, 'url time slice');
+  check(served < bytes.length / 4, `url time slice read ${served} of ${bytes.length} bytes`);
+  await d.close();
+  server.close();
+  await e.close();
+  await single.close();
+}
+
 // errors say what's wrong
 {
   const e = new Engine();

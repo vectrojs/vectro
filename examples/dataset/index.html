@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vectro datasets in the browser</title>
+<style>
+  :root { --ink: #1b2430; --muted: #5b6573; --line: #d9dee5; --ok: #0f766e; --bad: #b45309; --bg: #fff; --code: #f4f6f8; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ink: #e6edf3; --muted: #9aa3ae; --line: #30363d; --ok: #3fb9a8; --bad: #f0a35e; --bg: #0d1117; --code: #161b22; } }
+  body { font: 15px/1.5 -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); background: var(--bg); max-width: 980px; margin: 24px auto; padding: 0 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 20px; font-size: 14px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); } .ok { color: var(--ok); font-weight: 600; } .bad { color: var(--bad); font-weight: 600; }
+  textarea { width: 100%; box-sizing: border-box; font: 14px/1.4 "SF Mono", Menlo, monospace; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--code); color: var(--ink); }
+  button, select, input[type=text] { font: inherit; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+  button.primary { background: var(--ok); color: #fff; border-color: var(--ok); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  #drop { border: 2px dashed var(--line); border-radius: 8px; padding: 14px; text-align: center; color: var(--muted); }
+  #drop.over { border-color: var(--ok); color: var(--ok); }
+  .examples button { font-size: 13px; padding: 3px 8px; }
+</style>
+</head>
+<body>
+<h1>Query a dataset of any size, in the browser</h1>
+<p class="muted">A <code>.vectro</code> dataset is read in pieces: from a URL with HTTP range requests, or from a file on this computer. Only the chunks and columns a query needs are read, so a file far bigger than the browser's memory works.</p>
+
+<div class="row">
+  <select id="served"><option value="">datasets on this server…</option></select>
+  <input type="text" id="url" placeholder="or a URL" size="40">
+  <button id="openUrl">Open URL</button>
+</div>
+<div id="drop">Drop a .vectro file here, or <input type="file" id="pick" accept=".vectro"></div>
+<p id="info" class="muted">No dataset open.</p>
+
+<div class="examples row" id="examples"></div>
+<textarea id="sql" rows="4">SELECT COUNT(*) AS n FROM data</textarea>
+<div class="row"><button class="primary" id="run">Run</button> <span id="status" class="muted"></span></div>
+<div id="out"></div>
+
+<script type="module">
+import { Engine, threadsAvailable, sql } from '../../src/browser.mjs';
+
+const $ = (id) => document.getElementById(id);
+const engine = new Engine();
+const R = { opens: [], runs: [] };
+window.__results = R;
+let data = null;
+const mb = (b) => (b >= 2 ** 30 ? `${(b / 2 ** 30).toFixed(2)} GB` : `${(b / 2 ** 20).toFixed(1)} MB`);
+const ms = (t) => (t < 1000 ? `${t.toFixed(0)} ms` : `${(t / 1000).toFixed(2)} s`);
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+
+// the datasets this server has (examples/browser-threads/serve.mjs --data <folder>)
+fetch('/data/').then((r) => (r.ok ? r.json() : [])).then((names) => {
+  for (const n of names) $('served').append(new Option(n, `/data/${n}`));
+}).catch(() => {});
+
+async function open(source, label) {
+  $('status').textContent = 'Opening…';
+  try {
+    await data?.close();
+    const t0 = performance.now();
+    data = await engine.openDataset(source);
+    const took = performance.now() - t0;
+    const cols = data.columnNames.map((n) => { const c = data.cols.get(n); return `${n} (${c.dict ? 'text' : c.date ? 'date' : c.strings ? 'free text' : 'number'})`; });
+    $('info').innerHTML = `<b>${esc(label)}</b>: ${data.length.toLocaleString()} rows in ${data.chunkCount} chunks, ${mb(data.bytes)} on disk · opened in ${ms(took)} · ${engine.W ? `${engine.W} workers` : 'one thread'}<br>${esc(cols.join(', '))}`;
+    R.opens.push({ label, rows: data.length, ms: took });
+    examples();
+    $('status').textContent = '';
+  } catch (err) {
+    $('status').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
+    R.opens.push({ label, error: err.message });
+  }
+}
+
+// a few queries for the columns this dataset has
+function examples() {
+  const box = $('examples');
+  box.innerHTML = '<span class="muted">Try:</span>';
+  const names = data.columnNames;
+  const text = names.find((n) => data.cols.get(n).dict), date = names.find((n) => data.cols.get(n).date);
+  const nums = names.filter((n) => { const c = data.cols.get(n); return !c.dict && !c.date && !c.strings; });
+  const qs = [['count', 'SELECT COUNT(*) AS n FROM data']];
+  if (nums.length) qs.push(['totals', `SELECT COUNT(*) AS n, SUM(${nums[0]}) AS s, AVG(${nums.at(-1)}) AS a FROM data`]);
+  if (text) qs.push([`by ${text}`, `SELECT ${text}, COUNT(*) AS n${nums[0] ? `, AVG(${nums[0]}) AS a` : ''} FROM data GROUP BY ${text} ORDER BY n DESC`]);
+  if (nums[1]) qs.push(['top 10', `SELECT * FROM data ORDER BY ${nums[1]} DESC LIMIT 10`]);
+  if (text && nums[0]) qs.push(['distinct', `SELECT ${text}, COUNT(DISTINCT ${nums[0]}) AS d FROM data GROUP BY ${text} ORDER BY ${text}`]);
+  for (const [label, q] of qs) {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => { $('sql').value = q; run(); };
+    box.append(b);
+  }
+  if (date) { // the last day of the data: from the footer's statistics, no reading
+    const last = Math.max(...data.meta.chunks.map((ch) => Number(ch.cols[date].max)).filter(Number.isFinite));
+    const from = new Date(last - 86_400_000).toISOString().slice(0, 19).replace('T', ' ');
+    const b = document.createElement('button');
+    b.textContent = 'last day';
+    b.onclick = () => { $('sql').value = `SELECT COUNT(*) AS n${nums[0] ? `, AVG(${nums[0]}) AS a` : ''} FROM data WHERE ${date} >= TIMESTAMP '${from}'`; run(); };
+    box.append(b);
+  }
+}
+
+async function run() {
+  if (!data) return void ($('status').textContent = 'Open a dataset first.');
+  const q = $('sql').value;
+  $('status').textContent = 'Running…';
+  $('run').disabled = true;
+  try {
+    const t0 = performance.now();
+    const rows = await sql(q, { data }).toRowsAsync(200);
+    const took = performance.now() - t0;
+    const lr = data.lastRun ?? { bytesRead: 0, read: 0, chunks: data.chunkCount, skipped: 0 };
+    $('status').innerHTML = `<span class="ok">${ms(took)}</span> · read ${mb(lr.bytesRead)} of ${mb(data.bytes)} · ${lr.read} of ${lr.chunks} chunks (${lr.skipped} skipped by the filters)`;
+    const cols = rows.length ? Object.keys(rows[0]) : [];
+    const cell = (v) => (v instanceof Date ? v.toISOString().replace('T', ' ').replace('.000Z', '') : typeof v === 'number' ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(4)) : esc(v));
+    $('out').innerHTML = `<table><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr>${rows.map((r) => `<tr>${cols.map((c) => `<td class="${typeof r[c] === 'number' ? 'n' : ''}">${cell(r[c])}</td>`).join('')}</tr>`).join('')}</table>`;
+    R.runs.push({ q, ms: took, rows: rows.length, bytesRead: lr.bytesRead, first: rows[0] });
+  } catch (err) {
+    $('status').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
+    R.runs.push({ q, error: err.message });
+  } finally { $('run').disabled = false; }
+}
+
+$('run').onclick = run;
+$('sql').onkeydown = (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) run(); };
+$('served').onchange = () => { if ($('served').value) open($('served').value, $('served').value.split('/').pop()); };
+$('openUrl').onclick = () => { const u = $('url').value.trim(); if (u) open(new URL(u, location.href).href, u); };
+$('pick').onchange = () => { const f = $('pick').files[0]; if (f) open(f, f.name); };
+const drop = $('drop');
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); const f = e.dataTransfer.files[0]; if (f) open(f, f.name); };
+const auto = new URL(location.href).searchParams.get('open'); // ?open=/data/name.vectro
+if (auto) open(new URL(auto, location.href).href, auto.split('/').pop());
+</script>
+</body>
+</html>

@@ -12,6 +12,7 @@
 //   const orders = await engine.loadCSV('/orders.csv');
 //   await orders.filter("region == 'EU'").sumAsync('price * qty');
 import { Engine as CoreEngine } from './engine.mjs';
+import { openDatasetAsync } from './dataset.mjs';
 
 export const browserPlatform = {
   canBlock: false,
@@ -51,6 +52,13 @@ export class Engine extends CoreEngine {
     if (!res.ok) throw new Error(`vectro: ${url}: HTTP ${res.status}`);
     return this.parseCSVAsync(new Uint8Array(await res.arrayBuffer()), opts);
   }
+
+  // A dataset (a .vectro table of any size, see dataset.mjs) from a File the
+  // user picked or dropped, a Blob, or a URL (read with HTTP range requests):
+  // only the parts a query needs are read. Query it with the async calls.
+  //   const orders = await engine.openDataset(input.files[0]);
+  //   await sql('SELECT region, COUNT(*) FROM orders GROUP BY region', { orders }).toRowsAsync();
+  openDataset(source) { return openDatasetAsync(this, source); }
 }
 
 // ---- split tables: multi-core on pages WITHOUT isolation headers ------------
@@ -96,3 +104,4 @@ export { BatchEncoder, FrameReader, encodeSchema, encodeEnd } from './frames.mjs
 export { readArrow, writeArrow, ArrowReader, ArrowEncoder } from './arrow.mjs';
 export { DistinctSketch } from './sketch.mjs';
 export { sql } from './sql.mjs';
+export { Dataset, openDatasetAsync, blobFile, urlFile } from './dataset.mjs';

@@ -10,8 +10,10 @@
 // /examples/check/ (correctness on every engine the browser has).
 // Pages opened with ?report=<name> POST their results to /report, which
 // saves them as results/<name>.json, so any browser can be tested unattended.
+// --data <folder> serves that folder as /data/ (e.g. big .vectro datasets for
+// /examples/dataset/); every file answers HTTP range requests.
 import { createServer } from 'node:http';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile, open } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acceptWebSocket } from '../stream/ws-server.mjs';
@@ -20,7 +22,8 @@ const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const PORT = Number(process.argv[2] ?? 8766);
 const ISOLATE = !process.argv.includes('--no-isolation');
 const HOST = process.argv.includes('--lan') ? '0.0.0.0' : '127.0.0.1';
-const TYPES = { '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.csv': 'text/csv', '.json': 'application/json' };
+const DATA = process.argv.includes('--data') ? process.argv[process.argv.indexOf('--data') + 1] : null;
+const TYPES = { '.vectro': 'application/octet-stream', '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.csv': 'text/csv', '.json': 'application/json' };
 
 const server = createServer(async (req, res) => {
   if (req.method === 'POST' && req.url.startsWith('/report?')) {
@@ -33,15 +36,35 @@ const server = createServer(async (req, res) => {
     return res.writeHead(204).end();
   }
   let path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname)).replace(/^(\.\.[/\\])+/, '');
-  let file = join(ROOT, path);
+  let file = DATA && path.startsWith('/data/') ? join(DATA, path.slice(6)) : join(ROOT, path);
+  const headers = {
+    ...(ISOLATE ? { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' } : {}),
+    'Cache-Control': 'no-store',
+    'Accept-Ranges': 'bytes',
+  };
   try {
     if ((await stat(file)).isDirectory()) file = join(file, 'index.html');
+    headers['Content-Type'] = TYPES[extname(file)] ?? 'application/octet-stream';
+    if (DATA && path === '/data/') { // a list of the datasets there
+      const { readdir } = await import('node:fs/promises');
+      res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify((await readdir(DATA)).filter((n) => n.endsWith('.vectro'))));
+    }
+    const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
+    if (range) { // just the bytes asked for, read from disk (files can be bigger than memory)
+      const size = (await stat(file)).size;
+      const a = Number(range[1]), b = Math.min(size - 1, range[2] ? Number(range[2]) : size - 1);
+      if (a > b) return res.writeHead(416, { 'Content-Range': `bytes */${size}` }).end();
+      const fh = await open(file, 'r');
+      try {
+        const buf = Buffer.allocUnsafe(b - a + 1);
+        for (let done = 0; done < buf.length; ) done += (await fh.read(buf, done, buf.length - done, a + done)).bytesRead;
+        res.writeHead(206, { ...headers, 'Content-Range': `bytes ${a}-${b}/${size}`, 'Content-Length': buf.length });
+        return res.end(buf);
+      } finally { await fh.close(); }
+    }
     const body = await readFile(file);
-    res.writeHead(200, {
-      'Content-Type': TYPES[extname(file)] ?? 'application/octet-stream',
-      ...(ISOLATE ? { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' } : {}),
-      'Cache-Control': 'no-store',
-    });
+    res.writeHead(200, headers);
     res.end(body);
   } catch {
     res.writeHead(404).end('not found');
