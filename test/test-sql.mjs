@@ -52,6 +52,69 @@ const CASES = [
     () => [{ eu: sum(O.filter((r) => r.region === 'EU').map((r) => r.qty)), other: sum(O.filter((r) => r.region !== 'EU').map((r) => r.qty)) }]],
   ['SELECT name, tier FROM customers WHERE tier <> 1 AND name LIKE \'c1_\' ORDER BY name', () => C.filter((c) => c.tier !== 1 && /^c1.$/.test(c.name)).sort((a, b) => byKey(a.name, b.name)).map(({ name, tier }) => ({ name, tier }))],
 ];
+// subqueries, set operations, window functions, percentiles (references in plain JS)
+const sorted = (xs) => xs.filter(present).sort((a, b) => a - b);
+const cont = (xs, p) => { const s = sorted(xs), m = s.length; if (!m) return NaN; const r = p * (m - 1), lo = Math.floor(r); return s[lo] + (r - lo) * (s[Math.min(m - 1, lo + 1)] - s[lo]); };
+const disc = (xs, p) => { const s = sorted(xs); return s.length ? s[Math.max(0, Math.ceil(p * s.length) - 1)] : NaN; };
+const day = (d) => Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+const monthly = () => [...groupRows(O, (r) => month(r.ts))].sort((a, b) => a[0] - b[0]).map(([m, rs]) => ({ m, n: rs.length }));
+const custs = (rows) => [...new Set(col(rows, 'cust'))].sort((a, b) => a - b);
+CASES.push(
+  ['WITH s AS (SELECT cust, SUM(qty) AS q FROM orders GROUP BY cust) SELECT cust, q FROM s WHERE q > 900 ORDER BY q DESC, cust LIMIT 5',
+    () => [...groupRows(O, (r) => r.cust)].map(([cust, rs]) => ({ cust, q: sum(col(rs, 'qty')) })).filter((r) => r.q > 900).sort((a, b) => b.q - a.q || a.cust - b.cust).slice(0, 5)],
+  ['WITH t(c, total) AS (SELECT cust, SUM(qty) FROM orders GROUP BY cust), u AS (SELECT * FROM t WHERE c < 10) SELECT MAX(total) AS m, COUNT(*) AS k FROM u',
+    () => { const g = [...groupRows(O.filter((r) => r.cust < 10), (r) => r.cust)].map(([, rs]) => sum(col(rs, 'qty'))); return [{ m: Math.max(...g), k: g.length }]; }],
+  ['SELECT c.name, t.n FROM (SELECT cust, COUNT(*) AS n FROM orders GROUP BY cust) AS t JOIN customers c ON t.cust = c.cust ORDER BY t.n DESC, c.name LIMIT 4',
+    () => [...groupRows(O.filter((r) => r.cust < 50), (r) => r.cust)].map(([cust, rs]) => ({ name: `c${cust}`, n: rs.length })).sort((a, b) => b.n - a.n || byKey(a.name, b.name)).slice(0, 4)],
+  ['SELECT COUNT(*) AS n FROM (SELECT cust FROM orders WHERE qty = 5 UNION ALL SELECT cust FROM customers) u', () => [{ n: O.filter((r) => r.qty === 5).length + C.length }]],
+  ['SELECT cust FROM orders WHERE price > 990 UNION SELECT cust FROM customers WHERE tier = 3 ORDER BY cust',
+    () => custs([...O.filter((r) => r.price > 990), ...C.filter((c) => c.tier === 3)]).map((cust) => ({ cust }))],
+  ['SELECT cust FROM orders WHERE price > 990 INTERSECT SELECT cust FROM customers WHERE tier = 3 ORDER BY 1',
+    () => custs(O.filter((r) => r.price > 990)).filter((c) => c < 50 && c % 3 === 2).map((cust) => ({ cust }))],
+  ['SELECT cust FROM orders EXCEPT (SELECT cust FROM customers) ORDER BY cust DESC', () => custs(O).filter((c) => c >= 50).reverse().map((cust) => ({ cust }))],
+  ["SELECT region AS r FROM orders WHERE cust = 1 UNION SELECT name FROM customers WHERE cust < 3 ORDER BY r",
+    () => [...new Set([...O.filter((r) => r.cust === 1).map((r) => r.region), 'c0', 'c1', 'c2'])].sort(byKey).map((r) => ({ r }))],
+  ['SELECT COUNT(*) AS n FROM orders WHERE cust IN (SELECT cust FROM customers WHERE tier = 2)', () => [{ n: O.filter((r) => r.cust < 50 && r.cust % 3 === 1).length }]],
+  ['SELECT COUNT(*) AS n FROM orders WHERE cust NOT IN (SELECT cust FROM customers)', () => [{ n: O.filter((r) => r.cust >= 50).length }]],
+  ["SELECT COUNT(*) AS n FROM orders WHERE region IN (SELECT region FROM orders WHERE price > 999 AND cust < 20)",
+    () => { const rs = new Set(O.filter((r) => r.price > 999 && r.cust < 20).map((r) => r.region)); return [{ n: O.filter((r) => rs.has(r.region)).length }]; }],
+  ['SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust = c.cust AND o.price > 995) ORDER BY name',
+    () => C.filter((c) => O.some((o) => o.cust === c.cust && o.price > 995)).map(({ name }) => ({ name })).sort((a, b) => byKey(a.name, b.name))],
+  ['SELECT COUNT(*) AS n FROM customers c WHERE NOT EXISTS (SELECT * FROM orders o WHERE c.cust = o.cust AND o.price > 999)',
+    () => [{ n: C.filter((c) => !O.some((o) => o.cust === c.cust && o.price > 999)).length }]],
+  ['SELECT COUNT(*) AS n FROM customers c WHERE c.tier IN (SELECT o.qty FROM orders o WHERE o.cust = c.cust AND o.price > 990)',
+    () => [{ n: C.filter((c) => O.some((o) => o.cust === c.cust && o.price > 990 && o.qty === c.tier)).length }]],
+  ['SELECT COUNT(*) AS n FROM orders WHERE price > (SELECT AVG(price) FROM orders)', () => { const a = avg(col(O, 'price')); return [{ n: O.filter((r) => r.price > a).length }]; }],
+  ['SELECT c.name, (SELECT MAX(o.price) FROM orders o WHERE o.cust = c.cust) AS mx, (SELECT COUNT(*) FROM orders o WHERE o.cust = c.cust AND o.qty = 5) AS n5 FROM customers c ORDER BY c.cust LIMIT 5',
+    () => C.slice(0, 5).map((c) => ({ name: c.name, mx: Math.max(...O.filter((o) => o.cust === c.cust).map((o) => o.price).filter(present)), n5: O.filter((o) => o.cust === c.cust && o.qty === 5).length }))],
+  ['SELECT COUNT(*) AS n FROM orders o WHERE o.price > (SELECT AVG(p.price) FROM orders p WHERE p.region = o.region)',
+    () => { const a = new Map([...groupRows(O, (r) => r.region)].map(([k, rs]) => [k, avg(col(rs, 'price'))])); return [{ n: O.filter((r) => r.price > a.get(r.region)).length }]; }],
+  ['SELECT cust, price, ROW_NUMBER() OVER (PARTITION BY cust ORDER BY price DESC, ts) AS rn FROM orders WHERE cust < 3 AND price IS NOT NULL ORDER BY cust, rn LIMIT 8',
+    () => { const rs = O.filter((r) => r.cust < 3 && present(r.price)).sort((a, b) => a.cust - b.cust || b.price - a.price || a.ts - b.ts); let k = 0; return rs.map((r, i) => ({ cust: r.cust, price: r.price, rn: (k = i && rs[i - 1].cust === r.cust ? k + 1 : 1) })).slice(0, 8); }],
+  ['SELECT region, cust, s FROM (SELECT region, cust, SUM(qty) AS s, RANK() OVER (PARTITION BY region ORDER BY SUM(qty) DESC) AS r FROM orders GROUP BY region, cust) t WHERE r <= 2 ORDER BY region, s DESC, cust',
+    () => [...groupRows(O, (r) => r.region)].sort((a, b) => byKey(a[0], b[0])).flatMap(([region, rs]) => {
+      const g = [...groupRows(rs, (r) => r.cust)].map(([cust, xs]) => ({ region, cust, s: sum(col(xs, 'qty')) }));
+      return g.filter((x) => g.filter((y) => y.s > x.s).length + 1 <= 2).sort((a, b) => b.s - a.s || a.cust - b.cust);
+    })],
+  ["SELECT d, n, SUM(n) OVER (ORDER BY d) AS running, n - LAG(n) OVER (ORDER BY d) AS change, AVG(n) OVER (ORDER BY d ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ma FROM (SELECT DATE_TRUNC('month', ts) AS d, COUNT(*) AS n FROM orders GROUP BY 1) m ORDER BY d",
+    () => { const ms = monthly(); let run = 0; return ms.map(({ m, n }, i) => ({ d: new Date(m), n, running: (run += n), change: i ? n - ms[i - 1].n : NaN, ma: avg(ms.slice(Math.max(0, i - 2), i + 1).map((x) => x.n)) })); }],
+  ["SELECT d, SUM(n) OVER (ORDER BY d RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW) AS wk, MAX(n) OVER (ORDER BY d DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS mx FROM (SELECT DATE_TRUNC('day', ts) AS d, COUNT(*) AS n FROM orders GROUP BY 1) x ORDER BY d LIMIT 20 OFFSET 100",
+    () => { const ds = [...groupRows(O, (r) => day(r.ts))].map(([d, rs]) => ({ d, n: rs.length })).sort((a, b) => a.d - b.d); return ds.map(({ d }, i) => ({ d: new Date(d), wk: sum(ds.filter((x) => x.d <= d && x.d >= d - 6 * 86_400_000).map((x) => x.n)), mx: Math.max(...ds.slice(Math.max(0, i - 1), i + 2).map((x) => x.n)) })).slice(100, 120); }],
+  ['SELECT region, MEDIAN(price) AS med, PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY qty) AS p90, PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY price) AS p25, COUNT(*) AS n FROM orders GROUP BY region ORDER BY region',
+    () => [...groupRows(O, (r) => r.region)].sort((a, b) => byKey(a[0], b[0])).map(([region, rs]) => ({ region, med: cont(col(rs, 'price'), 0.5), p90: cont(col(rs, 'qty'), 0.9), p25: disc(col(rs, 'price'), 0.25), n: rs.length }))],
+  ['SELECT MEDIAN(qty) AS m, PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY price DESC) AS p, QUANTILE_CONT(price, 0.3) AS q3 FROM orders',
+    () => [{ m: cont(col(O, 'qty'), 0.5), p: cont(col(O, 'price'), 0.9), q3: cont(col(O, 'price'), 0.3) }]],
+  ['SELECT cust, COUNT(*) OVER (PARTITION BY tier) AS n, DENSE_RANK() OVER (ORDER BY tier) AS dr, NTILE(4) OVER (ORDER BY cust) AS q, FIRST_VALUE(cust) OVER (PARTITION BY tier ORDER BY cust) AS f, LAST_VALUE(cust) OVER (PARTITION BY tier ORDER BY cust ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l, PERCENT_RANK() OVER (ORDER BY cust) AS pr, CUME_DIST() OVER (PARTITION BY tier ORDER BY cust) AS cd, LEAD(cust, 2, -1) OVER (PARTITION BY tier ORDER BY cust) AS ld, MIN(name) OVER () AS mn FROM customers ORDER BY cust',
+    () => C.map((c, i) => { const same = C.filter((x) => x.tier === c.tier), pos = same.indexOf(c); return { cust: c.cust, n: same.length, dr: c.tier, q: i < 26 ? Math.floor(i / 13) + 1 : 3 + Math.floor((i - 26) / 12), f: same[0].cust, l: same.at(-1).cust, pr: i / 49, cd: (pos + 1) / same.length, ld: same[pos + 2]?.cust ?? -1, mn: 'c0' }; })],
+  ['SELECT cust, qty, MEDIAN(price - 500) AS m, PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY -price) AS d FROM orders GROUP BY cust, qty ORDER BY cust, qty',
+    () => [...groupRows(O, (r) => r.cust * 10 + r.qty)].sort((a, b) => a[0] - b[0]).map(([k, rs]) => ({ cust: Math.floor(k / 10), qty: k % 10, m: cont(rs.map((r) => r.price - 500), 0.5), d: disc(rs.map((r) => -r.price), 0.5) }))],
+  ["SELECT tier, PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY name) AS mid, PERCENTILE_DISC(1) WITHIN GROUP (ORDER BY name) AS top FROM customers GROUP BY tier ORDER BY tier",
+    () => [1, 2, 3].map((tier) => { const ns = C.filter((c) => c.tier === tier).map((c) => c.name).sort(byKey); return { tier, mid: ns[Math.ceil(0.5 * ns.length) - 1], top: ns.at(-1) }; })],
+  ['SELECT 1 + 2 AS x, 10 / 4 AS y', () => [{ x: 3, y: 2.5 }]],
+  ['SELECT COUNT(*) AS n FROM customers a CROSS JOIN customers b WHERE a.tier = b.tier', () => [{ n: 17 * 17 + 17 * 17 + 16 * 16 }]],
+  ['SELECT cust, price FROM orders WHERE cust = 7 ORDER BY price NULLS FIRST, ts OFFSET 14 ROWS FETCH FIRST 5 ROWS ONLY',
+    () => O.filter((r) => r.cust === 7).sort((a, b) => (present(a.price) - present(b.price)) || (a.price - b.price) || a.ts - b.ts).slice(14, 19).map(({ cust, price }) => ({ cust, price }))],
+);
 const norm = (v) => (v instanceof Date ? v.getTime() : typeof v === 'number' ? (v !== v ? 'NaN' : Number(v.toPrecision(12))) : v);
 for (const [label, make] of [['threads', () => new Engine()], ['single thread', () => new Engine({ threads: 1 })], ['interpreter', () => new PortableEngine({ jit: false })]]) {
   const e = make();
@@ -89,6 +152,15 @@ for (const [label, make] of [['threads', () => new Engine()], ['single thread', 
     ["SELECT * FROM orders WHERE region = 'EU", 'not closed'],
     ['SELECT UPPER(region) FROM orders', 'unknown function UPPER'],
     ['SELECT * FROM orders LIMIT', 'LIMIT needs a number'],
+    ['SELECT cust FROM orders UNION SELECT cust, price FROM orders', 'same number of columns'],
+    ['SELECT region FROM orders UNION SELECT cust FROM orders', 'text'],
+    ['SELECT cust FROM orders WHERE ROW_NUMBER() OVER (ORDER BY cust) = 1', 'window functions'],
+    ['SELECT ROW_NUMBER() AS r FROM orders', 'needs OVER'],
+    ['SELECT cust FROM orders o WHERE price > (SELECT MAX(price) FROM prices p WHERE p.price > o.price)', 'outer query'],
+    ['SELECT * FROM orders o RIGHT JOIN customers c ON o.cust = c.cust', 'RIGHT JOIN'],
+    ['SELECT * FROM (SELECT cust FROM orders)', 'needs a name'],
+    ['SELECT PERCENTILE_CONT(0.5) FROM orders', 'WITHIN GROUP'],
+    ['SELECT cust FROM orders INTERSECT ALL SELECT cust FROM customers', 'INTERSECT ALL'],
   ]) {
     let msg = '';
     try { sql(query, tables).toRows(); } catch (err) { msg = err.message; }

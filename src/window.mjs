@@ -1,0 +1,147 @@
+// Window functions over rows already sorted by (partition keys, order keys):
+// each function gives one value per row, from the rows of its partition in
+// its frame. Plain loops, one pass each (running and moving sums from prefix
+// sums, moving min / max with a monotonic queue). Missing values (NaN) follow
+// SQL: sum / avg / min / max skip them, count(x) counts values present.
+//
+// spec items: { fn, arg (Float64Array | null), frame, offset, def, k, p }
+//   fn: row_number rank dense_rank percent_rank cume_dist ntile
+//       lag lead first_value last_value nth_value
+//       sum avg min max count (count with arg null: rows)
+//       percentile_cont percentile_disc (p; arg sorted within the partition)
+//   frame: { unit: 'rows' | 'range', start, end } with start / end each
+//       { kind: 'unbounded' | 'preceding' | 'following' | 'current', n }
+//       (null: SQL's default: with ORDER BY, RANGE from the partition start to
+//       the current row and its ties; without, the whole partition)
+
+const same = (a, b) => a === b || (a !== a && b !== b); // (NaN equals NaN here, as in GROUP BY)
+
+// Partition starts: part[i] = first row of row i's partition; peers likewise
+// for rows with equal order keys inside a partition.
+export function bounds(n, partKeys, orderKeys) {
+  const partStart = new Int32Array(n), partEnd = new Int32Array(n), peerStart = new Int32Array(n), peerEnd = new Int32Array(n);
+  let p = 0;
+  while (p < n) {
+    let q = p + 1;
+    while (q < n && partKeys.every((k) => same(k[q], k[p]))) q++;
+    for (let i = p; i < q; i++) { partStart[i] = p; partEnd[i] = q; }
+    let a = p;
+    while (a < q) {
+      let b = a + 1;
+      while (b < q && orderKeys.every((k) => same(k[b], k[a]))) b++;
+      for (let i = a; i < b; i++) { peerStart[i] = a; peerEnd[i] = b; }
+      a = b;
+    }
+    p = q;
+  }
+  return { partStart, partEnd, peerStart, peerEnd };
+}
+
+// Each row's frame [lo[i], hi[i]) (row indexes, within its partition).
+// orderKey: the single ORDER BY key, for RANGE with distances (desc: it falls).
+function frames(n, b, frame, hasOrder, orderKey, desc) {
+  const lo = new Int32Array(n), hi = new Int32Array(n);
+  const f = frame ?? (hasOrder ? { unit: 'range', start: { kind: 'unbounded' }, end: { kind: 'current' } } : { unit: 'rows', start: { kind: 'unbounded' }, end: { kind: 'unbounded' } });
+  const { partStart: ps, partEnd: pe, peerStart: qs, peerEnd: qe } = b;
+  const byValue = f.unit === 'range' && (f.start.n !== undefined || f.end.n !== undefined);
+  if (byValue && !orderKey) throw new Error('vectro: RANGE with a distance needs exactly one ORDER BY key, a number or date');
+  for (let i = 0; i < n; i++) {
+    for (const [e, isEnd] of [[f.start, false], [f.end, true]]) {
+      let at;
+      if (e.kind === 'unbounded') at = isEnd ? pe[i] : ps[i];
+      else if (f.unit === 'rows') {
+        const j = e.kind === 'current' ? i : e.kind === 'preceding' ? i - e.n : i + e.n;
+        at = Math.min(pe[i], Math.max(ps[i], isEnd ? j + 1 : j));
+      } else if (e.kind === 'current') at = isEnd ? qe[i] : qs[i]; // (RANGE: the current row and its ties)
+      else continue; // (RANGE n PRECEDING / FOLLOWING: by value, below)
+      if (isEnd) hi[i] = at; else lo[i] = at;
+    }
+  }
+  if (byValue) { // two pointers per partition over the keys, in their order
+    const sign = desc ? -1 : 1, off = (e) => (e.kind === 'preceding' ? -e.n : e.kind === 'following' ? e.n : 0);
+    for (let s = 0; s < n; s = pe[s]) {
+      const end = pe[s];
+      let a = s, z = s;
+      for (let i = s; i < end; i++) {
+        const v = sign * orderKey[i];
+        if (v !== v) { lo[i] = qs[i]; hi[i] = qe[i]; continue; } // (missing keys: their ties)
+        if (f.start.n !== undefined) { const t = v + off(f.start); while (a < end && sign * orderKey[a] < t) a++; lo[i] = a; }
+        if (f.end.n !== undefined) { const t = v + off(f.end); while (z < end && sign * orderKey[z] <= t) z++; hi[i] = z; }
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) if (hi[i] < lo[i]) hi[i] = lo[i]; // (an empty frame)
+  return { lo, hi };
+}
+
+// The values of one window function, for every row.
+export function windowValues(n, b, item, hasOrder, orderKey, desc) {
+  const out = new Float64Array(n);
+  const { partStart: ps, partEnd: pe, peerStart: qs, peerEnd: qe } = b;
+  const x = item.arg;
+  switch (item.fn) {
+    case 'row_number': for (let i = 0; i < n; i++) out[i] = i - ps[i] + 1; return out;
+    case 'rank': for (let i = 0; i < n; i++) out[i] = qs[i] - ps[i] + 1; return out;
+    case 'dense_rank': for (let i = 0, r = 0; i < n; i++) { if (i === ps[i]) r = 1; else if (qs[i] === i) r++; out[i] = r; } return out;
+    case 'percent_rank': for (let i = 0; i < n; i++) { const m = pe[i] - ps[i]; out[i] = m > 1 ? (qs[i] - ps[i]) / (m - 1) : 0; } return out;
+    case 'cume_dist': for (let i = 0; i < n; i++) out[i] = (qe[i] - ps[i]) / (pe[i] - ps[i]); return out;
+    case 'ntile': for (let i = 0; i < n; i++) { // the first (m mod k) tiles get one row more
+      const m = pe[i] - ps[i], k = item.k, j = i - ps[i], small = Math.floor(m / k), big = m % k;
+      out[i] = j < big * (small + 1) ? Math.floor(j / (small + 1)) + 1 : big + Math.floor((j - big * (small + 1)) / Math.max(1, small)) + 1;
+    } return out;
+    case 'lag': case 'lead': {
+      const k = (item.fn === 'lag' ? -1 : 1) * (item.offset ?? 1);
+      for (let i = 0; i < n; i++) { const j = i + k; out[i] = j >= ps[i] && j < pe[i] ? x[j] : (item.def ?? NaN); }
+      return out;
+    }
+    case 'percentile_cont': case 'percentile_disc': { // over the partition's values present (sorted: the window orders by the value)
+      for (let s = 0; s < n; ) {
+        const e = pe[s];
+        let a = s, z = e; // present values: NaN sort last
+        while (z > a && x[z - 1] !== x[z - 1]) z--;
+        const m = z - a;
+        let v = NaN;
+        if (m) {
+          if (item.fn === 'percentile_disc') v = x[a + Math.max(0, Math.ceil(item.p * m) - 1)];
+          else { const r = item.p * (m - 1), lo = Math.floor(r); v = x[a + lo] + (r - lo) * ((x[a + Math.min(m - 1, lo + 1)]) - x[a + lo]); }
+        }
+        out.fill(v, s, e);
+        s = e;
+      }
+      return out;
+    }
+  }
+  // functions of the frame
+  const { lo, hi } = frames(n, b, item.frame, hasOrder, orderKey, desc);
+  switch (item.fn) {
+    case 'first_value': for (let i = 0; i < n; i++) out[i] = hi[i] > lo[i] ? x[lo[i]] : NaN; return out;
+    case 'last_value': for (let i = 0; i < n; i++) out[i] = hi[i] > lo[i] ? x[hi[i] - 1] : NaN; return out;
+    case 'nth_value': for (let i = 0; i < n; i++) { const j = lo[i] + item.k - 1; out[i] = j < hi[i] ? x[j] : NaN; } return out;
+    case 'sum': case 'avg': case 'count': {
+      // prefix sums of the values present, and of how many are present
+      const s = new Float64Array(n + 1), c = new Float64Array(n + 1);
+      for (let i = 0; i < n; i++) { const v = x ? x[i] : 1; const ok = v === v; s[i + 1] = s[i] + (ok ? v : 0); c[i + 1] = c[i] + (ok ? 1 : 0); }
+      for (let i = 0; i < n; i++) {
+        const cnt = c[hi[i]] - c[lo[i]], sum = s[hi[i]] - s[lo[i]];
+        out[i] = item.fn === 'count' ? cnt : item.fn === 'avg' ? (cnt ? sum / cnt : NaN) : cnt ? sum : NaN; // (sum of nothing: NULL)
+      }
+      if (item.fn === 'sum' && item.exactSmall !== false) { // short frames: add directly (prefix differences lose digits)
+        for (let i = 0; i < n; i++) if (hi[i] - lo[i] <= 64) { let t = 0, m = 0; for (let j = lo[i]; j < hi[i]; j++) { const v = x[j]; if (v === v) { t += v; m++; } } out[i] = m ? t : NaN; }
+      }
+      return out;
+    }
+    case 'min': case 'max': { // frames only move forward: a monotonic queue of candidates
+      const better = item.fn === 'min' ? (a, c) => a <= c : (a, c) => a >= c;
+      const q = new Int32Array(n);
+      let head = 0, tail = 0, added = 0, part = -1;
+      for (let i = 0; i < n; i++) {
+        if (ps[i] !== part) { part = ps[i]; head = tail = 0; added = ps[i]; }
+        while (added < hi[i]) { const v = x[added]; if (v === v) { while (tail > head && better(v, x[q[tail - 1]])) tail--; q[tail++] = added; } added++; }
+        while (tail > head && q[head] < lo[i]) head++;
+        out[i] = tail > head ? x[q[head]] : NaN;
+      }
+      return out;
+    }
+  }
+  throw new Error(`vectro: unknown window function ${item.fn}`);
+}

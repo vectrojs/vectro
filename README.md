@@ -101,20 +101,59 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
       { orders, customers }).toRows();
   ```
 
-  SELECT [DISTINCT], FROM with aliases, [INNER | LEFT] JOIN ... ON / USING,
-  WHERE, GROUP BY (columns, expressions, select aliases or positions),
-  HAVING, ORDER BY ... ASC/DESC, LIMIT / OFFSET; COUNT(*), COUNT(x),
-  COUNT(DISTINCT x), SUM, AVG, MIN, MAX, APPROX_COUNT_DISTINCT anywhere in
-  SELECT / HAVING / ORDER BY; BETWEEN, IN, LIKE, IS [NOT] NULL, CASE, %,
-  COALESCE, NULLIF, ROUND, LEAST, GREATEST, CAST, DATE / TIMESTAMP literals,
-  INTERVAL '7 days', EXTRACT, DATE_TRUNC, YEAR(), MONTH()... It compiles to
-  the planner below, so SQL gets every optimization. Text can be compared,
-  matched and grouped but not computed (no `||` or UPPER). The MCP server has
+  SELECT [DISTINCT], FROM with aliases, [INNER | LEFT | CROSS] JOIN ... ON /
+  USING, WHERE, GROUP BY (columns, expressions, select aliases or positions),
+  HAVING, ORDER BY ... ASC/DESC [NULLS FIRST | LAST], LIMIT / OFFSET / FETCH
+  FIRST; COUNT(*), COUNT(x), COUNT(DISTINCT x), SUM, AVG, MIN, MAX,
+  APPROX_COUNT_DISTINCT, MEDIAN, PERCENTILE_CONT / PERCENTILE_DISC WITHIN GROUP
+  (ORDER BY x), QUANTILE_CONT anywhere in SELECT / HAVING / ORDER BY; BETWEEN,
+  IN, LIKE, IS [NOT] NULL, CASE, %, COALESCE, NULLIF, ROUND, LEAST, GREATEST,
+  CAST, DATE / TIMESTAMP literals, INTERVAL '7 days', EXTRACT, DATE_TRUNC,
+  YEAR(), MONTH()... It compiles to the planner below, so SQL gets every
+  optimization, on tables and on datasets bigger than memory.
+
+  **Subqueries and set operations:** WITH (CTEs, with column names too),
+  subqueries in FROM and JOIN, UNION [ALL] / INTERSECT / EXCEPT, SELECT
+  without FROM, and in expressions IN (SELECT ...), EXISTS (SELECT ...) and
+  (SELECT one value), correlated too when the link is an equality (`WHERE
+  o.cust = c.cust`). Every subquery becomes a join, so the whole statement is
+  one plan with no row-by-row loops.
+
+  **Window functions:** `f(...) OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS
+  | RANGE BETWEEN ... AND ...])` with ROW_NUMBER, RANK, DENSE_RANK,
+  PERCENT_RANK, CUME_DIST, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE,
+  NTH_VALUE, SUM, AVG, MIN, MAX, COUNT; frames by rows or by value (`RANGE
+  BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW`), over grouped results
+  too (`RANK() OVER (PARTITION BY region ORDER BY SUM(qty) DESC)`). Running
+  and moving sums use prefix sums, and moving MIN / MAX use a monotonic queue,
+  so each window costs one pass after its sort.
+
+  ```js
+  sql(`SELECT region, cust, spend FROM (
+         SELECT region, cust, SUM(price) AS spend,
+                RANK() OVER (PARTITION BY region ORDER BY SUM(price) DESC) AS r
+         FROM orders WHERE cust IN (SELECT cust FROM customers WHERE tier = 1)
+         GROUP BY region, cust) t
+       WHERE r <= 3 ORDER BY region, spend DESC`, { orders, customers }).toRows();
+  ```
+
+  `compare/check-sql.mjs` runs 24 such queries (CTEs, set operations,
+  correlated subqueries, windows, percentiles, missing values) in Vectro and
+  DuckDB on the same 200K rows; every answer is the same. Not yet: RIGHT /
+  FULL JOIN, INTERSECT ALL / EXCEPT ALL, correlation on anything but
+  equalities, and computing text (`||`, UPPER): text can be compared, matched
+  and grouped. The MCP server has
   a `sql` tool. The same SQL text vs DuckDB on 10M orders + 100K customers
   (`compare/bench-sql.mjs`, answers checked): filtered totals 3.0 vs 9.5 ms,
   group by region 6.6 vs 31.8 ms, join + filter + group 21.4 vs 30.6 ms, top 10
   customers 9.8 vs 45.0 ms, top 20 rows 8.7 vs 24.5 ms, CASE inside SUM 6.0 vs
-  36.7 ms; distinct customers per month is slower (144 vs 74 ms).
+  36.7 ms; distinct customers per month is slower (144 vs 74 ms). The new
+  parts, same run: correlated subquery 17.6 vs 57.6 ms, IN (subquery) 30.8 vs
+  27.5 ms, top 3 per region with RANK 131 vs 127 ms, running total by day 18.6
+  vs 15.3 ms; slower: MEDIAN per region 165 vs 78 ms and ROW_NUMBER over all
+  10M rows 416 vs 213 ms (a full sort, on one thread). Window functions and
+  percentiles gather all their rows, so on a dataset they need its rows (the
+  columns used) to fit in memory.
 - **Lazy queries (a planner):** `t.lazy()` records a chain (`filter`, `derive`,
   `select`, `join`, `groupBy().agg`, `sort`, `limit`/`top`) and optimizes it as a
   whole before running it with `collect()`, `toRows()`, `agg()` or `count()`

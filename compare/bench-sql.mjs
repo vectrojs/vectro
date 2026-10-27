@@ -18,6 +18,12 @@ const QUERIES = [
   ['distinct customers per month', 'SELECT EXTRACT(YEAR FROM ts) * 100 + EXTRACT(MONTH FROM ts) AS ym, COUNT(DISTINCT cust) AS customers FROM orders GROUP BY 1 ORDER BY 1'],
   ['top 20 rows by price', 'SELECT cust, price, qty, region FROM orders WHERE region <> \'US\' ORDER BY price DESC, cust LIMIT 20'],
   ['CASE inside SUM', "SELECT region, SUM(CASE WHEN qty >= 5 THEN price ELSE 0 END) AS big FROM orders GROUP BY region HAVING SUM(qty) > 0 ORDER BY big DESC"],
+  ['IN (subquery)', 'SELECT region, COUNT(*) AS n FROM orders WHERE cust IN (SELECT cust FROM customers WHERE tier = 1) GROUP BY region ORDER BY region'],
+  ['correlated subquery', 'SELECT COUNT(*) AS n FROM orders o WHERE o.price > (SELECT AVG(p.price) FROM orders p WHERE p.region = o.region)'],
+  ['top 3 per region (RANK)', 'SELECT region, cust, spend FROM (SELECT region, cust, SUM(price * qty) AS spend, RANK() OVER (PARTITION BY region ORDER BY SUM(price * qty) DESC) AS r FROM orders GROUP BY region, cust) t WHERE r <= 3 ORDER BY region, spend DESC, cust'],
+  ['ROW_NUMBER over all rows', 'SELECT COUNT(*) AS n, SUM(rn) AS s FROM (SELECT ROW_NUMBER() OVER (PARTITION BY cust ORDER BY ts) AS rn FROM orders) t WHERE rn <= 3'],
+  ['running total by day', "SELECT d, SUM(n) OVER (ORDER BY d) AS running FROM (SELECT DATE_TRUNC('day', ts) AS d, COUNT(*) AS n FROM orders GROUP BY 1) x ORDER BY d"],
+  ['median per region', 'SELECT region, MEDIAN(price) AS m FROM orders GROUP BY region ORDER BY region'],
 ];
 const csvOf = (name) => join(tmpdir(), `vectro-sql-${name}-${N}.csv`);
 function rng(seed) { return () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }

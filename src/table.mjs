@@ -14,6 +14,8 @@ import { maxUnits } from './kernels.mjs';
 import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { joinTablesG, joinViewG } from './join.mjs';
 import { Query } from './plan.mjs';
+import { bounds, windowValues } from './window.mjs';
+import { copyRows } from './rows.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
 import { DATE_FNS, DATE_RESULT, parseDateText, toMillis } from './dates.mjs';
@@ -314,7 +316,8 @@ export class Table {
     yield* this.engine.evalG(src, this.#vars(merged), out);
     const top = parse(expr);
     const date = (top.t === 'call' && DATE_RESULT.has(top.fn)) || (top.t === 'var' && !!this.cols.get(top.name)?.date); // dayStart(ts), monthStart(ts)...: still dates
-    const cols = new Map(this.cols).set(name, { data: out, dict: null, codes: null, date });
+    const same = top.t === 'var' ? this.cols.get(top.name) : null; // a copy of a text column stays text
+    const cols = new Map(this.cols).set(name, { data: out, dict: same?.dict ?? null, codes: same?.dict ? same.codes : null, date });
     return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params, owned: [name] });
   }
 
@@ -978,6 +981,112 @@ export class Table {
   sort(by) { return this.engine._drive(this.#sortG(by)); }
   sortAsync(by) { return this.engine._driveAsync(this.#sortG(by)); }
 
+  // (SQL window functions, see window.mjs) The rows, sorted by the partition
+  // keys and then the order keys, with one new column per item:
+  //   spec = { partition: [names], order: [{ name, desc }], items: [{ name,
+  //     fn, arg (a column name or null), frame, offset, def, k, p }] }
+  _window(spec) { return this.engine._drive(this.#windowG(spec)); }
+  _windowAsync(spec) { return this.engine._driveAsync(this.#windowG(spec)); }
+
+  *#windowG({ partition = [], order = [], items }) {
+    const { engine } = this;
+    if (items.length && order.length === 1 && !order[0].desc && items.every((it) => (it.fn === 'percentile_cont' || it.fn === 'percentile_disc') && it.arg === order[0].name) && !this.cols.get(order[0].name)?.dict) return yield* this.#percentilesG(partition, items); // (text: by its sorted labels, below)
+    const by = [...partition, ...order.map((o) => `${o.desc ? '-' : ''}${o.name}`)];
+    const t = by.length ? yield* this.#sortG(by) : yield* this.#collectG();
+    const n = t.n, f32 = t.type === Float32Array;
+    const values = (name) => { // a column's values (codes for text), plain
+      const c = t.cols.get(name);
+      if (!c) throw new Error(`vectro: no column "${name}"`);
+      if (c.strings) throw new Error(`vectro: window functions can't read the free-text column "${name}"`);
+      const d = engine.live(c.data), out = new Float64Array(n);
+      if (c.enc) for (let i = 0; i < n; i++) out[i] = decodeOne(c.enc, d[i], f32); else out.set(d.subarray(0, n));
+      return out;
+    };
+    const b = bounds(n, partition.map(values), order.map((o) => values(o.name)));
+    const orderKey = order.length === 1 ? values(order[0].name) : null;
+    const cols = new Map(t.cols), owned = t === this ? [] : [...t.owned];
+    if (t !== this) t.owned = [];
+    const KEEPS_KIND = new Set(['lag', 'lead', 'first_value', 'last_value', 'nth_value', 'min', 'max', 'percentile_disc']);
+    for (const it of items) {
+      if (cols.has(it.name)) throw new Error(`vectro: column "${it.name}" already exists`);
+      const vals = windowValues(n, b, { ...it, arg: it.arg ? values(it.arg) : null }, order.length > 0, orderKey, order[0]?.desc);
+      const data = engine.alloc(t.type, n);
+      engine.live(data).set(vals);
+      const src = it.arg && KEEPS_KIND.has(it.fn) ? t.cols.get(it.arg) : null; // (text stays text, dates stay dates)
+      cols.set(it.name, { data, dict: src?.dict ?? null, codes: src?.codes ?? null, date: src?.date || (it.fn === 'percentile_cont' && t.cols.get(it.arg)?.date) || undefined });
+      owned.push(it.name);
+    }
+    for (const c of cols.values()) c.data = engine.live(c.data);
+    return new Table(engine, cols, n, { owned, zones: false });
+  }
+
+  // Percentiles of each partition, for every row, without sorting the table:
+  // rows numbered by partition (as for groupBy), each partition's values
+  // gathered (a counting sort by partition number), the ranks needed picked
+  // with quickselect. Rows stay in their order.
+  *#percentilesG(partition, items) {
+    const { engine } = this;
+    const t = yield* this.#collectG();
+    const n = t.n, f32 = t.type === Float32Array;
+    const plainOf = (c, data = c.data) => { const d = engine.live(data), out = new Float64Array(n); if (c.enc) for (let i = 0; i < n; i++) out[i] = decodeOne(c.enc, d[i], f32); else out.set(d.subarray(0, n)); return out; };
+    let K = 1, g = null;
+    if (partition.length && n) {
+      for (const k of partition) if (!t.cols.has(k)) throw new Error(`vectro: no column "${k}"`);
+      const ids = (yield* t.#directGroups(partition, 1)) ?? (engine.jit && n >= 4096 ? yield* t.#hashGroupsParallelG(partition) : t.#hashGroups(partition));
+      try { K = ids.K; g = ids.enc ? Int32Array.from(plainOf({ enc: ids.enc }, ids.data)) : toInt32(engine.live(ids.data), n); } finally { if (ids.owned) engine.free(ids.data); for (const x of ids.extra ?? []) engine.free(x); }
+    }
+    const cols = new Map(t.cols), owned = t === this ? [] : [...t.owned];
+    if (t !== this) t.owned = [];
+    const valuesOf = (arg) => {
+      const c = t.cols.get(arg);
+      if (!c) throw new Error(`vectro: no column "${arg}"`);
+      if (c.strings) throw new Error(`vectro: window functions can't read the free-text column "${arg}"`);
+      return !c.enc && !f32 ? engine.live(c.data).subarray(0, n) : plainOf(c); // (read only)
+    };
+    // the ranks each item needs in each partition, then picked all at once per column
+    const byArg = new Map();
+    for (const it of items) {
+      if (cols.has(it.name)) throw new Error(`vectro: column "${it.name}" already exists`);
+      if (!byArg.has(it.arg)) byArg.set(it.arg, []);
+      byArg.get(it.arg).push(it);
+    }
+    const per = new Map();
+    for (const [arg, its] of byArg) {
+      const got = percentiles(valuesOf(arg), g, K, its);
+      its.forEach((it, j) => per.set(it, got[j]));
+    }
+    for (const it of items) {
+      const per1 = per.get(it);
+      const data = engine.alloc(t.type, n), d = engine.live(data);
+      if (g) spread(d, per1, g, n); else d.fill(per1[0] ?? NaN, 0, n);
+      const src = it.fn === 'percentile_disc' ? t.cols.get(it.arg) : null; // (text stays text, dates stay dates)
+      cols.set(it.name, { data, dict: src?.dict ?? null, codes: src?.codes ?? null, date: t.cols.get(it.arg)?.date || undefined });
+      owned.push(it.name);
+    }
+    for (const c of cols.values()) c.data = engine.live(c.data);
+    return new Table(engine, cols, n, { owned, zones: false });
+  }
+
+  // (SQL UNION ALL) this table's rows, then each other's, as a new table;
+  // columns by position, named as this table's.
+  _concat(others) {
+    const names = this.columnNames;
+    const parts = [this, ...others].map((t) => {
+      const tn = t.columnNames;
+      if (tn.length !== names.length) throw new Error(`vectro: UNION needs the same number of columns on each side (${names.length} and ${tn.length})`);
+      const kind = (c) => (c.strings ? 'free text' : c.dict ? 'text' : 'number');
+      const cols = new Map(names.map((nm, k) => {
+        const c = t.cols.get(tn[k]), want = this.cols.get(nm);
+        if (kind(c) !== kind(want)) throw new Error(`vectro: UNION column ${k + 1} is ${kind(want)} on one side and ${kind(c)} on another`);
+        return [nm, c];
+      }));
+      const v = new Table(t.engine, cols, t.n, { pred: t.pred, params: t.params });
+      return v.pred ? v.collect() : v;
+    });
+    try { return copyRows(this.engine, parts.map((t) => [t, 0, t.n])); } finally { for (const p of parts) if (p.owned.length) p.dispose(); }
+  }
+  async _concatAsync(others) { return this._concat(others); }
+
   // top(k, by): the first k rows of sort(by), e.g. top(10, '-revenue') for
   // the 10 largest, without sorting everything: rows are kept only if their
   // first key is at most a cutoff estimated from a sample (counted and
@@ -1393,4 +1502,86 @@ export function rewriteText(ast, cols, src) {
     return n;
   };
   return fix(ast);
+}
+
+// Percentiles of each partition (items: { fn: 'percentile_cont' |
+// 'percentile_disc', p }): x the values (NaN skipped), g each row's partition
+// 0..K-1 (null: one). Returns one Float64Array(K) per item. With few
+// partitions, a radix pick: each value's top 16 bits in sortable order are
+// counted, then only the values in the buckets holding the wanted ranks are
+// gathered and selected among (two passes over x, in order). With many
+// (small) partitions, each one's values are gathered and selected among.
+function percentiles(x, g, K, items) {
+  const n = x.length, radix = K <= 64 && n >= 4096, B = 65536;
+  const sizes = new Int32Array(K);
+  let hist = null, hi = null;
+  if (radix) {
+    hist = new Int32Array(K * B);
+    hi = new Int32Array(x.buffer, x.byteOffset, n * 2); // (signed: stays a small integer in V8)
+    if (g) { for (let i = 0; i < n; i++) { const v = x[i]; if (v === v) { const h = hi[2 * i + 1]; hist[g[i] * B + (h < 0 ? ~h >>> 16 : (h >>> 16) | 0x8000)]++; } } } // (negatives reversed)
+    else for (let i = 0; i < n; i++) { const v = x[i]; if (v === v) { const h = hi[2 * i + 1]; hist[h < 0 ? ~h >>> 16 : (h >>> 16) | 0x8000]++; } }
+    for (let k = 0; k < K; k++) { let m = 0; for (let b = k * B, e = b + B; b < e; b++) m += hist[b]; sizes[k] = m; }
+  } else if (g) { for (let i = 0; i < n; i++) if (x[i] === x[i]) sizes[g[i]]++; } else for (let i = 0; i < n; i++) if (x[i] === x[i]) sizes[0]++;
+  // the ranks wanted (0 = the smallest value present)
+  const wants = [];
+  const plan = items.map((it) => Array.from(sizes, (m, k) => {
+    if (!m) return null;
+    if (it.fn === 'percentile_disc') { wants.push([k, Math.max(0, Math.ceil(it.p * m) - 1)]); return { at: wants.length - 1 }; }
+    const r = it.p * (m - 1), lo = Math.floor(r);
+    wants.push([k, lo]);
+    if (lo + 1 < m && r > lo) { wants.push([k, lo + 1]); return { at: wants.length - 2, frac: r - lo }; }
+    return { at: wants.length - 1 };
+  }));
+  const got = new Float64Array(wants.length);
+  if (!radix) {
+    const start = new Int32Array(K + 1);
+    for (let k = 0; k < K; k++) start[k + 1] = start[k] + sizes[k];
+    const at = start.slice(0, K), buf = new Float64Array(start[K]);
+    for (let i = 0; i < n; i++) { const v = x[i]; if (v === v) buf[at[g ? g[i] : 0]++] = v; }
+    wants.forEach(([k, r], j) => { got[j] = select(buf, start[k], start[k + 1], start[k] + r); });
+  } else if (wants.length) {
+    // each wanted rank's bucket, and its rank within the bucket
+    const slotOf = new Map(), place = [];
+    for (const [k, r] of wants) {
+      let b = 0, below = 0;
+      const h0 = k * B;
+      while (below + hist[h0 + b] <= r) below += hist[h0 + b++];
+      if (!slotOf.has(h0 + b)) slotOf.set(h0 + b, slotOf.size);
+      place.push([slotOf.get(h0 + b), r - below]);
+    }
+    const slot = new Int32Array(K * B).fill(-1);
+    const bufs = [...slotOf.keys()].map((key, j) => { slot[key] = j; return new Float64Array(hist[key]); }), fill = new Int32Array(bufs.length);
+    for (let i = 0; i < n; i++) {
+      const v = x[i];
+      if (v !== v) continue;
+      const h = hi[2 * i + 1], j = slot[(g ? g[i] * B : 0) + (h < 0 ? ~h >>> 16 : (h >>> 16) | 0x8000)];
+      if (j >= 0) bufs[j][fill[j]++] = v;
+    }
+    place.forEach(([j, r], w) => { got[w] = select(bufs[j], 0, bufs[j].length, r); });
+  }
+  return plan.map((ws) => Float64Array.from(ws, (w) => (!w ? NaN : w.frac ? got[w.at] + w.frac * (got[w.at + 1] - got[w.at]) : got[w.at])));
+}
+function toInt32(a, n) { const out = new Int32Array(n); for (let i = 0; i < n; i++) out[i] = a[i]; return out; }
+function spread(d, per, g, n) { for (let i = 0; i < n; i++) d[i] = per[g[i]]; }
+
+// The k-th smallest of a[lo..hi) (quickselect, in place: afterwards a[k] is
+// it, smaller values before it, larger after).
+function select(a, lo, hi, k) {
+  let l = lo, r = hi - 1;
+  while (r > l) {
+    if (r - l < 16) { for (let i = l + 1; i <= r; i++) { const v = a[i]; let j = i - 1; while (j >= l && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; } break; }
+    const m = (l + r) >> 1; // median of three as the pivot
+    if (a[m] < a[l]) { const x = a[m]; a[m] = a[l]; a[l] = x; }
+    if (a[r] < a[l]) { const x = a[r]; a[r] = a[l]; a[l] = x; }
+    if (a[r] < a[m]) { const x = a[r]; a[r] = a[m]; a[m] = x; }
+    const pivot = a[m];
+    let i = l, j = r;
+    while (i <= j) {
+      while (a[i] < pivot) i++;
+      while (a[j] > pivot) j--;
+      if (i <= j) { const x = a[i]; a[i] = a[j]; a[j] = x; i++; j--; }
+    }
+    if (k <= j) r = j; else if (k >= i) l = i; else break;
+  }
+  return a[k];
 }

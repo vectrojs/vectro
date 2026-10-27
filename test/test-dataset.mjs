@@ -427,6 +427,37 @@ for (const [label, make] of engines) {
   await e.close();
 }
 
+// SQL with subqueries, set operations and window functions: a dataset gives
+// what the table gives (sync and async)
+{
+  const e = new Engine();
+  const t = e.table(cols);
+  writeDataset(e, file('sqlw.vectro'), t, { rowsPerChunk: 7000 });
+  const ds = e.openDataset(file('sqlw.vectro'));
+  const cs = e.table({ cust: customers.cust, tier: customers.tier });
+  for (const q of [
+    'WITH s AS (SELECT cust, SUM(qty) AS q FROM orders GROUP BY cust) SELECT cust, q FROM s ORDER BY q DESC, cust LIMIT 5',
+    'SELECT cust FROM orders WHERE price > 999 UNION SELECT cust FROM customers WHERE tier = 3 AND cust < 30 ORDER BY cust',
+    'SELECT cust FROM orders EXCEPT SELECT cust FROM customers ORDER BY cust LIMIT 20',
+    'SELECT COUNT(*) AS n FROM (SELECT cust FROM orders UNION ALL SELECT cust FROM orders WHERE qty = 1) u',
+    'SELECT COUNT(*) AS n FROM orders WHERE cust IN (SELECT cust FROM customers WHERE tier = 2)',
+    'SELECT COUNT(*) AS n FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust = c.cust AND o.price > 990)',
+    'SELECT COUNT(*) AS n FROM orders o WHERE o.price > (SELECT AVG(p.price) FROM orders p WHERE p.region = o.region)',
+    'SELECT region, cust, s FROM (SELECT region, cust, SUM(qty) AS s, RANK() OVER (PARTITION BY region ORDER BY SUM(qty) DESC) AS r FROM orders GROUP BY region, cust) t WHERE r <= 2 ORDER BY region, s DESC, cust',
+    'SELECT cust, price, ROW_NUMBER() OVER (PARTITION BY cust ORDER BY price DESC, ts) AS rn FROM orders WHERE cust < 9 AND price IS NOT NULL ORDER BY cust, rn LIMIT 30',
+    'SELECT region, MEDIAN(price) AS m, PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY qty) AS p FROM orders GROUP BY region ORDER BY region',
+    "SELECT COUNT(lp) AS n, SUM(lp) AS s FROM (SELECT LAG(price) OVER (PARTITION BY region ORDER BY ts) AS lp FROM orders) x",
+  ]) {
+    const want = sql(q, { orders: t, customers: cs }).toRows();
+    let got, gotAsync;
+    try { got = sql(q, { orders: ds, customers: cs }).toRows(); gotAsync = await sql(q, { orders: ds, customers: cs }).toRowsAsync(); } catch (err) { check(false, `${q}: ${err.message}`); continue; }
+    same(got, want, `dataset SQL: ${q}`);
+    same(gotAsync, want, `dataset SQL async: ${q}`);
+  }
+  await ds.close();
+  await e.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} dataset checks passed`);
 process.exit(failures ? 1 : 0);

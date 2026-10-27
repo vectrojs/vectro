@@ -1,24 +1,36 @@
-// SQL on Vectro tables: sql(text, { orders, customers }) returns a lazy query
-// (see plan.mjs) — call .toRows(), .collect(), .count() or .explain().
+// SQL on Vectro tables and datasets: sql(text, { orders, customers }) returns
+// a lazy query (see plan.mjs): call .toRows(), .collect(), .count() or
+// .explain() (or their Async versions).
 //
-//   SELECT [DISTINCT] items FROM t [AS a]
-//     [[INNER | LEFT [OUTER]] JOIN u [AS b] ON a.x = b.y [AND ...] | USING (x, ...)]...
+//   [WITH name [(cols)] AS (query), ...]
+//   SELECT [DISTINCT] items [FROM t [AS a] | (query) [AS] a
+//     [[INNER | LEFT [OUTER] | CROSS] JOIN u [AS b] | (query) b [ON a.x = b.y [AND ...] | USING (x, ...)]]...]
 //     [WHERE cond] [GROUP BY exprs] [HAVING cond]
-//     [ORDER BY expr [ASC | DESC], ...] [LIMIT n [OFFSET m]]
+//   [UNION [ALL] | INTERSECT | EXCEPT SELECT ...]...
+//   [ORDER BY expr [ASC | DESC] [NULLS FIRST | LAST], ...] [LIMIT n | FETCH FIRST n ROWS ONLY] [OFFSET m]
 //
 // Expressions: numbers, 'text', DATE '2024-01-01', TIMESTAMP '...', INTERVAL
 // '7 days', NULL, TRUE / FALSE; + - * / %; = <> != < <= > >=; AND OR NOT;
-// BETWEEN, IN (...), LIKE, IS [NOT] NULL, CASE WHEN ... THEN ... ELSE ... END;
+// BETWEEN, IN (...), IN (SELECT ...), EXISTS (SELECT ...), (SELECT one value),
+// LIKE, IS [NOT] NULL, CASE WHEN ... THEN ... ELSE ... END;
 // ABS SQRT FLOOR CEIL ROUND LEAST GREATEST COALESCE IFNULL NULLIF CAST
-// YEAR MONTH DAY HOUR MINUTE SECOND EXTRACT(part FROM x) DATE_TRUNC('month', x)
-// and the aggregates COUNT(*) COUNT(x) COUNT(DISTINCT x) SUM AVG MIN MAX
-// APPROX_COUNT_DISTINCT, anywhere in SELECT / HAVING / ORDER BY.
-// Text values can be compared, matched and grouped, not computed.
+// YEAR MONTH DAY HOUR MINUTE SECOND EXTRACT(part FROM x) DATE_TRUNC('month', x);
+// aggregates COUNT(*) COUNT(x) COUNT(DISTINCT x) SUM AVG MIN MAX
+// APPROX_COUNT_DISTINCT MEDIAN PERCENTILE_CONT(p) / PERCENTILE_DISC(p) WITHIN
+// GROUP (ORDER BY x) QUANTILE_CONT(x, p), anywhere in SELECT / HAVING / ORDER BY;
+// window functions f(...) OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS | RANGE
+// BETWEEN ... AND ...]): ROW_NUMBER RANK DENSE_RANK PERCENT_RANK CUME_DIST NTILE
+// LAG LEAD FIRST_VALUE LAST_VALUE NTH_VALUE and SUM AVG MIN MAX COUNT.
+//
+// Subqueries become joins, so the whole query stays one plan: IN / EXISTS
+// join the subquery's distinct keys (correlated ones on their equalities:
+// WHERE b.k = a.k), a single-value subquery joins its one row (correlated
+// ones: grouped by the correlation keys).
 
-import { Query } from './plan.mjs';
+import { Query, namesOf } from './plan.mjs';
 import { quoteText } from './fuse.mjs';
 
-const KEYWORDS = new Set(['SELECT', 'DISTINCT', 'FROM', 'AS', 'JOIN', 'INNER', 'LEFT', 'OUTER', 'ON', 'USING', 'WHERE', 'GROUP', 'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'AND', 'OR', 'NOT', 'BETWEEN', 'IN', 'LIKE', 'IS', 'NULL', 'TRUE', 'FALSE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'NULLS', 'FIRST', 'LAST', 'CAST', 'DATE', 'TIMESTAMP', 'INTERVAL', 'EXTRACT', 'ALL']);
+const KEYWORDS = new Set(['SELECT', 'DISTINCT', 'FROM', 'AS', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'ON', 'USING', 'WHERE', 'GROUP', 'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'AND', 'OR', 'NOT', 'BETWEEN', 'IN', 'LIKE', 'IS', 'NULL', 'TRUE', 'FALSE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'NULLS', 'FIRST', 'LAST', 'CAST', 'DATE', 'TIMESTAMP', 'INTERVAL', 'EXTRACT', 'ALL', 'EXISTS', 'UNION', 'INTERSECT', 'EXCEPT', 'WITH']);
 
 class SqlError extends SyntaxError {}
 const fail = (msg) => { throw new SqlError(`vectro SQL: ${msg}`); };
@@ -46,7 +58,7 @@ function tokenize(src) {
     if (c === '"' || c === '`') { // "quoted name"
       const e = src.indexOf(c, i + 1);
       if (e < 0) fail('a quoted name is not closed');
-      toks.push({ t: 'id', v: src.slice(i + 1, e) });
+      toks.push({ t: 'id', v: src.slice(i + 1, e), quoted: true });
       i = e + 1;
       continue;
     }
@@ -68,24 +80,33 @@ function tokenize(src) {
 }
 
 // ---- parser ---------------------------------------------------------------------------------
-function parseSql(src) {
+// Words that are keywords only where they're expected (columns may be named so).
+const SOFT = new Set(['OVER', 'PARTITION', 'ROWS', 'RANGE', 'UNBOUNDED', 'PRECEDING', 'FOLLOWING', 'CURRENT', 'ROW', 'WITHIN', 'FETCH', 'NEXT', 'ONLY', 'FILTER']);
+
+function parseStatement(src) {
   const toks = tokenize(src);
   let p = 0;
   const peek = (o = 0) => toks[p + o];
   const isKw = (v, o = 0) => peek(o)?.t === 'kw' && peek(o).v === v;
+  const isWord = (v, o = 0) => isKw(v, o) || (peek(o)?.t === 'id' && !peek(o).quoted && peek(o).v.toUpperCase() === v);
   const isOp = (v, o = 0) => peek(o)?.t === 'op' && peek(o).v === v;
   const eatKw = (v) => { if (isKw(v)) { p++; return true; } return false; };
+  const eatWord = (v) => { if (isWord(v)) { p++; return true; } return false; };
   const eatOp = (v) => { if (isOp(v)) { p++; return true; } return false; };
   const needKw = (v) => { if (!eatKw(v)) fail(`expected ${v} ${near()}`); };
+  const needWord = (v) => { if (!eatWord(v)) fail(`expected ${v} ${near()}`); };
   const needOp = (v) => { if (!eatOp(v)) fail(`expected "${v}" ${near()}`); };
   const near = () => (peek() ? `near "${peek().v}"` : 'at the end');
   const ident = () => { const t = peek(); if (t?.t !== 'id') fail(`expected a name ${near()}`); p++; return t.v; };
+  const startsQuery = (o = 0) => isKw('SELECT', o) || isKw('WITH', o);
+  const aliasNext = () => peek()?.t === 'id' && !(SOFT.has(peek().v.toUpperCase()) && !peek().quoted && ['OVER', 'WITHIN', 'FETCH', 'FILTER'].includes(peek().v.toUpperCase()));
 
   function expr() { return or(); }
   function or() { let l = and(); while (eatKw('OR')) l = { k: 'bin', op: 'OR', l, r: and() }; return l; }
   function and() { let l = not(); while (eatKw('AND')) l = { k: 'bin', op: 'AND', l, r: not() }; return l; }
   function not() { if (eatKw('NOT')) return { k: 'not', x: not() }; return cmp(); }
   function cmp() {
+    if (isKw('EXISTS')) { p++; needOp('('); const q = query(); needOp(')'); return { k: 'exists', q }; }
     const l = add();
     const negate = (x) => ({ k: 'not', x });
     if (isKw('IS')) {
@@ -98,6 +119,7 @@ function parseSql(src) {
     if (eatKw('BETWEEN')) { const lo = add(); needKw('AND'); const hi = add(); const e = { k: 'between', x: l, lo, hi }; return neg ? negate(e) : e; }
     if (eatKw('IN')) {
       needOp('(');
+      if (startsQuery()) { const q = query(); needOp(')'); const e = { k: 'insub', x: l, q }; return neg ? negate(e) : e; }
       const list = [expr()];
       while (eatOp(',')) list.push(expr());
       needOp(')');
@@ -114,7 +136,7 @@ function parseSql(src) {
     for (;;) {
       if (eatOp('+')) l = { k: 'bin', op: '+', l, r: mul() };
       else if (eatOp('-')) l = { k: 'bin', op: '-', l, r: mul() };
-      else if (isOp('||')) fail('text can be compared and grouped, not joined with ||');
+      else if (eatOp('||')) l = { k: 'call', fn: 'CONCAT', args: [l, mul()] };
       else return l;
     }
   }
@@ -138,15 +160,54 @@ function parseSql(src) {
     const t = peek();
     if (!t || (t.t !== 'id' && t.t !== 'kw')) fail(`expected a type ${near()}`);
     p++;
-    if (eatOp('(')) { while (!eatOp(')')) p++; } // DECIMAL(10, 2)
+    if (eatOp('(')) { while (!eatOp(')')) p++; } // DECIMAL(10, 2), VARCHAR(20)
     return t.v.toUpperCase();
+  }
+  function orderItems() {
+    const out = [];
+    do {
+      const e = expr();
+      let desc = false, nullsFirst = false;
+      if (eatKw('DESC')) desc = true; else eatKw('ASC');
+      if (eatKw('NULLS')) { if (eatKw('FIRST')) nullsFirst = true; else needKw('LAST'); }
+      out.push({ e, desc, nullsFirst });
+    } while (eatOp(','));
+    return out;
+  }
+  function frameBound() {
+    if (eatWord('UNBOUNDED')) { if (eatWord('PRECEDING')) return { kind: 'unbounded' }; needWord('FOLLOWING'); return { kind: 'unbounded' }; }
+    if (eatWord('CURRENT')) { needWord('ROW'); return { kind: 'current' }; }
+    const n = add();
+    if (eatWord('PRECEDING')) return { kind: 'preceding', x: n };
+    needWord('FOLLOWING');
+    return { kind: 'following', x: n };
+  }
+  function windowSpec() {
+    needOp('(');
+    const partition = [];
+    if (eatWord('PARTITION')) { needKw('BY'); do partition.push(expr()); while (eatOp(',')); }
+    const order = eatKw('ORDER') ? (needKw('BY'), orderItems()) : [];
+    let frame = null;
+    if (isWord('ROWS') || isWord('RANGE')) {
+      const unit = peek().v.toUpperCase() === 'ROWS' ? 'rows' : 'range';
+      p++;
+      if (eatKw('BETWEEN')) { const start = frameBound(); needKw('AND'); frame = { unit, start, end: frameBound() }; }
+      else frame = { unit, start: frameBound(), end: { kind: 'current' } };
+    }
+    needOp(')');
+    return { partition, order, frame };
   }
   function primary() {
     const t = peek();
     if (!t) fail('the query ends too early');
     if (t.t === 'num') { p++; return { k: 'num', v: t.v }; }
     if (t.t === 'str') { p++; return { k: 'str', v: t.v }; }
-    if (eatOp('(')) { const e = expr(); needOp(')'); return e; }
+    if (eatOp('(')) {
+      if (startsQuery()) { const q = query(); needOp(')'); return { k: 'subq', q }; }
+      const e = expr();
+      needOp(')');
+      return e;
+    }
     if (t.t === 'kw') {
       if (eatKw('NULL')) return { k: 'null' };
       if (eatKw('TRUE')) return { k: 'num', v: 1 };
@@ -154,7 +215,7 @@ function parseSql(src) {
       if (isKw('DATE') || isKw('TIMESTAMP')) {
         if (peek(1)?.t === 'str') { p++; return { k: 'date', v: toks[p++].v }; }
       }
-      if (eatKw('INTERVAL')) { const s = peek(); if (s?.t !== 'str') fail("INTERVAL needs text, e.g. INTERVAL '7 days'"); p++; return { k: 'interval', v: s.v, unit: peek()?.t === 'id' ? ident() : null }; }
+      if (eatKw('INTERVAL')) { const s = peek(); if (s?.t !== 'str') fail("INTERVAL needs text, e.g. INTERVAL '7 days'"); p++; return { k: 'interval', v: s.v, unit: peek()?.t === 'id' && !SOFT.has(peek().v.toUpperCase()) ? ident() : null }; }
       if (eatKw('CASE')) {
         const base = isKw('WHEN') ? null : expr();
         const whens = [];
@@ -173,20 +234,12 @@ function parseSql(src) {
         needOp(')');
         return { k: 'call', fn: String(part.v).toUpperCase(), args: [x] };
       }
+      if ((isKw('LEFT') || isKw('RIGHT')) && isOp('(', 1)) { const fn = peek().v; p++; return call(fn); } // LEFT(text, n)
       fail(`unexpected ${t.v} ${near()}`);
     }
     if (t.t === 'id') {
       p++;
-      if (eatOp('(')) { // a function
-        const fn = t.v.toUpperCase();
-        if (eatOp('*')) { needOp(')'); return { k: 'call', fn, args: [], star: true }; }
-        const distinct = eatKw('DISTINCT');
-        eatKw('ALL');
-        const args = [];
-        if (!isOp(')')) { args.push(expr()); while (eatOp(',')) args.push(expr()); }
-        needOp(')');
-        return { k: 'call', fn, args, distinct };
-      }
+      if (isOp('(')) return call(t.v.toUpperCase());
       if (eatOp('.')) {
         if (eatOp('*')) return { k: 'star', table: t.v };
         return { k: 'col', table: t.v, name: ident() };
@@ -196,59 +249,129 @@ function parseSql(src) {
     if (eatOp('*')) return { k: 'star' };
     fail(`unexpected "${t.v}"`);
   }
-
-  // SELECT ...
-  needKw('SELECT');
-  const distinct = eatKw('DISTINCT');
-  eatKw('ALL');
-  const items = [];
-  do {
-    const e = expr();
-    let alias = null;
-    if (eatKw('AS')) alias = ident();
-    else if (peek()?.t === 'id') alias = ident();
-    items.push({ e, alias });
-  } while (eatOp(','));
-  needKw('FROM');
-  const tableRef = () => { const name = ident(); let alias = name; if (eatKw('AS')) alias = ident(); else if (peek()?.t === 'id') alias = ident(); return { name, alias }; };
-  const from = tableRef();
-  const joins = [];
-  for (;;) {
-    let how = null;
-    if (eatKw('JOIN')) how = 'inner';
-    else if (isKw('INNER')) { p++; needKw('JOIN'); how = 'inner'; }
-    else if (isKw('LEFT')) { p++; eatKw('OUTER'); needKw('JOIN'); how = 'left'; }
-    else if (isOp(',')) fail('use JOIN ... ON instead of commas between tables');
-    if (!how) break;
-    const ref = tableRef();
-    if (eatKw('USING')) { needOp('('); const cols = [ident()]; while (eatOp(',')) cols.push(ident()); needOp(')'); joins.push({ ...ref, how, using: cols }); }
-    else { needKw('ON'); joins.push({ ...ref, how, on: expr() }); }
+  function call(fn) { // after the name: (args) [WITHIN GROUP (ORDER BY x)] [OVER (...)]
+    needOp('(');
+    let e;
+    if (eatOp('*')) { needOp(')'); e = { k: 'call', fn, args: [], star: true }; }
+    else {
+      const distinct = eatKw('DISTINCT');
+      eatKw('ALL');
+      const args = [];
+      if (!isOp(')')) { args.push(expr()); while (eatOp(',')) args.push(expr()); }
+      needOp(')');
+      e = { k: 'call', fn, args, distinct };
+    }
+    if (eatWord('WITHIN')) { needKw('GROUP'); needOp('('); needKw('ORDER'); needKw('BY'); const [o] = orderItems(); needOp(')'); e.within = o; }
+    if (eatWord('OVER')) return { k: 'window', call: e, ...windowSpec() };
+    return e;
   }
-  const where = eatKw('WHERE') ? expr() : null;
-  let groupBy = [];
-  if (eatKw('GROUP')) { needKw('BY'); do groupBy.push(expr()); while (eatOp(',')); }
-  const having = eatKw('HAVING') ? expr() : null;
-  const orderBy = [];
-  if (eatKw('ORDER')) {
-    needKw('BY');
+
+  function fromItem() {
+    if (eatOp('(')) {
+      if (!startsQuery()) fail(`expected a subquery (SELECT ...) ${near()}`);
+      const q = query();
+      needOp(')');
+      eatKw('AS');
+      if (peek()?.t !== 'id') fail('a subquery in FROM needs a name: (SELECT ...) AS name');
+      return { q, alias: ident() };
+    }
+    const name = ident();
+    let alias = name;
+    if (eatKw('AS')) alias = ident(); else if (aliasNext()) alias = ident();
+    return { name, alias };
+  }
+  function selectCore() {
+    needKw('SELECT');
+    const distinct = eatKw('DISTINCT');
+    eatKw('ALL');
+    const items = [];
     do {
       const e = expr();
-      let desc = false;
-      if (eatKw('DESC')) desc = true; else eatKw('ASC');
-      if (eatKw('NULLS')) { if (eatKw('FIRST')) fail('NULLS FIRST is not supported (missing values sort last)'); needKw('LAST'); }
-      orderBy.push({ e, desc });
+      let alias = null;
+      if (eatKw('AS')) alias = ident();
+      else if (aliasNext()) alias = ident();
+      items.push({ e, alias });
     } while (eatOp(','));
+    let from = null;
+    const joins = [];
+    if (eatKw('FROM')) {
+      from = fromItem();
+      for (;;) {
+        let how = null;
+        if (eatKw('JOIN')) how = 'inner';
+        else if (isKw('INNER')) { p++; needKw('JOIN'); how = 'inner'; }
+        else if (isKw('LEFT')) { p++; eatKw('OUTER'); needKw('JOIN'); how = 'left'; }
+        else if (isKw('RIGHT') || isKw('FULL')) { const w = peek().v; p++; eatKw('OUTER'); needKw('JOIN'); how = w.toLowerCase(); }
+        else if (isKw('CROSS')) { p++; needKw('JOIN'); how = 'cross'; }
+        else if (isOp(',')) fail('use JOIN ... ON instead of commas between tables');
+        if (!how) break;
+        const ref = fromItem();
+        if (how === 'cross') { joins.push({ ...ref, how }); continue; }
+        if (eatKw('USING')) { needOp('('); const cols = [ident()]; while (eatOp(',')) cols.push(ident()); needOp(')'); joins.push({ ...ref, how, using: cols }); }
+        else { needKw('ON'); joins.push({ ...ref, how, on: expr() }); }
+      }
+    }
+    const where = eatKw('WHERE') ? expr() : null;
+    const groupBy = [];
+    if (eatKw('GROUP')) { needKw('BY'); do groupBy.push(expr()); while (eatOp(',')); }
+    const having = eatKw('HAVING') ? expr() : null;
+    return { k: 'select', distinct, items, from, joins, where, groupBy, having };
   }
-  let limit = null, offset = 0;
-  if (eatKw('LIMIT')) { const t = peek(); if (t?.t !== 'num') fail('LIMIT needs a number'); p++; limit = t.v; }
-  if (eatKw('OFFSET')) { const t = peek(); if (t?.t !== 'num') fail('OFFSET needs a number'); p++; offset = t.v; }
+  function setTerm() {
+    if (isOp('(') && startsQuery(1)) { p++; const q = query(); needOp(')'); return q; }
+    return selectCore();
+  }
+  // query: WITH, set operations, then ORDER BY / LIMIT for the whole
+  function query() {
+    const ctes = [];
+    if (eatKw('WITH')) {
+      do {
+        const name = ident();
+        let cols = null;
+        if (eatOp('(')) { cols = [ident()]; while (eatOp(',')) cols.push(ident()); needOp(')'); }
+        needKw('AS');
+        needOp('(');
+        const q = query();
+        needOp(')');
+        ctes.push({ name, cols, q });
+      } while (eatOp(','));
+    }
+    let body = setTerm();
+    for (;;) {
+      let op = null;
+      if (eatKw('UNION')) op = eatKw('ALL') ? 'union all' : (eatKw('DISTINCT'), 'union');
+      else if (eatKw('INTERSECT')) { if (eatKw('ALL')) fail('INTERSECT ALL is not supported (INTERSECT is)'); eatKw('DISTINCT'); op = 'intersect'; }
+      else if (eatKw('EXCEPT')) { if (eatKw('ALL')) fail('EXCEPT ALL is not supported (EXCEPT is)'); eatKw('DISTINCT'); op = 'except'; }
+      if (!op) break;
+      body = { k: 'setop', op, left: body, right: setTerm() };
+    }
+    const orderBy = eatKw('ORDER') ? (needKw('BY'), orderItems()) : [];
+    let limit = null, offset = 0;
+    if (eatKw('LIMIT')) {
+      if (eatKw('ALL')) limit = null;
+      else { const t = peek(); if (t?.t !== 'num') fail('LIMIT needs a number'); p++; limit = t.v; }
+    }
+    if (eatKw('OFFSET')) { const t = peek(); if (t?.t !== 'num') fail('OFFSET needs a number'); p++; offset = t.v; eatWord('ROWS') || eatWord('ROW'); }
+    if (eatWord('FETCH')) {
+      if (!eatKw('FIRST')) needWord('NEXT');
+      const t = peek(); if (t?.t !== 'num') fail('FETCH FIRST needs a number'); p++; limit = t.v;
+      if (!eatWord('ROWS')) needWord('ROW');
+      needWord('ONLY');
+    }
+    return { k: 'query', ctes, body, orderBy, limit, offset };
+  }
+
+  const q = query();
   eatOp(';');
-  if (p < toks.length) fail(`unexpected "${peek().v}" (one SELECT at a time)`);
-  return { distinct, items, from, joins, where, groupBy, having, orderBy, limit, offset };
+  if (p < toks.length) fail(`unexpected "${peek().v}" (one statement at a time)`);
+  return q;
 }
 
 // ---- translation ------------------------------------------------------------------------------
 const AGG = { COUNT: 'count', SUM: 'sum', AVG: 'mean', MEAN: 'mean', MIN: 'min', MAX: 'max', APPROX_COUNT_DISTINCT: 'approxDistinct' };
+const PERCENTILE = new Set(['MEDIAN', 'PERCENTILE_CONT', 'PERCENTILE_DISC', 'QUANTILE_CONT', 'QUANTILE_DISC', 'QUANTILE']);
+const WINDOW_FNS = { ROW_NUMBER: 'row_number', RANK: 'rank', DENSE_RANK: 'dense_rank', PERCENT_RANK: 'percent_rank', CUME_DIST: 'cume_dist', NTILE: 'ntile', LAG: 'lag', LEAD: 'lead', FIRST_VALUE: 'first_value', LAST_VALUE: 'last_value', NTH_VALUE: 'nth_value', SUM: 'sum', AVG: 'avg', MEAN: 'avg', MIN: 'min', MAX: 'max', COUNT: 'count' };
+const KEEPS_KIND = new Set(['lag', 'lead', 'first_value', 'last_value', 'nth_value', 'min', 'max']);
 const DATE_PART = { YEAR: 'year', MONTH: 'month', DAY: 'day', HOUR: 'hour', MINUTE: 'minute', SECOND: 'second', ISODOW: 'weekday', DAYOFMONTH: 'day' };
 const TRUNC = { year: 'yearStart', month: 'monthStart', week: 'weekStart', day: 'dayStart', hour: 'hourStart' };
 const INTERVAL_MS = { millisecond: 1, second: 1000, minute: 60_000, hour: 3_600_000, day: 86_400_000, week: 604_800_000 };
@@ -258,96 +381,321 @@ const v = (name) => ({ t: 'var', name });
 const bin = (op, l, r) => ({ t: 'bin', op, l, r });
 const call = (fn, ...args) => ({ t: 'call', fn, args });
 const cond = (c, x, y) => ({ t: 'cond', c, x, y });
-const isAgg = (e) => e.k === 'call' && (AGG[e.fn] || e.fn === 'COUNT');
+const constNum = (t) => (t.t === 'num' ? t.v : t.t === 'un' && t.op === '-' && t.x.t === 'num' ? -t.x.v : null);
+const isAgg = (e) => e.k === 'call' && (AGG[e.fn] || PERCENTILE.has(e.fn));
 const key = (e) => JSON.stringify(e);
-function hasAgg(e) {
+// does e contain a node matching test (not looking inside subqueries or windows' own calls)?
+function has(e, test, intoWindows = false) {
   let found = false;
   const visit = (x) => {
-    if (!x || typeof x !== 'object') return;
-    if (isAgg(x)) { found = true; return; }
+    if (found || !x || typeof x !== 'object') return;
+    if (test(x)) { found = true; return; }
+    if (x.k === 'subq' || x.k === 'exists' || x.k === 'query') return;
+    if (x.k === 'insub') { visit(x.x); return; }
+    if (x.k === 'window' && !intoWindows) { for (const y of [...x.partition, ...x.order.map((o) => o.e), ...x.call.args]) visit(y); return; }
     for (const val of Object.values(x)) if (Array.isArray(val)) val.forEach(visit); else if (val && typeof val === 'object') visit(val);
   };
   visit(e);
   return found;
 }
+const hasAgg = (e) => has(e, isAgg);
+const hasWindow = (e) => has(e, (x) => x.k === 'window');
+const conjuncts = (e) => (!e ? [] : e.k === 'bin' && e.op === 'AND' ? [...conjuncts(e.l), ...conjuncts(e.r)] : [e]);
+const andAll = (list) => (list.length ? list.reduce((a, b) => ({ k: 'bin', op: 'AND', l: a, r: b })) : null);
 
 // sql(text, tables) -> Query
 export function sql(text, tables = {}) {
-  const ast = parseSql(String(text));
-  const lookup = (name) => {
-    const t = tables[name] ?? Object.entries(tables).find(([k]) => k.toLowerCase() === name.toLowerCase())?.[1];
-    if (!t) fail(`no table "${name}" (tables: ${Object.keys(tables).join(', ') || 'none given'})`);
-    return t;
+  const ast = parseStatement(String(text));
+  const engine = Object.values(tables).find((t) => t?.engine)?.engine ?? null;
+  return compileQuery(ast, { tables, ctes: new Map(), engine, n: { hidden: 0 } }, null).query;
+}
+
+// A relation: { query, names, kinds (name -> 'text' | 'date' | 'number') }.
+const kindOfTable = (t, col) => { const c = t.cols?.get(col); return c?.dict || c?.strings ? 'text' : c?.date ? 'date' : 'number'; };
+function tableRelation(t) {
+  return { query: t.lazy(), names: t.columnNames, kinds: new Map(t.columnNames.map((n) => [n, kindOfTable(t, n)])) };
+}
+
+function compileQuery(q, env, outer) {
+  let scopeEnv = env;
+  if (q.ctes.length) { // WITH: later ones and the body see earlier ones
+    scopeEnv = { ...env, ctes: new Map(env.ctes) };
+    for (const c of q.ctes) {
+      let rel = compileQuery(c.q, scopeEnv, outer);
+      if (c.cols) {
+        if (c.cols.length !== rel.names.length) fail(`WITH ${c.name}(${c.cols.join(', ')}) names ${c.cols.length} columns, its query has ${rel.names.length}`);
+        rel = renameRelation(rel, c.cols);
+      }
+      scopeEnv.ctes.set(c.name.toLowerCase(), rel);
+    }
+  }
+  if (q.body.k === 'select') return compileSelect(q.body, scopeEnv, outer, q);
+  // set operations: then ORDER BY / LIMIT on the result's columns
+  let rel = compileSet(q.body, scopeEnv, outer);
+  let out = rel.query;
+  if (q.orderBy.length) {
+    const by = [];
+    for (const o of q.orderBy) {
+      let name = null;
+      if (o.e.k === 'num') name = rel.names[o.e.v - 1] ?? fail(`ORDER BY ${o.e.v}: there is no column ${o.e.v}`);
+      else if (o.e.k === 'col' && !o.e.table) name = rel.names.find((n) => n.toLowerCase() === o.e.name.toLowerCase()) ?? fail(`ORDER BY ${o.e.name}: a UNION is ordered by its columns`);
+      else fail('a UNION / INTERSECT / EXCEPT is ordered by its column names or numbers');
+      if (o.nullsFirst) { const h = `__nf${env.n.hidden++}`; out = out.derive(h, `${name} == ${name} ? 1 : 0`); by.push(h); }
+      by.push(o.desc ? `-${name}` : name);
+    }
+    out = out.sort(by);
+  }
+  if (q.limit !== null) out = out.limit(q.limit, q.offset);
+  else if (q.offset) fail('OFFSET needs LIMIT');
+  return { ...rel, query: out.select(...rel.names) };
+}
+
+function renameRelation(rel, names) {
+  let q = rel.query;
+  const kinds = new Map();
+  const tmp = rel.names.map((n, k) => `__r${k}_${n}`);
+  rel.names.forEach((n, k) => { q = q.derive(tmp[k], n); });
+  rel.names.forEach((n, k) => { kinds.set(names[k], rel.kinds.get(n)); });
+  // (derive copies values; text and date columns keep their kind through a plain copy)
+  let out = q.select(...tmp);
+  tmp.forEach((t, k) => { out = out.derive(names[k], t); });
+  return { query: out.select(...names), names, kinds };
+}
+
+function compileSet(body, env, outer) {
+  if (body.k === 'query') return compileQuery(body, env, outer);
+  if (body.k === 'select') return compileSelect(body, env, outer, { orderBy: [], limit: null, offset: 0 });
+  const L = compileSet(body.left, env, outer), R = compileSet(body.right, env, outer);
+  if (L.names.length !== R.names.length) fail(`${body.op.toUpperCase()} needs the same number of columns on each side (${L.names.length} and ${R.names.length})`);
+  L.names.forEach((n, k) => {
+    const a = L.kinds.get(n), b = R.kinds.get(R.names[k]);
+    if ((a === 'text') !== (b === 'text')) fail(`${body.op.toUpperCase()} column ${k + 1} is ${a} on one side and ${b} on the other`);
+  });
+  const names = L.names;
+  const right = R.query; // (columns by position; named as the left's)
+  if (body.op === 'union all') return { query: Query.union([L.query, right]), names, kinds: L.kinds };
+  if (body.op === 'union') return { query: Query.union([L.query, right]).groupBy(names).agg({ __u: 'count()' }).select(...names), names, kinds: L.kinds };
+  // INTERSECT / EXCEPT: both sides marked, grouped by every column
+  const mark = (rel, m) => rel.query.derive('__src', String(m)).select(...rel.names, '__src');
+  const grouped = Query.union([mark(L, 1), mark(R, 2)]).groupBy(names).agg({ __mn: 'min(__src)', __mx: 'max(__src)' });
+  const kept = body.op === 'intersect' ? grouped.filter('__mn == 1 && __mx == 2') : grouped.filter('__mx == 1');
+  return { query: kept.select(...names), names, kinds: L.kinds };
+}
+
+// FROM item -> relation
+function relationOf(item, env, outer) {
+  if (item.q) return compileQuery(item.q, env, outer);
+  const cte = env.ctes.get(item.name.toLowerCase());
+  if (cte) return cte;
+  const { tables } = env;
+  const t = tables[item.name] ?? Object.entries(tables).find(([k]) => k.toLowerCase() === item.name.toLowerCase())?.[1];
+  if (!t) fail(`no table "${item.name}" (tables: ${Object.keys(tables).join(', ') || 'none given'})`);
+  return tableRelation(t);
+}
+
+// The names a SELECT's FROM can see, without compiling it: [{ alias, names }]
+function scopeNamesOf(sel, env) {
+  if (!sel.from) return [];
+  const one = (item) => {
+    if (item.q) {
+      const body = item.q.body;
+      if (body.k === 'select' && body.items.every((it) => it.alias || it.e.k === 'col')) return { alias: item.alias, names: body.items.map((it) => it.alias ?? it.e.name) };
+      return { alias: item.alias, names: compileQuery(item.q, env, null).names };
+    }
+    const cte = env.ctes.get(item.name.toLowerCase());
+    const t = cte ?? env.tables[item.name] ?? Object.entries(env.tables).find(([k]) => k.toLowerCase() === item.name.toLowerCase())?.[1];
+    return { alias: item.alias, names: cte ? cte.names : t?.columnNames ?? [] };
   };
+  return [one(sel.from), ...sel.joins.map(one)];
+}
 
-  // FROM and JOINs: the query's columns, and how each table's columns are named in it
-  const first = lookup(ast.from.name);
-  let q = first.lazy();
-  const scope = [{ alias: ast.from.alias, table: first, names: new Map(first.columnNames.map((n) => [n, n])) }];
-  let outNames = [...first.columnNames];
-  const kindOfTable = (t, col) => { const c = t.cols?.get(col); return c?.dict || c?.strings ? 'text' : c?.date ? 'date' : 'number'; };
-  const kinds = new Map(first.columnNames.map((n) => [n, kindOfTable(first, n)]));
+function compileSelect(ast, env, outer, tail) {
+  const n = env.n;
+  // FROM and JOINs: the query's columns, and how each relation's columns are named in it
+  let first;
+  if (ast.from) first = relationOf(ast.from, env, outer);
+  else { // SELECT without FROM: one row
+    if (!env.engine) fail('SELECT without FROM needs at least one table given (for its engine)');
+    first = tableRelation(env.engine.table({ __one: [0] }));
+  }
+  let q = first.query;
+  const scope = [{ alias: ast.from?.alias ?? '', rel: first, names: new Map(first.names.map((x) => [x, x])) }];
+  const outNames = [...first.names];
+  const kinds = new Map(first.names.map((x) => [x, first.kinds.get(x)]));
 
-  const resolve = (ref) => { // { table?, name } -> output column name
+  // a column reference -> its output name (or, if outer resolves it, an outer marker)
+  const find = (ref) => {
     if (ref.table) {
       const s = scope.find((x) => x.alias.toLowerCase() === ref.table.toLowerCase());
-      if (!s) fail(`no table or alias "${ref.table}"`);
-      const out = s.names.get(ref.name) ?? [...s.names].find(([n]) => n.toLowerCase() === ref.name.toLowerCase())?.[1];
+      if (!s) return null;
+      const out = s.names.get(ref.name) ?? [...s.names].find(([x]) => x.toLowerCase() === ref.name.toLowerCase())?.[1];
       if (!out) fail(`table "${ref.table}" has no column "${ref.name}"`);
       return out;
     }
     const hits = scope.filter((s) => s.names.has(ref.name));
     if (!hits.length) {
-      const ci = scope.flatMap((s) => [...s.names].filter(([n]) => n.toLowerCase() === ref.name.toLowerCase()).map(([, o]) => o));
+      const ci = [...new Set(scope.flatMap((s) => [...s.names].filter(([x]) => x.toLowerCase() === ref.name.toLowerCase()).map(([, o]) => o)))];
       if (ci.length === 1) return ci[0];
-      fail(`no column "${ref.name}"`);
+      if (ci.length > 1) fail(`column "${ref.name}" is ambiguous`);
+      return null;
     }
     const outs = new Set(hits.map((s) => s.names.get(ref.name)));
     if (outs.size > 1) fail(`column "${ref.name}" is ambiguous: write ${hits.map((s) => `${s.alias}.${ref.name}`).join(' or ')}`);
     return [...outs][0];
   };
+  const resolve = (ref) => {
+    const out = find(ref);
+    if (out !== null) return out;
+    if (ref.table && !scope.some((s) => s.alias.toLowerCase() === ref.table.toLowerCase())) {
+      if (outer?.canSee(ref)) fail(`"${ref.table}.${ref.name}" belongs to the outer query: a subquery can use outer columns only in WHERE equalities (WHERE inner.x = outer.y)`);
+      fail(`no table or alias "${ref.table}"`);
+    }
+    if (outer?.canSee(ref)) fail(`"${ref.name}" belongs to the outer query: a subquery can use outer columns only in WHERE equalities (WHERE inner.x = outer.y)`);
+    fail(`no column "${ref.name}"`);
+  };
+  const canSee = (ref) => { try { return find(ref) !== null; } catch { return true; } };
+
+  // hidden columns: a name for an expression's AST (a column as it is)
+  const hide = (t, prefix = '__h') => {
+    if (t.t === 'var') return t.name;
+    const name = `${prefix}${n.hidden++}`;
+    q = q.derive(name, src(t));
+    return name;
+  };
 
   for (const j of ast.joins) {
-    const right = lookup(j.name);
-    const rs = { alias: j.alias, table: right, names: new Map() };
+    const right = relationOf(j, env, outer);
+    const rs = { alias: j.alias, rel: right, names: new Map() };
+    const rightHas = (name) => right.names.includes(name);
     let on;
     const extra = []; // ON conditions that aren't key equalities (inner joins only)
-    if (j.using) on = { left: j.using.map((c) => resolve({ name: c })), right: j.using };
+    if (j.how === 'right' || j.how === 'full') fail(`${j.how.toUpperCase()} JOIN is not supported yet (LEFT JOIN with the tables swapped works for RIGHT JOIN)`);
+    let rq = right.query;
+    if (j.how === 'cross') { // every pair: both sides on one constant key
+      const k = `__x${n.hidden++}`;
+      q = q.derive(k, '0');
+      rq = rq.derive(k, '0');
+      on = { left: [k], right: [k] };
+    } else if (j.using) on = { left: j.using.map((c) => resolve({ name: c })), right: j.using };
     else {
       const lefts = [], rights = [];
       const conds = [];
-      const flat = (e) => (e.k === 'bin' && e.op === 'AND' ? [...flat(e.l), ...flat(e.r)] : [e]);
-      for (const c of flat(j.on)) {
-        const side = (ref) => (ref.k !== 'col' ? null : (ref.table ? ref.table.toLowerCase() === j.alias.toLowerCase() : right.cols?.has(ref.name) && !scope.some((s) => s.names.has(ref.name))) ? 'right' : 'left');
+      for (const c of conjuncts(j.on)) {
+        const side = (ref) => (ref.k !== 'col' ? null : (ref.table ? ref.table.toLowerCase() === j.alias.toLowerCase() : rightHas(ref.name) && !scope.some((s) => s.names.has(ref.name))) ? 'right' : 'left');
         if (c.k === 'bin' && c.op === '=' && side(c.l) && side(c.r) && side(c.l) !== side(c.r)) {
           const [l, r] = side(c.l) === 'left' ? [c.l, c.r] : [c.r, c.l];
-          if (!right.cols?.has(r.name)) fail(`table "${j.name}" has no column "${r.name}"`);
+          if (!rightHas(r.name)) fail(`table "${j.name ?? j.alias}" has no column "${r.name}"`);
           lefts.push(resolve(l)); rights.push(r.name);
         } else conds.push(c);
       }
-      if (!lefts.length) fail(`JOIN ${j.name} needs ON with an equality between the two sides, e.g. ON a.id = b.id`);
+      if (!lefts.length) fail(`JOIN ${j.name ?? j.alias} needs ON with an equality between the two sides, e.g. ON a.id = b.id`);
       if (conds.length && j.how === 'left') fail('LEFT JOIN ... ON takes key equalities only (move other conditions to WHERE)');
       on = { left: lefts, right: rights };
       extra.push(...conds);
     }
     // output names, as the join makes them: right key columns named like the left key go away
-    const sameKey = new Set(on.right.filter((n, k) => on.left[k] === n));
-    for (const n of right.columnNames) {
-      if (sameKey.has(n)) { rs.names.set(n, n); continue; }
-      let out = n;
+    const sameKey = new Set(on.right.filter((x, k) => on.left[k] === x));
+    for (const x of right.names) {
+      if (sameKey.has(x)) { rs.names.set(x, x); continue; }
+      let out = x;
       while (outNames.includes(out)) out += '_right';
       outNames.push(out);
-      rs.names.set(n, out);
-      kinds.set(out, kindOfTable(right, n));
+      rs.names.set(x, out);
+      kinds.set(out, right.kinds.get(x));
     }
-    q = q.join(right, { on: on.left.every((n, k) => n === on.right[k]) ? on.left : on, how: j.how });
+    q = q.join(rq, { on: on.left.every((x, k) => x === on.right[k]) ? on.left : on, how: j.how === 'cross' ? 'inner' : j.how });
     scope.push(rs);
-    for (const c of extra) q = q.filter(src(translate(c, plain)));
+    for (const c of extra) { const t = translate(c, plain); q = q.filter(src(t)); } // (translating may join: q after it)
   }
 
-  // translating expressions; `ctx.col(ref)` turns a column into an AST
-  const plain = { col: (ref) => v(resolve(ref)), agg: () => fail('aggregates (SUM, COUNT...) belong in SELECT, HAVING or ORDER BY, not here') };
-  const kindOf = (e, ctx) => (e.k === 'col' ? (ctx.kindOfCol?.(e) ?? kinds.get(resolve(e))) : e.k === 'date' ? 'date' : e.k === 'str' ? 'text' : 'number');
+  // ---- subqueries in expressions: joins that add a column ----------------------------------
+  // The subquery's WHERE equalities with outer columns are its correlation
+  // keys (taken out of it); anything else from outside is an error.
+  const outerHere = { canSee: (ref) => canSee(ref) || !!outer?.canSee(ref) };
+  function correlate(sub) {
+    const body = sub.body;
+    if (body.k !== 'select' || sub.ctes.length) return { inner: sub, pairs: [] }; // (only a plain SELECT can be correlated)
+    const innerScope = scopeNamesOf(body, env);
+    const isInner = (ref) => (ref.table ? innerScope.some((s) => s.alias.toLowerCase() === ref.table.toLowerCase()) : innerScope.some((s) => s.names.some((x) => x.toLowerCase() === ref.name.toLowerCase())));
+    const isOuter = (ref) => !isInner(ref) && canSee(ref);
+    const pairs = [], keep = [];
+    for (const c of conjuncts(body.where)) {
+      if (c.k === 'bin' && c.op === '=' && c.l.k === 'col' && c.r.k === 'col') {
+        const lo = isOuter(c.l), ro = isOuter(c.r);
+        if (lo !== ro) { pairs.push(lo ? { outer: c.l, inner: c.r } : { outer: c.r, inner: c.l }); continue; }
+      }
+      keep.push(c);
+    }
+    return { inner: { ...sub, body: { ...body, where: andAll(keep) } }, pairs };
+  }
+  // join rel (its columns `cols`) on outer key ASTs = rel key columns; the
+  // rel's columns get fresh names; returns them
+  function attach(rel, outerKeys, relKeys, cols) {
+    const tag = n.hidden++;
+    const fresh = (c) => `__s${tag}_${c}`;
+    let rq = rel.query;
+    const all = [...new Set([...relKeys, ...cols])];
+    all.forEach((c) => { rq = rq.derive(fresh(c), c); });
+    rq = rq.select(...all.map(fresh));
+    let lefts = outerKeys.map((t) => hide(t));
+    let rights = relKeys.map(fresh);
+    if (!lefts.length) { const k = `__x${n.hidden++}`; q = q.derive(k, '0'); rq = rq.derive(k, '0'); lefts = [k]; rights = [k]; }
+    q = q.join(rq, { on: { left: lefts, right: rights }, how: 'left', view: true }); // (its keys are unique: right columns looked up, left rows not copied)
+    return cols.map(fresh);
+  }
+  function subqueryValue(e, ctx) {
+    if (e.k === 'exists') {
+      const { inner, pairs } = correlate(e.q);
+      const body = inner.body;
+      const keyItems = pairs.map((pr, i) => ({ e: pr.inner, alias: `__k${i}` }));
+      const sel = { ...body, distinct: true, items: [...keyItems, { e: { k: 'num', v: 1 }, alias: '__m' }], groupBy: [] };
+      if (body.groupBy?.length || body.having) fail('EXISTS (SELECT ... GROUP BY ...) is not supported');
+      const rel = compileQuery({ ...inner, body: sel, orderBy: [], limit: pairs.length ? null : 1, offset: 0 }, env, outerHere);
+      const [m] = attach(rel, pairs.map((pr) => translate(pr.outer, ctx)), keyItems.map((it) => it.alias), ['__m']);
+      return bin('==', v(m), num(1));
+    }
+    if (e.k === 'insub') {
+      const { inner, pairs } = correlate(e.q);
+      const body = inner.body;
+      if (body.k !== 'select' || body.items.length !== 1 || body.items[0].e.k === 'star') {
+        if (!pairs.length) { // a UNION or such: its one column
+          const rel = compileQuery(inner, env, outerHere);
+          if (rel.names.length !== 1) fail('IN (SELECT ...) needs exactly one column');
+          const dist = { ...rel, query: rel.query.groupBy([rel.names[0]]).agg({ __m: 'count()' }).derive('__m1', '1') };
+          const [m] = attach({ ...dist, names: [rel.names[0], '__m1'] }, [translate(e.x, ctx)], [rel.names[0]], ['__m1']);
+          return bin('==', v(m), num(1));
+        }
+        fail('IN (SELECT ...) needs exactly one column');
+      }
+      const keyItems = pairs.map((pr, i) => ({ e: pr.inner, alias: `__k${i}` }));
+      const sel = { ...body, distinct: !body.groupBy?.length, items: [{ e: body.items[0].e, alias: '__v' }, ...keyItems, ...(body.groupBy?.length ? [] : [{ e: { k: 'num', v: 1 }, alias: '__m' }])] };
+      let rel = compileQuery({ ...inner, body: sel, orderBy: [], limit: null, offset: 0 }, env, outerHere);
+      if (body.groupBy?.length) { const keys = ['__v', ...keyItems.map((it) => it.alias)]; rel = { ...rel, query: rel.query.groupBy(keys).agg({ __c: 'count()' }).derive('__m', '1'), names: [...keys, '__m'] }; }
+      const [m] = attach(rel, [translate(e.x, ctx), ...pairs.map((pr) => translate(pr.outer, ctx))], ['__v', ...keyItems.map((it) => it.alias)], ['__m']);
+      return bin('==', v(m), num(1));
+    }
+    // (SELECT one value)
+    const { inner, pairs } = correlate(e.q);
+    const body = inner.body;
+    if (body.k === 'select' && body.items.length !== 1) fail('a subquery used as a value needs exactly one column');
+    if (!pairs.length) {
+      const rel = compileQuery(inner, env, outerHere);
+      if (rel.names.length !== 1) fail('a subquery used as a value needs exactly one column');
+      const [c] = attach(rel, [], [], [rel.names[0]]);
+      return v(c);
+    }
+    if (!(body.items.length === 1 && hasAgg(body.items[0].e)) || body.groupBy?.length) fail('a correlated subquery used as a value must compute one aggregate, e.g. (SELECT MAX(x) FROM t WHERE t.k = o.k)');
+    const keyItems = pairs.map((pr, i) => ({ e: pr.inner, alias: `__k${i}` }));
+    const sel = { ...body, items: [...keyItems, { e: body.items[0].e, alias: '__v' }], groupBy: keyItems.map((it) => it.e) };
+    const rel = compileQuery({ ...inner, body: sel, orderBy: [], limit: null, offset: 0 }, env, outerHere);
+    const [c] = attach(rel, pairs.map((pr) => translate(pr.outer, ctx)), keyItems.map((it) => it.alias), ['__v']);
+    const it = body.items[0].e;
+    return it.k === 'call' && it.fn === 'COUNT' ? call('coalesce', v(c), num(0)) : v(c); // (no rows: COUNT is 0)
+  }
+
+  // ---- translating expressions; `ctx.col(ref)` turns a column into an AST -----------------
+  const plain = { col: (ref) => v(resolve(ref)), agg: () => fail('aggregates (SUM, COUNT...) belong in SELECT, HAVING or ORDER BY, not here'), window: () => fail('window functions (... OVER (...)) belong in SELECT or ORDER BY') };
+  const kindOf = (e, ctx) => (e.k === 'col' ? (ctx.kindOfCol?.(e) ?? kinds.get(resolve(e))) : e.k === 'date' ? 'date' : e.k === 'str' ? 'text' : e.k === 'window' ? ctx.windowKind?.(e) ?? 'number' : 'number');
   function translate(e, ctx) {
     const T = (x) => translate(x, ctx);
     switch (e.k) {
@@ -365,6 +713,8 @@ export function sql(text, tables = {}) {
       case 'star': fail('* only works as a whole SELECT item (or COUNT(*))');
       case 'neg': return { t: 'un', op: '-', x: T(e.x) };
       case 'not': return { t: 'un', op: '!', x: T(e.x) };
+      case 'exists': case 'insub': case 'subq': return subqueryValue(e, ctx);
+      case 'window': return ctx.window(e);
       case 'bin': {
         if (e.op === 'AND') return bin('&&', T(e.l), T(e.r));
         if (e.op === 'OR') return bin('||', T(e.l), T(e.r));
@@ -400,14 +750,14 @@ export function sql(text, tables = {}) {
       }
       case 'cast': {
         const x = T(e.x);
-        if (['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT'].includes(e.type)) return cond(bin('>=', x, num(0)), call('floor', x), call('ceil', x));
+        if (['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT'].includes(e.type)) return cond(bin('>=', x, num(0)), call('floor', x), call('ceil', x));
         if (['DOUBLE', 'FLOAT', 'REAL', 'DECIMAL', 'NUMERIC'].includes(e.type)) return x;
         if (e.type === 'DATE' || e.type === 'TIMESTAMP') return e.x.k === 'str' ? translate({ k: 'date', v: e.x.v }, ctx) : e.type === 'DATE' ? call('dayStart', x) : x;
         fail(`CAST to ${e.type} is not supported`);
       }
       case 'call': {
         if (isAgg(e)) return ctx.agg(e);
-        const a = e.args.map(T), need = (n) => { if (a.length !== n) fail(`${e.fn}() takes ${n} value(s)`); };
+        const a = e.args.map(T), need = (k) => { if (a.length !== k) fail(`${e.fn}() takes ${k} value(s)`); };
         switch (e.fn) {
           case 'ABS': case 'SQRT': case 'FLOOR': need(1); return call(e.fn.toLowerCase(), a[0]);
           case 'CEIL': case 'CEILING': need(1); return call('ceil', a[0]);
@@ -428,8 +778,10 @@ export function sql(text, tables = {}) {
           case 'DOW': case 'DAYOFWEEK': need(1); { const w = call('weekday', a[0]); return bin('-', w, bin('*', call('floor', bin('/', w, num(7))), num(7))); } // 0 = Sunday
           case 'WEEKDAY': case 'ISODOW': need(1); return call('weekday', a[0]);
           case 'NOW': case 'CURRENT_TIMESTAMP': return num(Date.now());
+          case 'CONCAT': fail('text can be compared and grouped, not joined with || or CONCAT (yet)');
           default:
             if (DATE_PART[e.fn]) { need(1); return call(DATE_PART[e.fn], a[0]); }
+            if (WINDOW_FNS[e.fn] && !AGG[e.fn]) fail(`${e.fn}() needs OVER (...)`);
             fail(`unknown function ${e.fn}()`);
         }
       }
@@ -440,7 +792,9 @@ export function sql(text, tables = {}) {
 
   if (ast.where) {
     if (hasAgg(ast.where)) fail('aggregates (SUM, COUNT...) can\'t be used in WHERE: use HAVING');
-    q = q.filter(src(translate(ast.where, plain)));
+    if (hasWindow(ast.where)) fail('window functions can\'t be used in WHERE (filter on them in an outer query)');
+    const t = translate(ast.where, plain);
+    q = q.filter(src(t));
   }
 
   // SELECT items (* expanded)
@@ -450,7 +804,7 @@ export function sql(text, tables = {}) {
       const from = e.table ? scope.filter((s) => s.alias.toLowerCase() === e.table.toLowerCase()) : scope;
       if (!from.length) fail(`no table or alias "${e.table}"`);
       const seen = new Set(items.map((i) => i.name));
-      for (const s of from) for (const out of new Set(s.names.values())) if (!seen.has(out)) { seen.add(out); items.push({ e: { k: 'col', name: out, resolved: true }, name: out }); }
+      for (const s of from) for (const out of new Set(s.names.values())) if (!seen.has(out) && !out.startsWith('__')) { seen.add(out); items.push({ e: { k: 'col', name: out, resolved: true }, name: out }); }
       return;
     }
     items.push({ e, alias, name: alias ?? null });
@@ -458,21 +812,96 @@ export function sql(text, tables = {}) {
   const used = new Set();
   items.forEach((it, i) => { // output names: alias, column, sum_price, col3...
     if (!it.name) {
+      const c = it.e.k === 'window' ? it.e.call : it.e;
       if (it.e.k === 'col') it.name = it.e.name;
-      else if (isAgg(it.e)) it.name = it.e.star ? 'count' : `${AGG[it.e.fn] === 'mean' ? 'avg' : it.e.distinct ? 'count_distinct' : it.e.fn.toLowerCase()}${it.e.args[0]?.k === 'col' ? `_${it.e.args[0].name}` : ''}`;
+      else if (isAgg(c) || it.e.k === 'window') it.name = `${c.star ? 'count' : AGG[c.fn] === 'mean' ? 'avg' : c.distinct ? 'count_distinct' : c.fn.toLowerCase()}${c.args[0]?.k === 'col' ? `_${c.args[0].name}` : ''}`;
       else it.name = `col${i + 1}`;
     }
-    let n = it.name, k = 2;
-    while (used.has(n)) n = `${it.name}_${k++}`;
-    if (!/^[A-Za-z_]\w*$/.test(n)) fail(`"${n}" can't be a column name: use AS name`);
-    it.name = n;
-    used.add(n);
+    let nm = it.name, k = 2;
+    while (used.has(nm)) nm = `${it.name}_${k++}`;
+    if (!/^[A-Za-z_]\w*$/.test(nm)) fail(`"${nm}" can't be a column name: use AS name`);
+    it.name = nm;
+    used.add(nm);
   });
   const colOf = (e) => (e.resolved ? v(e.name) : v(resolve(e)));
+  const orderBy = tail.orderBy ?? [];
+
+  // ---- window functions: after grouping, before ORDER BY / DISTINCT / LIMIT ---------------
+  // (their inputs are translated first, so aggregates inside them are known)
+  const windowNodes = [];
+  const collectWindows = (e) => { const visit = (x) => { if (!x || typeof x !== 'object') return; if (x.k === 'window') { if (!windowNodes.some((w) => key(w) === key(x))) windowNodes.push(x); return; } if (x.k === 'subq' || x.k === 'exists' || x.k === 'insub') return; for (const val of Object.values(x)) if (Array.isArray(val)) val.forEach(visit); else if (val && typeof val === 'object') visit(val); }; visit(e); };
+  items.forEach((it) => collectWindows(it.e));
+  orderBy.forEach((o) => collectWindows(o.e));
+  if (ast.having && hasWindow(ast.having)) fail('window functions can\'t be used in HAVING (filter on them in an outer query)');
+  let windowPlan = null; // [{ spec key, partition ASTs, order, items }]
+  const windowVars = new Map(), windowKinds = new Map();
+  function planWindows(tr, kindCtx) {
+    const specs = new Map();
+    for (const w of windowNodes) {
+      const c = w.call, fn = WINDOW_FNS[c.fn] ?? (PERCENTILE.has(c.fn) ? null : null);
+      if (!fn) fail(`${c.fn}() can't be used with OVER (window functions: ${Object.keys(WINDOW_FNS).join(', ')})`);
+      if (c.distinct) fail(`${c.fn}(DISTINCT ...) OVER (...) is not supported`);
+      const partition = w.partition.map(tr), order = w.order.map((o) => ({ ast: tr(o.e), desc: o.desc, nullsFirst: o.nullsFirst }));
+      const sk = key({ p: partition, o: order });
+      if (!specs.has(sk)) specs.set(sk, { partition, order, items: [] });
+      const constArg = (i, what) => { const x = c.args[i]; if (!x) return undefined; const k = constNum(tr(x)); if (k === null) fail(`${c.fn}(): the ${what} must be a number`); return k; };
+      const item = { node: w, fn, name: `__w${n.hidden++}` };
+      if (['lag', 'lead'].includes(fn)) { item.arg = tr(c.args[0] ?? fail(`${c.fn}() needs a value`)); item.offset = constArg(1, 'offset') ?? 1; item.def = constArg(2, 'default'); }
+      else if (fn === 'ntile') { item.k = constArg(0, 'number of tiles'); if (!(item.k >= 1)) fail('NTILE(n) needs n >= 1'); }
+      else if (fn === 'nth_value') { item.arg = tr(c.args[0]); item.k = constArg(1, 'position'); }
+      else if (['first_value', 'last_value', 'sum', 'avg', 'min', 'max'].includes(fn)) item.arg = tr(c.args[0] ?? fail(`${c.fn}() needs a value`));
+      else if (fn === 'count') item.arg = c.star || !c.args.length ? null : tr(c.args[0]);
+      if (w.frame) {
+        const bound = (b) => (b.x === undefined ? { kind: b.kind } : { kind: b.kind, n: (() => { const t = tr(b.x); if (t.t !== 'num' || !(t.v >= 0)) fail('a window frame needs a number of rows (or a distance) like 3 PRECEDING'); return t.v; })() });
+        item.frame = { unit: w.frame.unit, start: bound(w.frame.start), end: bound(w.frame.end) };
+        if (item.frame.start.kind === 'unbounded' && w.frame.start.kind === 'unbounded' && false) item.frame.start.kind = 'unbounded';
+      }
+      specs.get(sk).items.push(item);
+      windowVars.set(key(w), item.name);
+      const argKind = c.args[0] ? kindCtx(c.args[0]) : 'number';
+      windowKinds.set(key(w), KEEPS_KIND.has(fn) ? argKind : 'number');
+    }
+    windowPlan = [...specs.values()];
+  }
+  function applyWindows() {
+    for (const spec of windowPlan ?? []) {
+      const partition = spec.partition.map((t) => hide(t, '__wp'));
+      const order = [];
+      for (const o of spec.order) {
+        const name = hide(o.ast, '__wo');
+        if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, `${name} == ${name} ? 1 : 0`); order.push({ name: h }); }
+        order.push({ name, desc: o.desc });
+      }
+      const its = spec.items.map((it) => ({ name: it.name, fn: it.fn, arg: it.arg ? hide(it.arg, '__wa') : null, frame: it.frame, offset: it.offset, def: it.def, k: it.k }));
+      q = q.window({ partition, order, items: its });
+    }
+  }
+  const windowCtx = (base) => ({ ...base, window: (e) => v(windowVars.get(key(e)) ?? fail('internal: window not planned')), windowKind: (e) => windowKinds.get(key(e)) });
+
+  // ---- percentiles: a window over each group's rows, then min() of it -----------------
+  function percentileAgg(e, groupKeyNames, tr) {
+    let p, arg;
+    if (e.fn === 'MEDIAN') { if (e.args.length !== 1) fail('MEDIAN(x) takes one value'); p = 0.5; arg = e.args[0]; }
+    else if (e.fn === 'PERCENTILE_CONT' || e.fn === 'PERCENTILE_DISC') {
+      if (!e.within) fail(`${e.fn}(p) needs WITHIN GROUP (ORDER BY x)`);
+      const t = tr(e.args[0] ?? fail(`${e.fn}(p) needs a fraction p`));
+      if (t.t !== 'num' || !(t.v >= 0 && t.v <= 1)) fail(`${e.fn}(p): p must be a number from 0 to 1`);
+      p = e.within.desc ? 1 - t.v : t.v;
+      arg = e.within.e;
+    } else { // QUANTILE_CONT(x, p) (DuckDB)
+      const t = tr(e.args[1] ?? fail(`${e.fn}(x, p) needs a fraction p`));
+      if (t.t !== 'num' || !(t.v >= 0 && t.v <= 1)) fail(`${e.fn}(x, p): p must be a number from 0 to 1`);
+      p = t.v; arg = e.args[0];
+    }
+    const disc = e.fn === 'PERCENTILE_DISC' || e.fn === 'QUANTILE_DISC';
+    const argName = hide(tr(arg), '__qa');
+    const name = `__q${n.hidden++}`;
+    q = q.window({ partition: groupKeyNames, order: [{ name: argName }], items: [{ name, fn: disc ? 'percentile_disc' : 'percentile_cont', arg: argName, p }] });
+    return name;
+  }
 
   const grouped = ast.groupBy.length > 0 || items.some((it) => hasAgg(it.e)) || (ast.having && hasAgg(ast.having));
   const sortKeys = [];
-  let hidden = 0;
   if (grouped) {
     // group keys: ordinal, select alias or expression
     const keys = []; // { name, sqlKey, kind }
@@ -481,21 +910,29 @@ export function sql(text, tables = {}) {
       if (g.k === 'num') e = items[g.v - 1]?.e ?? fail(`GROUP BY ${g.v}: there is no select item ${g.v}`);
       else if (g.k === 'col' && !g.table && items.some((it) => it.alias === g.name) && !scope.some((s) => s.names.has(g.name))) e = items.find((it) => it.alias === g.name).e;
       if (hasAgg(e)) fail('GROUP BY can\'t use aggregates');
+      if (hasWindow(e)) fail('GROUP BY can\'t use window functions');
       const t = e.k === 'col' ? colOf(e) : translate(e, plain);
       let name;
       if (t.t === 'var') name = t.name;
-      else { name = `__g${keys.length}`; q = q.derive(name, src(t)); }
+      else { name = `__g${keys.length}_${n.hidden++}`; q = q.derive(name, src(t)); }
       keys.push({ name, sqlKey: key(e), colName: t.t === 'var' ? t.name : null, kind: e.k === 'col' ? kinds.get(t.name) : 'number' });
     }
     // aggregates, each once
     const aggs = new Map(); // sqlKey -> name
-    const spec = {};
+    const spec = {}, extraKeys = [];
     const aggOf = (e) => {
       const k = key(e);
       if (aggs.has(k)) return v(aggs.get(k));
-      const name = `__a${aggs.size}`;
+      const name = `__a${aggs.size}_${n.hidden++}`;
       aggs.set(k, name);
       if (e.args.some(hasAgg)) fail('aggregates can\'t contain aggregates');
+      if (PERCENTILE.has(e.fn)) {
+        const qn = percentileAgg(e, keys.map((x) => x.name), (x) => translate(x, plain));
+        const arg = e.fn === 'MEDIAN' || e.fn.startsWith('QUANTILE') ? e.args[0] : e.within.e;
+        if (kindOf(arg, plain) === 'text') { extraKeys.push(qn); aggs.set(k, qn); return v(qn); } // (one value per group: a key, so it stays text)
+        spec[name] = `min(${qn})`;
+        return v(name);
+      }
       const fn = e.fn === 'COUNT' && e.star ? 'count' : e.fn === 'COUNT' && e.distinct ? 'countDistinct' : AGG[e.fn];
       if (e.distinct && e.fn !== 'COUNT') fail(`${e.fn}(DISTINCT ...) is not supported (COUNT(DISTINCT x) is)`);
       if (!e.star && e.args.length !== 1) fail(`${e.fn}() takes one value`);
@@ -503,7 +940,7 @@ export function sql(text, tables = {}) {
       return v(name);
     };
     // after grouping: aggregates and keys by name; other columns must be keys
-    const post = {
+    const post = windowCtx({
       agg: aggOf,
       col: (ref) => {
         const k = keys.find((x) => x.sqlKey === key(ref) || (x.colName && x.colName === (ref.resolved ? ref.name : resolve(ref))));
@@ -511,30 +948,34 @@ export function sql(text, tables = {}) {
         return v(k.name);
       },
       kindOfCol: (ref) => keys.find((x) => x.colName && x.colName === resolve(ref))?.kind,
-    };
+    });
     const translatePost = (e) => {
       const k = keys.find((x) => x.sqlKey === key(e));
       if (k && e.k !== 'col') return v(k.name);
       return translate(e, post);
     };
+    planWindows(translatePost, (x) => kindOf(x, post));
     const outs = items.map((it) => ({ ...it, ast: translatePost(it.e) }));
     const havingAst = ast.having ? translatePost(ast.having) : null;
-    const orderAsts = ast.orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, translatePost) }));
-    q = q.groupBy(keys.map((k) => k.name)).agg(Object.keys(spec).length ? spec : { __a_rows: 'count()' });
-    for (const o of outs) if (!(o.ast.t === 'var' && o.ast.name === o.name)) q = q.derive(o.name, src(o.ast));
+    const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, translatePost) }));
+    q = q.groupBy([...keys.map((k) => k.name), ...extraKeys]).agg(Object.keys(spec).length ? spec : { __a_rows: 'count()' });
     if (havingAst) q = q.filter(src(havingAst));
-    for (const o of orderAsts) sortKeys.push(sortKey(o));
-    q = finish(q, outs.map((o) => o.name));
-  } else {
-    const outs = items.map((it) => ({ ...it, ast: it.e.k === 'col' ? colOf(it.e) : translate(it.e, plain) }));
-    const orderAsts = ast.orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, (e) => (e.k === 'col' ? colOf(e) : translate(e, plain))) }));
+    applyWindows();
     for (const o of outs) if (!(o.ast.t === 'var' && o.ast.name === o.name)) q = q.derive(o.name, src(o.ast));
-    for (const o of orderAsts) sortKeys.push(sortKey(o));
-    if (ast.distinct) q = q.groupBy(outs.map((o) => o.name)).agg({ __distinct_rows: 'count()' });
-    q = finish(q, outs.map((o) => o.name));
+    for (const o of orderAsts) sortKey(o);
+    return finish(outs, (o) => (o.e.k === 'col' ? post.kindOfCol(o.e) ?? kinds.get(resolveSafe(o.e)) : kindOf(o.e, post)));
   }
-  return q;
+  const pre = windowCtx(plain);
+  planWindows((e) => (e.k === 'col' ? colOf(e) : translate(e, pre)), (x) => kindOf(x, pre));
+  applyWindows();
+  const outs = items.map((it) => ({ ...it, ast: it.e.k === 'col' ? colOf(it.e) : translate(it.e, pre) }));
+  const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, (e) => (e.k === 'col' ? colOf(e) : translate(e, pre))) }));
+  for (const o of outs) if (!(o.ast.t === 'var' && o.ast.name === o.name)) q = q.derive(o.name, src(o.ast));
+  for (const o of orderAsts) sortKey(o);
+  if (ast.distinct) q = q.groupBy(outs.map((o) => o.name)).agg({ __distinct_rows: 'count()' });
+  return finish(outs, (o) => (o.e.k === 'col' ? kinds.get(o.e.resolved ? o.e.name : resolve(o.e)) : kindOf(o.e, pre)));
 
+  function resolveSafe(e) { try { return e.resolved ? e.name : resolve(e); } catch { return null; } }
   // ORDER BY item -> an output name or an expression
   function orderTarget(e, outs, tr) {
     if (e.k === 'num') { const o = outs[e.v - 1]; if (!o) fail(`ORDER BY ${e.v}: there is no select item ${e.v}`); return v(o.name); }
@@ -545,15 +986,18 @@ export function sql(text, tables = {}) {
   function sortKey(o) {
     let k;
     if (o.ast.t === 'var') k = o.ast.name;
-    else { k = `__o${hidden++}`; q = q.derive(k, src(o.ast)); }
-    return o.desc ? `-${k}` : k;
+    else { k = `__o${n.hidden++}`; q = q.derive(k, src(o.ast)); }
+    if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, `${k} == ${k} ? 1 : 0`); sortKeys.push(h); }
+    sortKeys.push(o.desc ? `-${k}` : k);
   }
-  function finish(query, names) {
-    let out = query;
+  function finish(outs, kindFn) {
+    let out = q;
     if (sortKeys.length) out = out.sort(sortKeys);
-    if (ast.limit !== null) out = out.limit(ast.limit, ast.offset);
-    else if (ast.offset) fail('OFFSET needs LIMIT');
-    return out.select(...names);
+    if (tail.limit !== null && tail.limit !== undefined) out = out.limit(tail.limit, tail.offset);
+    else if (tail.offset) fail('OFFSET needs LIMIT');
+    const names = outs.map((o) => o.name);
+    const outKinds = new Map(outs.map((o) => [o.name, kindFn(o) ?? 'number']));
+    return { query: out.select(...names), names, kinds: outKinds };
   }
 }
 
@@ -571,4 +1015,4 @@ function toSourceAst(n) {
   throw new Error(`bad node ${n.t}`);
 }
 
-export { Query };
+export { Query, namesOf };

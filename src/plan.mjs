@@ -87,6 +87,10 @@ export class Query {
     const right = other instanceof Query ? other.node : { op: 'scan', table: other };
     return new Query({ op: 'join', left: this.node, right, opts: opts ?? {} });
   }
+  // (SQL) window functions: see Table._window for the spec
+  window(spec) { return new Query({ op: 'window', input: this.node, partition: spec.partition ?? [], order: spec.order ?? [], items: spec.items }); }
+  // (SQL) the rows of several queries one after another, columns by position
+  static union(queries) { return new Query({ op: 'union', inputs: queries.map((q) => q.node) }); }
   groupBy(keys) {
     return { agg: (spec, params = {}) => new Query({ op: 'aggregate', input: this.node, keys: keyList(keys), spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) }) };
   }
@@ -123,6 +127,8 @@ export function namesOf(node) {
     case 'select': return node.names;
     case 'aggregate': return [...node.keys, ...Object.keys(node.spec)];
     case 'join': return joinNames(node).all;
+    case 'window': return [...namesOf(node.input).filter((n) => !node.items.some((it) => it.name === n)), ...node.items.map((it) => it.name)];
+    case 'union': return namesOf(node.inputs[0]);
   }
   return [];
 }
@@ -168,10 +174,13 @@ function pushFilter(node, cond) {
     case 'aggregate':
       if ([...used].every((n) => node.keys.includes(n))) return { ...node, input: pushFilter(node.input, cond), pushed: (node.pushed ?? 0) + 1 };
       break;
+    case 'window': // (only a filter on the partition keys keeps every window the same)
+      if (node.partition.length && [...used].every((n) => node.partition.includes(n))) return { ...node, input: pushFilter(node.input, cond) };
+      break;
     case 'join': {
       const { left, fromRight } = joinNames(node);
       if ([...used].every((n) => left.has(n))) return { ...node, left: pushFilter(node.left, cond) };
-      if ([...used].every((n) => fromRight.has(n))) return { ...node, right: pushFilter(node.right, rename(cond, fromRight)) };
+      if (node.opts.how !== 'left' && [...used].every((n) => fromRight.has(n))) return { ...node, right: pushFilter(node.right, rename(cond, fromRight)) };
       break;
     }
   }
@@ -188,6 +197,7 @@ export function optimize(node) {
       return input;
     }
     case 'join': return { ...node, left: optimize(node.left), right: optimize(node.right) };
+    case 'union': return { ...node, inputs: node.inputs.map(optimize) };
     default: return { ...node, input: optimize(node.input) };
   }
 }
@@ -250,6 +260,21 @@ function* execG(node, needed, temps) {
         r = yield { table: r, method: 'derive', args: [n, toSource(d.ast)], date: d.date };
         }
       return { table: r, derived: new Map(), visible: keep };
+    }
+    case 'window': {
+      const made = new Set(node.items.map((it) => it.name));
+      const inputs = [...node.partition, ...node.order.map((o) => o.name), ...node.items.map((it) => it.arg).filter(Boolean)];
+      const s = yield* execG(node.input, needed ? new Set([...[...needed].filter((n) => !made.has(n)), ...inputs]) : null, temps);
+      const keep = needed ? s.visible.filter((n) => needed.has(n) || inputs.includes(n)) : s.visible;
+      const t = yield* materializeG(s, new Set([...keep, ...inputs]), temps, [], true);
+      const w = yield { table: t.select(...new Set([...keep, ...inputs])), method: '_window', args: [{ partition: node.partition, order: node.order, items: node.items }] };
+      return { table: w, derived: new Map(), visible: [...keep, ...node.items.map((it) => it.name)] };
+    }
+    case 'union': {
+      const parts = [];
+      for (const input of node.inputs) parts.push(yield* execG({ op: 'output', input }, null, temps));
+      const u = yield { table: parts[0], method: '_concat', args: [parts.slice(1)] };
+      return { table: u, derived: new Map(), visible: u.columnNames };
     }
     case 'join': {
       const { left: leftNames, fromRight } = joinNames(node);
@@ -347,6 +372,7 @@ const record = (temps, req, out) => { if (out && out !== req.table && out.cols &
 // chunk by chunk.
 export function findDataset(node) {
   if (node.op === 'scan') return node.table.isDataset ? node.table : null;
+  if (node.op === 'union') { for (const i of node.inputs) { const d = findDataset(i); if (d) return d; } return null; }
   return node.op === 'join' ? findDataset(node.left) ?? findDataset(node.right) : findDataset(node.input);
 }
 
@@ -404,6 +430,8 @@ function describe(node, depth = 0) {
       : `${describe(node.input, depth)}\n${pad}limit ${node.n}${node.offset ? ` offset ${node.offset}` : ''}`;
     case 'join': return `${pad}join ${JSON.stringify(node.opts.on)} ${node.opts.how ?? 'inner'}\n${pad}  left:\n${describe(node.left, depth + 2)}\n${pad}  right:\n${describe(node.right, depth + 2)}`;
     case 'output': return describe(node.input, depth);
+    case 'window': return `${describe(node.input, depth)}\n${pad}window ${node.items.map((it) => `${it.name} = ${it.fn}(${it.arg ?? ''})`).join(', ')}${node.partition.length ? ` partition by ${node.partition.join(', ')}` : ''}${node.order.length ? ` order by ${node.order.map((o) => (o.desc ? `-${o.name}` : o.name)).join(', ')}` : ''}`;
+    case 'union': return `${pad}union all\n${node.inputs.map((i) => describe(i, depth + 1)).join(`\n${pad}  and\n`)}`;
     case 'total': return `${describe(node.input, depth)}\n${pad}totals: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}`;
   }
   return `${pad}${node.op}`;
