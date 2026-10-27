@@ -312,6 +312,9 @@ export class Engine {
     Atomics.store(ctrl, C.DONE, 0);
     Atomics.store(ctrl, C.ERROR, 0);
     Atomics.store(ctrl, C.NEXT, tag << TAG_SHIFT);
+    // (workers don't run this task: put back the last published SEQ so idle
+    // ones keep sleeping; a late one sees the fresh tag and skips the fields)
+    if (this.W && Atomics.load(ctrl, C.SEQ) === SEQ_WRITING) Atomics.store(ctrl, C.SEQ, this.#prevSeq);
     let mainError = null;
     runUnits(op, this.T, n, arrays, this.sc, ctrl, W, this.res, tag, F, 0, (err) => { mainError ??= err; });
     if (mainError) throw mainError;
@@ -388,8 +391,20 @@ export class Engine {
     return req.after ? req.after(parts) : Float64Array.from(parts); // results are copied out before the next run
   }
 
+  // Before a request's setup() writes the control block (kernel, scalars...),
+  // mark it as being rewritten: a worker still reading the previous task
+  // must not take the new fields for it (the seqlock in #publish).
+  #prevSeq = 0;
+  #beginWrite() {
+    if (!this.W) return;
+    const s = Atomics.load(this.ctrl, C.SEQ);
+    if (s !== SEQ_WRITING) this.#prevSeq = s;
+    Atomics.store(this.ctrl, C.SEQ, SEQ_WRITING);
+  }
+
   _execSync(req) {
     this.#assertIdle(); // before setup(), which writes the shared control block
+    this.#beginWrite();
     req.setup?.();
     return this.#exec1(req, this.#run(req.op, req.n, req.arrays, req.W ?? null, req.F ?? null));
   }
@@ -400,6 +415,7 @@ export class Engine {
     this.#queue = new Promise((r) => { release = r; });
     await before;
     try {
+      this.#beginWrite();
       req.setup?.();
       return await this.#exec1(req, await this.#runAsync(req.op, req.n, req.arrays, req.W ?? null, req.F ?? null));
     } finally {

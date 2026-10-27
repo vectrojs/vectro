@@ -10,7 +10,7 @@
 //                      worker only receives messages between event-loop turns);
 //                      Node: undefined (messages can be read synchronously)
 // }
-import { C, OP, WASM_MEMORY, SEQ_WRITING, MAX_ARGS, decodeArgs, runUnits, tagOf } from './kernels.mjs';
+import { C, OP, WASM_MEMORY, SEQ_WRITING, MAX_ARGS, TAG_SHIFT, decodeArgs, runUnits, tagOf } from './kernels.mjs';
 
 export async function workerLoop({ ctrlBuf, scalarBuf, resultBuf, spin, module, memory, index }, host) {
   const ctrl = new Int32Array(ctrlBuf);
@@ -94,7 +94,9 @@ export async function workerLoop({ ctrlBuf, scalarBuf, resultBuf, spin, module, 
         }
         : null;
     } catch (err) {
-      if (Atomics.load(ctrl, C.SEQ) !== s) continue;
+      // a newer task is being written (SEQ changed), or ran without the
+      // workers (a fresh tag): these fields weren't our task's
+      if (Atomics.load(ctrl, C.SEQ) !== s || Atomics.load(ctrl, C.NEXT) >>> TAG_SHIFT !== tagOf(s)) continue;
       throw err;
     }
     if (Atomics.load(ctrl, C.SEQ) !== s) continue;
