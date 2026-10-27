@@ -115,12 +115,55 @@ CASES.push(
   ['SELECT cust, price FROM orders WHERE cust = 7 ORDER BY price NULLS FIRST, ts OFFSET 14 ROWS FETCH FIRST 5 ROWS ONLY',
     () => O.filter((r) => r.cust === 7).sort((a, b) => (present(a.price) - present(b.price)) || (a.price - b.price) || a.ts - b.ts).slice(14, 19).map(({ cust, price }) => ({ cust, price }))],
 );
+// text functions and outer joins (missing text is '')
+const P = [[1, '  Ann Smith', 'Seattle'], [2, 'bob jones ', 'Austin'], [3, 'Çelik Ayşe', 'Ankara'], [4, 'dan', 'San José'], [5, 'Eve-Marie', 'Paris'], [6, "Frank O'Neil", ''], [7, '東京 太郎', 'Tokyo'], [8, 'gus', 'Dublin']].map(([id, name, city]) => ({ id, name, city }));
+const cps = (s) => Array.from(s);
+const nul = (s) => s === '';
+const sub = (s, a, n) => { const c = cps(s); const at = a > 0 ? a - 1 : a === 0 ? -1 : c.length + a; return c.slice(Math.max(0, at), Math.max(0, n === undefined ? c.length : at + n)).join(''); };
+const lpad = (s, n, f) => { const c = cps(s); if (c.length >= n) return c.slice(0, n).join(''); let p = ''; while (cps(p).length < n - c.length) p += f; return cps(p).slice(0, n - c.length).join('') + s; };
+const textOf = (v) => (v !== v ? '' : String(v));
+const band = (p) => (p !== p ? 'unknown' : p >= 500 ? 'high' : p >= 100 ? 'mid' : 'low');
+const ymOf = (d) => `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+const hi990 = () => [...groupRows(O.filter((r) => r.price > 990), (r) => r.cust)].map(([cust, rs]) => ({ cust, n: rs.length }));
+CASES.push(
+  ['SELECT UPPER(region) AS r, LOWER(region) AS l, LENGTH(region) AS n, COUNT(*) AS c FROM orders GROUP BY region ORDER BY r',
+    () => [...groupRows(O, (r) => r.region)].sort((a, b) => byKey(a[0], b[0])).map(([g, rs]) => ({ r: g.toUpperCase(), l: g.toLowerCase(), n: g.length, c: rs.length }))],
+  ["SELECT id, TRIM(name) AS t, UPPER(name) AS u, LENGTH(name) AS len, SUBSTR(name, 2, 3) AS s, LEFT(TRIM(name), 3) AS l, RIGHT(name, 2) AS r, REPLACE(name, ' ', '_') AS rp, REVERSE(city) AS rv, LPAD(city, 8, '.') AS lp, SPLIT_PART(TRIM(name), ' ', 2) AS sp, STRPOS(name, 'a') AS pos, CONCAT(city, '!', id) AS c, city || '/' || id AS cc, CONCAT_WS('-', city, name) AS ws, SUBSTRING(name FROM -3) AS e3, TRIM(LEADING ' ' FROM name) AS lt FROM people ORDER BY id",
+    () => P.map(({ id, name, city }) => ({ id, t: name.trim(), u: name.toUpperCase(), len: cps(name).length, s: sub(name, 2, 3), l: cps(name.trim()).slice(0, 3).join(''), r: cps(name).slice(-2).join(''), rp: name.split(' ').join('_'), rv: cps(city).reverse().join(''), lp: nul(city) ? '' : lpad(city, 8, '.'), sp: name.trim().split(' ')[1] ?? '', pos: name.indexOf('a') < 0 ? 0 : cps(name.slice(0, name.indexOf('a'))).length + 1, c: `${city}!${id}`, cc: nul(city) ? '' : `${city}/${id}`, ws: nul(city) ? name : `${city}-${name}`, e3: cps(name).slice(-3).join(''), lt: name.replace(/^ +/, '') }))],
+  ["SELECT COUNT(*) AS n FROM orders WHERE LOWER(region) = 'eu' OR STARTS_WITH(region, 'LA')", () => [{ n: O.filter((r) => r.region === 'EU' || r.region.startsWith('LA')).length }]],
+  ["SELECT region || '/' || CAST(qty AS VARCHAR) AS k, COUNT(*) AS n FROM orders GROUP BY 1 ORDER BY k LIMIT 7",
+    () => [...groupRows(O, (r) => `${r.region}/${r.qty}`)].sort((a, b) => byKey(a[0], b[0])).slice(0, 7).map(([k, rs]) => ({ k, n: rs.length }))],
+  ["SELECT CASE WHEN price >= 500 THEN 'high' WHEN price >= 100 THEN 'mid' WHEN price IS NULL THEN 'unknown' ELSE 'low' END AS band, COUNT(*) AS n FROM orders GROUP BY band ORDER BY band",
+    () => [...groupRows(O, (r) => band(r.price))].sort((a, b) => byKey(a[0], b[0])).map(([b, rs]) => ({ band: b, n: rs.length }))],
+  ["SELECT STRFTIME(ts, '%Y-%m') AS ym, COUNT(*) AS n, CAST(MIN(qty) AS VARCHAR) || '..' || CAST(MAX(qty) AS VARCHAR) AS q FROM orders GROUP BY ym ORDER BY ym LIMIT 5",
+    () => [...groupRows(O, (r) => ymOf(r.ts))].sort((a, b) => byKey(a[0], b[0])).slice(0, 5).map(([ym, rs]) => ({ ym, n: rs.length, q: `${Math.min(...col(rs, 'qty'))}..${Math.max(...col(rs, 'qty'))}` }))],
+  ["SELECT name FROM customers WHERE name >= 'c4' AND name < 'c5' ORDER BY name", () => C.map((c) => c.name).filter((s) => s >= 'c4' && s < 'c5').sort(byKey).map((name) => ({ name }))],
+  ["SELECT COUNT(*) AS n FROM people WHERE name ILIKE '%an%' AND NOT REGEXP_MATCHES(city, '^S')", () => [{ n: P.filter((p) => p.name.toLowerCase().includes('an') && !nul(p.city) && !/^S/.test(p.city)).length }]],
+  ["SELECT o.cust, COALESCE(c.name, 'none') AS name FROM orders o LEFT JOIN customers c ON o.cust = c.cust WHERE o.qty = 5 AND o.cust >= 48 ORDER BY o.ts LIMIT 6",
+    () => O.filter((r) => r.qty === 5 && r.cust >= 48).sort((a, b) => a.ts - b.ts).slice(0, 6).map((r) => ({ cust: r.cust, name: r.cust < 50 ? `c${r.cust}` : 'none' }))],
+  ['SELECT SUM(CAST(SUBSTR(name, 2) AS INTEGER)) AS s, COUNT(DISTINCT LEFT(name, 2)) AS d FROM customers', () => [{ s: 1225, d: new Set(C.map((c) => c.name.slice(0, 2))).size }]],
+  ["SELECT region, COUNT(*) AS n FROM orders GROUP BY region HAVING LOWER(region) LIKE '%a%' ORDER BY region",
+    () => [...groupRows(O, (r) => r.region)].filter(([g]) => g.toLowerCase().includes('a')).sort((a, b) => byKey(a[0], b[0])).map(([region, rs]) => ({ region, n: rs.length }))],
+  ["SELECT name, CAST(RANK() OVER (ORDER BY tier DESC, name) AS VARCHAR) || '.' AS r FROM customers ORDER BY r LIMIT 5",
+    () => { const s = [...C].sort((a, b) => b.tier - a.tier || byKey(a.name, b.name)); return s.map((c, i) => ({ name: c.name, r: `${i + 1}.` })).sort((a, b) => byKey(a.r, b.r)).slice(0, 5); }],
+  ['SELECT c.cust, COUNT(o.cust) AS n FROM (SELECT * FROM orders WHERE price > 990) o RIGHT JOIN customers c ON o.cust = c.cust GROUP BY c.cust ORDER BY c.cust',
+    () => C.map((c) => ({ cust: c.cust, n: O.filter((r) => r.price > 990 && r.cust === c.cust).length }))],
+  ['SELECT COALESCE(o.cust, c.cust) AS k, o.n, c.name FROM (SELECT cust, COUNT(*) AS n FROM orders WHERE price > 990 GROUP BY cust) o FULL JOIN customers c ON o.cust = c.cust ORDER BY k',
+    () => { const h = new Map(hi990().map((x) => [x.cust, x.n])); return [...new Set([...h.keys(), ...C.map((c) => c.cust)])].sort((a, b) => a - b).map((k) => ({ k, n: h.get(k) ?? NaN, name: k < 50 ? `c${k}` : '' })); }],
+  ['SELECT cust, n, tier FROM (SELECT cust, COUNT(*) AS n FROM orders WHERE price > 995 GROUP BY cust) o FULL JOIN customers USING (cust) ORDER BY cust',
+    () => { const h = new Map([...groupRows(O.filter((r) => r.price > 995), (r) => r.cust)].map(([k, rs]) => [k, rs.length])); return [...new Set([...h.keys(), ...C.map((c) => c.cust)])].sort((a, b) => a - b).map((cust) => ({ cust, n: h.get(cust) ?? NaN, tier: cust < 50 ? 1 + (cust % 3) : NaN })); }],
+  ['SELECT o.cust, c.cust AS cc FROM orders o LEFT JOIN customers c ON o.cust = c.cust WHERE o.cust >= 49 AND o.qty = 1 AND o.price > 900 ORDER BY o.cust, o.ts',
+    () => O.filter((r) => r.cust >= 49 && r.qty === 1 && r.price > 900).sort((a, b) => a.cust - b.cust || a.ts - b.ts).map((r) => ({ cust: r.cust, cc: r.cust < 50 ? r.cust : NaN }))],
+  ['SELECT cust AS qty, qty AS cust FROM orders WHERE price > 999 ORDER BY qty, cust', () => O.filter((r) => r.price > 999).map((r) => ({ qty: r.cust, cust: r.qty })).sort((a, b) => a.qty - b.qty || a.cust - b.cust)],
+  ['SELECT CAST(cust AS VARCHAR) AS k FROM customers WHERE cust < 3 UNION SELECT region FROM orders ORDER BY k', () => [...new Set(['0', '1', '2', ...O.map((r) => r.region)])].sort(byKey).map((k) => ({ k }))],
+);
 const norm = (v) => (v instanceof Date ? v.getTime() : typeof v === 'number' ? (v !== v ? 'NaN' : Number(v.toPrecision(12))) : v);
 for (const [label, make] of [['threads', () => new Engine()], ['single thread', () => new Engine({ threads: 1 })], ['interpreter', () => new PortableEngine({ jit: false })]]) {
   const e = make();
   const tables = {
     orders: e.table({ cust: col(O, 'cust'), price: col(O, 'price'), qty: col(O, 'qty'), region: col(O, 'region'), ts: col(O, 'ts') }),
     customers: e.table({ cust: col(C, 'cust'), name: col(C, 'name'), tier: col(C, 'tier') }),
+    people: e.table({ id: col(P, 'id'), name: col(P, 'name'), city: col(P, 'city') }),
   };
   for (const [query, ref] of CASES) {
     checks++;
@@ -148,16 +191,18 @@ for (const [label, make] of [['threads', () => new Engine()], ['single thread', 
     ['SELECT cust FROM orders WHERE SUM(price) > 1', 'HAVING'],
     ['SELECT price FROM orders o JOIN prices p ON o.cust = p.cust', 'ambiguous'],
     ['SELECT * FROM orders, customers', 'JOIN ... ON'],
-    ['SELECT region || \'x\' FROM orders', 'text'],
+    ['SELECT MIN(region) FROM orders', 'of text is not supported'],
     ["SELECT * FROM orders WHERE region = 'EU", 'not closed'],
-    ['SELECT UPPER(region) FROM orders', 'unknown function UPPER'],
+    ['SELECT UPPER(region, 2) FROM orders', 'UPPER() takes 1'],
+    ['SELECT NOPE(region) FROM orders', 'unknown function NOPE'],
     ['SELECT * FROM orders LIMIT', 'LIMIT needs a number'],
     ['SELECT cust FROM orders UNION SELECT cust, price FROM orders', 'same number of columns'],
     ['SELECT region FROM orders UNION SELECT cust FROM orders', 'text'],
     ['SELECT cust FROM orders WHERE ROW_NUMBER() OVER (ORDER BY cust) = 1', 'window functions'],
     ['SELECT ROW_NUMBER() AS r FROM orders', 'needs OVER'],
     ['SELECT cust FROM orders o WHERE price > (SELECT MAX(price) FROM prices p WHERE p.price > o.price)', 'outer query'],
-    ['SELECT * FROM orders o RIGHT JOIN customers c ON o.cust = c.cust', 'RIGHT JOIN'],
+    ['SELECT * FROM orders o FULL JOIN customers c ON o.cust = c.cust AND o.price > 1', 'key equalities'],
+    ['SELECT CAST(region AS BLOB) FROM orders', 'CAST to BLOB'],
     ['SELECT * FROM (SELECT cust FROM orders)', 'needs a name'],
     ['SELECT PERCENTILE_CONT(0.5) FROM orders', 'WITHIN GROUP'],
     ['SELECT cust FROM orders INTERSECT ALL SELECT cust FROM customers', 'INTERSECT ALL'],

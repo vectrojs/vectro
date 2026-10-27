@@ -19,6 +19,7 @@ for (let i = 0; i < N; i++) {
 }
 const c = { cust: Array.from({ length: 1000 }, (_, i) => i), name: Array.from({ length: 1000 }, (_, i) => `c${i}`), tier: Array.from({ length: 1000 }, (_, i) => 1 + (i % 4)) };
 
+const people = [[1, '  Ann Smith', 'Seattle'], [2, 'bob jones ', 'Austin'], [3, 'Çelik Ayşe', 'Ankara'], [4, 'dan', 'San José'], [5, 'Eve-Marie', 'Paris'], [6, "Frank O'Neil", null], [7, '東京 太郎', 'Tokyo'], [8, 'gus', 'Dublin']];
 const QUERIES = [
   'WITH s AS (SELECT cust, SUM(qty) AS q FROM orders GROUP BY cust) SELECT cust, q FROM s WHERE q > 950 ORDER BY q DESC, cust LIMIT 20',
   'SELECT c.tier, COUNT(*) AS n, AVG(t.spend) AS a FROM (SELECT cust, SUM(price * qty) AS spend FROM orders GROUP BY cust) t JOIN customers c ON t.cust = c.cust GROUP BY c.tier ORDER BY c.tier',
@@ -44,22 +45,42 @@ const QUERIES = [
   'SELECT cust, MEDIAN(price - 500) AS m, PERCENTILE_DISC(0.75) WITHIN GROUP (ORDER BY price) AS p75 FROM orders GROUP BY cust ORDER BY cust',
   'SELECT cust, price FROM orders WHERE cust = 7 ORDER BY price NULLS FIRST, ts LIMIT 12',
   'SELECT COUNT(*) AS n FROM customers a CROSS JOIN customers b WHERE a.tier = b.tier AND a.cust < 100 AND b.cust < 50',
+  // text
+  'SELECT UPPER(region) AS r, LOWER(region) AS l, LENGTH(region) AS n, COUNT(*) AS c FROM orders GROUP BY region ORDER BY r',
+  "SELECT region || '/' || CAST(qty AS VARCHAR) AS k, COUNT(*) AS n, SUM(price) AS s FROM orders GROUP BY 1 ORDER BY k",
+  "SELECT CASE WHEN price >= 500 THEN 'high' WHEN price >= 100 THEN 'mid' WHEN price IS NULL THEN 'unknown' ELSE 'low' END AS band, COUNT(*) AS n FROM orders GROUP BY band ORDER BY band",
+  "SELECT STRFTIME(ts, '%Y-%m') AS ym, COUNT(*) AS n, MAX(price) AS mx FROM orders GROUP BY ym ORDER BY ym",
+  "SELECT id, TRIM(name) AS t, UPPER(name) AS u, LENGTH(name) AS len, SUBSTR(name, 2, 3) AS s, LEFT(TRIM(name), 3) AS l, RIGHT(name, 2) AS r, REPLACE(name, ' ', '_') AS rp, REVERSE(city) AS rv, LPAD(city, 8, '.') AS lp, SPLIT_PART(TRIM(name), ' ', 2) AS sp, STRPOS(name, 'a') AS pos, CONCAT(city, '!', id) AS c, city || '/' || id AS cc, CONCAT_WS('-', city, name) AS ws, TRIM(LEADING ' ' FROM name) AS lt FROM people ORDER BY id",
+  "SELECT id, REGEXP_REPLACE(name, '[aeiou]', '*', 'g') AS r, REGEXP_EXTRACT(name, '([A-Z])[a-z]+', 1) AS x, REGEXP_MATCHES(name, 'an') AS m, name ILIKE '%AN%' AS il, STARTS_WITH(city, 'S') AS sw FROM people ORDER BY id",
+  "SELECT name FROM customers WHERE name >= 'c4' AND name < 'c41' ORDER BY name",
+  "SELECT region, COUNT(*) AS n FROM orders GROUP BY region HAVING LOWER(region) LIKE '%a%' ORDER BY region",
+  'SELECT SUM(CAST(SUBSTR(name, 2) AS INTEGER)) AS s, COUNT(DISTINCT LEFT(name, 2)) AS d FROM customers',
+  "SELECT CAST(cust AS VARCHAR) AS k FROM customers WHERE cust < 3 UNION SELECT region FROM orders ORDER BY k",
+  // outer joins
+  "SELECT o.cust, COALESCE(c.name, 'none') AS name, c.cust AS cc FROM orders o LEFT JOIN customers c ON o.cust = c.cust WHERE o.qty = 9 AND o.price > 990 ORDER BY o.ts, o.cust",
+  'SELECT c.tier, COUNT(o.cust) AS n, COUNT(*) AS rows FROM (SELECT * FROM orders WHERE price > 999) o RIGHT JOIN customers c ON o.cust = c.cust GROUP BY c.tier ORDER BY c.tier',
+  'SELECT COALESCE(o.cust, c.cust) AS k, o.n, c.name FROM (SELECT cust, COUNT(*) AS n FROM orders WHERE price > 999 GROUP BY cust) o FULL JOIN customers c ON o.cust = c.cust ORDER BY k',
+  'SELECT cust, n, tier FROM (SELECT cust, COUNT(*) AS n FROM orders WHERE price > 999.5 GROUP BY cust) o FULL JOIN customers USING (cust) ORDER BY cust',
+  'SELECT COUNT(*) AS n, COUNT(o.cust) AS a, COUNT(c.cust) AS b FROM orders o FULL OUTER JOIN customers c ON o.cust = c.cust',
+  'SELECT cust AS qty, qty AS cust FROM orders WHERE price > 999.9 ORDER BY qty, cust',
 ];
 
 const csv = join(tmpdir(), `vectro-check-sql-${N}.csv`);
 writeFileSync(csv, 'cust,price,qty,region,ts\n' + o.cust.map((x, i) => `${x},${o.price[i] === o.price[i] ? o.price[i] : ''},${o.qty[i]},${o.region[i]},${o.ts[i].toISOString()}`).join('\n'));
 const db = await (await DuckDBInstance.create(':memory:')).connect();
-await db.run(`CREATE TABLE orders AS SELECT cust::DOUBLE AS cust, price::DOUBLE AS price, qty::DOUBLE AS qty, region, ts::TIMESTAMP AS ts FROM read_csv('${csv}')`);
-await db.run('CREATE TABLE customers AS SELECT i::DOUBLE AS cust, \'c\' || i AS name, (1 + i % 4)::DOUBLE AS tier FROM range(1000) t(i)');
+await db.run(`CREATE TABLE orders AS SELECT cust::INTEGER AS cust, price::DOUBLE AS price, qty::INTEGER AS qty, region, ts::TIMESTAMP AS ts FROM read_csv('${csv}')`);
+await db.run('CREATE TABLE customers AS SELECT i::INTEGER AS cust, \'c\' || i AS name, (1 + i % 4)::INTEGER AS tier FROM range(1000) t(i)');
+await db.run(`CREATE TABLE people AS SELECT * FROM (VALUES ${people.map(([id, name, city]) => `(${id}, '${name.replaceAll("'", "''")}', ${city === null ? 'NULL' : `'${city}'`})`).join(', ')}) t(id, name, city)`);
 rmSync(csv);
 
 const engine = new Engine();
-const tables = { orders: engine.table(o), customers: engine.table(c) };
+const tables = { orders: engine.table(o), customers: engine.table(c), people: engine.table({ id: people.map((p) => p[0]), name: people.map((p) => p[1]), city: people.map((p) => p[2] ?? '') }) };
 const norm = (x) => {
   if (x === null || x === undefined) return 'NULL';
   if (typeof x === 'bigint') x = Number(x);
   if (x instanceof Date) return x.getTime();
   if (typeof x === 'object' && 'micros' in x) return Number(x.micros / 1000n); // a DuckDB timestamp
+  if (typeof x === 'boolean') return x ? 1 : 0;
   if (typeof x === 'number') return x !== x ? 'NULL' : Number(x.toPrecision(10));
   return x === '' ? 'NULL' : x;
 };

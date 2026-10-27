@@ -24,6 +24,13 @@ const QUERIES = [
   ['ROW_NUMBER over all rows', 'SELECT COUNT(*) AS n, SUM(rn) AS s FROM (SELECT ROW_NUMBER() OVER (PARTITION BY cust ORDER BY ts) AS rn FROM orders) t WHERE rn <= 3'],
   ['running total by day', "SELECT d, SUM(n) OVER (ORDER BY d) AS running FROM (SELECT DATE_TRUNC('day', ts) AS d, COUNT(*) AS n FROM orders GROUP BY 1) x ORDER BY d"],
   ['median per region', 'SELECT region, MEDIAN(price) AS m FROM orders GROUP BY region ORDER BY region'],
+  ['UPPER + group', 'SELECT UPPER(region) AS r, COUNT(*) AS n FROM orders GROUP BY 1 ORDER BY 1'],
+  ['|| key + group', "SELECT region || '-' || CAST(CAST(qty AS INTEGER) AS VARCHAR) AS k, SUM(price) AS s FROM orders GROUP BY 1 ORDER BY 1"],
+  ['CASE text + group', "SELECT CASE WHEN price >= 500 THEN 'high' WHEN price >= 100 THEN 'mid' ELSE 'low' END AS band, COUNT(*) AS n FROM orders GROUP BY 1 ORDER BY 1"],
+  ['STRFTIME month + group', "SELECT STRFTIME(ts, '%Y-%m') AS ym, COUNT(*) AS n FROM orders GROUP BY 1 ORDER BY 1"],
+  ['ILIKE filter', "SELECT COUNT(*) AS n FROM orders WHERE region ILIKE 'a%' OR LOWER(region) = 'eu'"],
+  ['RIGHT JOIN + group', 'SELECT c.tier, COUNT(o.cust) AS n FROM orders o RIGHT JOIN customers c ON o.cust = c.cust GROUP BY c.tier ORDER BY c.tier'],
+  ['FULL JOIN + count', 'SELECT COUNT(*) AS n, COUNT(o.cust) AS a, COUNT(c.cust) AS b FROM (SELECT * FROM orders WHERE price > 500) o FULL JOIN customers c ON o.cust = c.cust'],
 ];
 const csvOf = (name) => join(tmpdir(), `vectro-sql-${name}-${N}.csv`);
 function rng(seed) { return () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }

@@ -4,7 +4,7 @@
 //
 //   [WITH name [(cols)] AS (query), ...]
 //   SELECT [DISTINCT] items [FROM t [AS a] | (query) [AS] a
-//     [[INNER | LEFT [OUTER] | CROSS] JOIN u [AS b] | (query) b [ON a.x = b.y [AND ...] | USING (x, ...)]]...]
+//     [[INNER | LEFT | RIGHT | FULL [OUTER] | CROSS] JOIN u [AS b] | (query) b [ON a.x = b.y [AND ...] | USING (x, ...)]]...]
 //     [WHERE cond] [GROUP BY exprs] [HAVING cond]
 //   [UNION [ALL] | INTERSECT | EXCEPT SELECT ...]...
 //   [ORDER BY expr [ASC | DESC] [NULLS FIRST | LAST], ...] [LIMIT n | FETCH FIRST n ROWS ONLY] [OFFSET m]
@@ -20,7 +20,10 @@
 // GROUP (ORDER BY x) QUANTILE_CONT(x, p), anywhere in SELECT / HAVING / ORDER BY;
 // window functions f(...) OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS | RANGE
 // BETWEEN ... AND ...]): ROW_NUMBER RANK DENSE_RANK PERCENT_RANK CUME_DIST NTILE
-// LAG LEAD FIRST_VALUE LAST_VALUE NTH_VALUE and SUM AVG MIN MAX COUNT.
+// LAG LEAD FIRST_VALUE LAST_VALUE NTH_VALUE and SUM AVG MIN MAX COUNT;
+// text functions (see sqltext.mjs: UPPER, SUBSTRING, ||, REGEXP_REPLACE,
+// STRFTIME...), ILIKE, text CASE, CAST(x AS VARCHAR), run once per distinct
+// value (Table._textmap).
 //
 // Subqueries become joins, so the whole query stays one plan: IN / EXISTS
 // join the subquery's distinct keys (correlated ones on their equalities:
@@ -29,6 +32,7 @@
 
 import { Query, namesOf } from './plan.mjs';
 import { quoteText } from './fuse.mjs';
+import { TEXT_FUNCTIONS, toText, isNull, textToNumber, textToDate } from './sqltext.mjs';
 
 const KEYWORDS = new Set(['SELECT', 'DISTINCT', 'FROM', 'AS', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'ON', 'USING', 'WHERE', 'GROUP', 'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'AND', 'OR', 'NOT', 'BETWEEN', 'IN', 'LIKE', 'IS', 'NULL', 'TRUE', 'FALSE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'NULLS', 'FIRST', 'LAST', 'CAST', 'DATE', 'TIMESTAMP', 'INTERVAL', 'EXTRACT', 'ALL', 'EXISTS', 'UNION', 'INTERSECT', 'EXCEPT', 'WITH']);
 
@@ -115,7 +119,7 @@ function parseStatement(src) {
       needKw('NULL');
       return neg ? negate({ k: 'isnull', x: l }) : { k: 'isnull', x: l };
     }
-    const neg = isKw('NOT') && (isKw('BETWEEN', 1) || isKw('IN', 1) || isKw('LIKE', 1)) ? (p++, true) : false;
+    const neg = isKw('NOT') && (isKw('BETWEEN', 1) || isKw('IN', 1) || isKw('LIKE', 1) || isWord('ILIKE', 1)) ? (p++, true) : false;
     if (eatKw('BETWEEN')) { const lo = add(); needKw('AND'); const hi = add(); const e = { k: 'between', x: l, lo, hi }; return neg ? negate(e) : e; }
     if (eatKw('IN')) {
       needOp('(');
@@ -127,6 +131,7 @@ function parseStatement(src) {
       return neg ? negate(e) : e;
     }
     if (eatKw('LIKE')) { const e = { k: 'like', x: l, pattern: add() }; return neg ? negate(e) : e; }
+    if (eatWord('ILIKE')) { const e = { k: 'like', x: l, pattern: add(), ci: true }; return neg ? negate(e) : e; }
     const op = ['=', '<>', '!=', '<', '<=', '>', '>='].find((o) => isOp(o));
     if (op) { p++; return { k: 'bin', op, l, r: add() }; }
     return l;
@@ -136,7 +141,7 @@ function parseStatement(src) {
     for (;;) {
       if (eatOp('+')) l = { k: 'bin', op: '+', l, r: mul() };
       else if (eatOp('-')) l = { k: 'bin', op: '-', l, r: mul() };
-      else if (eatOp('||')) l = { k: 'call', fn: 'CONCAT', args: [l, mul()] };
+      else if (eatOp('||')) l = { k: 'call', fn: '||', args: l.k === 'call' && l.fn === '||' ? [...l.args, mul()] : [l, mul()] };
       else return l;
     }
   }
@@ -252,6 +257,34 @@ function parseStatement(src) {
   function call(fn) { // after the name: (args) [WITHIN GROUP (ORDER BY x)] [OVER (...)]
     needOp('(');
     let e;
+    // standard SQL's own forms: TRIM([BOTH | LEADING | TRAILING] [chars] FROM s), SUBSTRING(s FROM a [FOR n]), POSITION(sub IN s)
+    if (fn === 'TRIM' && (isWord('BOTH') || isWord('LEADING') || isWord('TRAILING') || isKw('FROM') || !isOp(')'))) {
+      const mode = eatWord('LEADING') ? 'LTRIM' : eatWord('TRAILING') ? 'RTRIM' : (eatWord('BOTH'), 'TRIM');
+      if (eatKw('FROM')) { const x = expr(); needOp(')'); return { k: 'call', fn: mode, args: [x] }; }
+      const first = expr();
+      if (eatKw('FROM')) { const x = expr(); needOp(')'); return { k: 'call', fn: mode, args: [x, first] }; }
+      const args = [first];
+      while (eatOp(',')) args.push(expr());
+      needOp(')');
+      return { k: 'call', fn: mode, args };
+    }
+    if ((fn === 'SUBSTRING' || fn === 'SUBSTR') && !isOp(')')) {
+      const x = expr();
+      if (eatKw('FROM')) { const args = [x, expr()]; if (eatWord('FOR')) args.push(expr()); needOp(')'); return { k: 'call', fn: 'SUBSTRING', args }; }
+      if (eatWord('FOR')) { const args = [x, { k: 'num', v: 1 }, expr()]; needOp(')'); return { k: 'call', fn: 'SUBSTRING', args }; }
+      const args = [x];
+      while (eatOp(',')) args.push(expr());
+      needOp(')');
+      return { k: 'call', fn: 'SUBSTRING', args };
+    }
+    if (fn === 'POSITION' && !isOp(')')) {
+      const sub = add();
+      if (eatKw('IN')) { const x = expr(); needOp(')'); return { k: 'call', fn: 'STRPOS', args: [x, sub] }; }
+      const args = [sub];
+      while (eatOp(',')) args.push(expr());
+      needOp(')');
+      return { k: 'call', fn: 'POSITION', args };
+    }
     if (eatOp('*')) { needOp(')'); e = { k: 'call', fn, args: [], star: true }; }
     else {
       const distinct = eatKw('DISTINCT');
@@ -381,6 +414,8 @@ const v = (name) => ({ t: 'var', name });
 const bin = (op, l, r) => ({ t: 'bin', op, l, r });
 const call = (fn, ...args) => ({ t: 'call', fn, args });
 const cond = (c, x, y) => ({ t: 'cond', c, x, y });
+const TEXT_TYPES = new Set(['VARCHAR', 'TEXT', 'STRING', 'CHAR', 'BPCHAR', 'NVARCHAR', 'NCHAR', 'CHARACTER']);
+function astVars(t, out = []) { if (t.t === 'var') out.push(t.name); for (const x of [t.x, t.l, t.r, t.c, t.y, ...(t.args ?? [])]) if (x && typeof x === 'object') astVars(x, out); return out; }
 const constNum = (t) => (t.t === 'num' ? t.v : t.t === 'un' && t.op === '-' && t.x.t === 'num' ? -t.x.v : null);
 const isAgg = (e) => e.k === 'call' && (AGG[e.fn] || PERCENTILE.has(e.fn));
 const key = (e) => JSON.stringify(e);
@@ -525,6 +560,7 @@ function compileSelect(ast, env, outer, tail) {
 
   // a column reference -> its output name (or, if outer resolves it, an outer marker)
   const find = (ref) => {
+    if (!ref.table && usingMap.has(ref.name.toLowerCase())) return usingMap.get(ref.name.toLowerCase());
     if (ref.table) {
       const s = scope.find((x) => x.alias.toLowerCase() === ref.table.toLowerCase());
       if (!s) return null;
@@ -563,21 +599,26 @@ function compileSelect(ast, env, outer, tail) {
     return name;
   };
 
-  for (const j of ast.joins) {
+  // USING (k) columns: an unqualified k reads the left's (LEFT), the right's (RIGHT) or either (FULL)
+  const usingMap = new Map();
+  // (the joins run after the translator below is set up: function declarations)
+  function addJoin(j) {
     const right = relationOf(j, env, outer);
     const rs = { alias: j.alias, rel: right, names: new Map() };
     const rightHas = (name) => right.names.includes(name);
+    const outerJoin = j.how === 'left' || j.how === 'right' || j.how === 'full';
     let on;
     const extra = []; // ON conditions that aren't key equalities (inner joins only)
-    if (j.how === 'right' || j.how === 'full') fail(`${j.how.toUpperCase()} JOIN is not supported yet (LEFT JOIN with the tables swapped works for RIGHT JOIN)`);
     let rq = right.query;
     if (j.how === 'cross') { // every pair: both sides on one constant key
       const k = `__x${n.hidden++}`;
       q = q.derive(k, '0');
       rq = rq.derive(k, '0');
       on = { left: [k], right: [k] };
-    } else if (j.using) on = { left: j.using.map((c) => resolve({ name: c })), right: j.using };
-    else {
+    } else if (j.using) {
+      for (const c of j.using) if (!rightHas(c)) fail(`table "${j.name ?? j.alias}" has no column "${c}" (USING)`);
+      on = { left: j.using.map((c) => resolve({ name: c })), right: j.using };
+    } else {
       const lefts = [], rights = [];
       const conds = [];
       for (const c of conjuncts(j.on)) {
@@ -589,23 +630,75 @@ function compileSelect(ast, env, outer, tail) {
         } else conds.push(c);
       }
       if (!lefts.length) fail(`JOIN ${j.name ?? j.alias} needs ON with an equality between the two sides, e.g. ON a.id = b.id`);
-      if (conds.length && j.how === 'left') fail('LEFT JOIN ... ON takes key equalities only (move other conditions to WHERE)');
+      if (conds.length && outerJoin) fail(`${j.how.toUpperCase()} JOIN ... ON takes key equalities only (move other conditions to WHERE)`);
       on = { left: lefts, right: rights };
       extra.push(...conds);
     }
+    // outer joins: a right key named like its left key gets a name of its own,
+    // so it reads as missing where no right row matched (an inner join keeps one)
+    const original = new Map(); // right column in rq -> its name in the right relation
+    let rightCols = right.names;
+    if (outerJoin) {
+      const renamed = new Map();
+      on = { left: on.left, right: on.right.map((r, k) => {
+        if (on.left[k] !== r) return r;
+        if (!renamed.has(r)) { const h = `__k${n.hidden++}`; rq = rq.derive(h, r); renamed.set(r, h); original.set(h, r); }
+        return renamed.get(r);
+      }) };
+      if (renamed.size) { rightCols = [...right.names.filter((x) => !renamed.has(x)), ...renamed.values()]; rq = rq.select(...rightCols); }
+    }
     // output names, as the join makes them: right key columns named like the left key go away
     const sameKey = new Set(on.right.filter((x, k) => on.left[k] === x));
-    for (const x of right.names) {
+    const leftNames = [...outNames], rightOut = [];
+    for (const x of rightCols) {
       if (sameKey.has(x)) { rs.names.set(x, x); continue; }
       let out = x;
       while (outNames.includes(out)) out += '_right';
       outNames.push(out);
-      rs.names.set(x, out);
-      kinds.set(out, right.kinds.get(x));
+      rightOut.push(out);
+      const orig = original.get(x) ?? x;
+      rs.names.set(orig, out);
+      kinds.set(out, right.kinds.get(orig));
     }
-    q = q.join(rq, { on: on.left.every((x, k) => x === on.right[k]) ? on.left : on, how: j.how === 'cross' ? 'inner' : j.how });
+    const keys = on.left.every((x, k) => x === on.right[k]) ? on.left : on;
+    if (j.how === 'right' || j.how === 'full') q = outerJoinG(rq, on, j.how, leftNames, rightCols, rightOut);
+    else q = q.join(rq, { on: keys, how: j.how === 'cross' ? 'inner' : j.how });
     scope.push(rs);
+    if (j.using && outerJoin) {
+      j.using.forEach((c, k) => {
+        const lo = on.left[k], ro = rs.names.get(c);
+        let out = j.how === 'left' ? lo : ro;
+        if (j.how === 'full') { // either side's key
+          out = `__u${n.hidden++}`;
+          q = kinds.get(lo) === 'text' ? q.textmap(out, { inputs: [lo, ro], fn: (a, b) => (a !== '' ? a : b), label: 'coalesce' }) : q.derive(out, `coalesce(${lo}, ${ro})`);
+          kinds.set(out, kinds.get(lo));
+        }
+        usingMap.set(c.toLowerCase(), out);
+      });
+    }
     for (const c of extra) { const t = translate(c, plain); q = q.filter(src(t)); } // (translating may join: q after it)
+  }
+
+  // RIGHT / FULL JOIN: the matching pairs (FULL: and the left rows without a
+  // match: a LEFT join), then the right rows whose keys no left row has (the
+  // right side joined to the left's distinct keys), with the left's columns
+  // missing; both in the same column order, one after the other.
+  function outerJoinG(rq, on, how, leftNames, rightCols, rightOut) {
+    const tag = n.hidden++;
+    const leftQ = q.select(...leftNames);
+    const fresh = on.left.map((_, k) => `__a${tag}_${k}`), mark = `__am${tag}`;
+    let lkeys = leftQ;
+    on.left.forEach((x, k) => { lkeys = lkeys.derive(fresh[k], x); });
+    lkeys = lkeys.select(...fresh).groupBy(fresh).agg({ [`__ac${tag}`]: 'count()' }).derive(mark, '1').select(...fresh, mark);
+    let lone = rq.join(lkeys, { on: { left: on.right, right: fresh }, how: 'left', view: true }).filter(`!(${mark} == 1)`);
+    const tmp = rightCols.map((_, k) => `__p${tag}_${k}`);
+    rightCols.forEach((x, k) => { lone = lone.derive(tmp[k], x); });
+    lone = lone.select(...tmp);
+    for (const L of leftNames) lone = kinds.get(L) === 'text' ? lone.textmap(L, { fn: () => '', label: 'null' }) : lone.derive(L, 'NaN');
+    rightOut.forEach((o, k) => { lone = lone.derive(o, tmp[k]); });
+    const order = [...leftNames, ...rightOut];
+    const joined = leftQ.join(rq, { on: on.left.every((x, k) => x === on.right[k]) ? on.left : on, how: how === 'full' ? 'left' : 'inner' });
+    return Query.union([joined.select(...order), lone.select(...order)]);
   }
 
   // ---- subqueries in expressions: joins that add a column ----------------------------------
@@ -694,8 +787,90 @@ function compileSelect(ast, env, outer, tail) {
   }
 
   // ---- translating expressions; `ctx.col(ref)` turns a column into an AST -----------------
-  const plain = { col: (ref) => v(resolve(ref)), agg: () => fail('aggregates (SUM, COUNT...) belong in SELECT, HAVING or ORDER BY, not here'), window: () => fail('window functions (... OVER (...)) belong in SELECT or ORDER BY') };
-  const kindOf = (e, ctx) => (e.k === 'col' ? (ctx.kindOfCol?.(e) ?? kinds.get(resolve(e))) : e.k === 'date' ? 'date' : e.k === 'str' ? 'text' : e.k === 'window' ? ctx.windowKind?.(e) ?? 'number' : 'number');
+  // (ctx.step: a new column the expression needs, made now, or after grouping for post)
+  const plain = { col: (ref) => v(resolve(ref)), agg: () => fail('aggregates (SUM, COUNT...) belong in SELECT, HAVING or ORDER BY, not here'), window: () => fail('window functions (... OVER (...)) belong in SELECT or ORDER BY'), step: (st) => st.run() };
+  const mostKind = (ks) => (ks.includes('text') ? 'text' : ks.includes('date') ? 'date' : 'number');
+  function kindOf(e, ctx) {
+    switch (e.k) {
+      case 'col': return ctx.kindOfCol?.(e) ?? kinds.get(e.resolved ? e.name : resolve(e));
+      case 'date': return 'date';
+      case 'str': return 'text';
+      case 'window': return ctx.windowKind?.(e) ?? 'number';
+      case 'cast': return TEXT_TYPES.has(e.type) ? 'text' : e.type === 'DATE' || e.type === 'TIMESTAMP' ? 'date' : 'number';
+      case 'case': return mostKind([...e.whens.map((w) => kindOf(w.v, ctx)), kindOf(e.otherwise, ctx)]);
+      case 'call':
+        if (TEXT_FUNCTIONS[e.fn] && !isAgg(e)) return TEXT_FUNCTIONS[e.fn].out === 'text' ? 'text' : 'number';
+        if (['COALESCE', 'IFNULL', 'NVL', 'NULLIF'].includes(e.fn)) return mostKind(e.args.map((a) => kindOf(a, ctx)));
+        if (e.fn === 'DATE_TRUNC') return 'date';
+        return 'number';
+      default: return 'number';
+    }
+  }
+
+  // ---- text: columns computed once per distinct value (Table._textmap) ------------------
+  // a column for an AST (an expression becomes a hidden derived column)
+  function materialize(t, ctx) {
+    if (t.t === 'var') return t.name;
+    const name = `__h${n.hidden++}`;
+    ctx.step({ name, inputs: astVars(t), run: () => { q = q.derive(name, src(t)); } });
+    return name;
+  }
+  // an argument: a constant { value, kind } or a column { col, kind }
+  function argOf(e, ctx) {
+    if (e.k === 'str') return { value: e.v, kind: 'text' };
+    if (e.k === 'num') return { value: e.v, kind: 'number' };
+    if (e.k === 'null') return { value: null, kind: 'number' };
+    if (e.k === 'neg' && e.x.k === 'num') return { value: -e.x.v, kind: 'number' };
+    if (e.k === 'date') return { value: textToDate(e.v), kind: 'date' };
+    const kind = kindOf(e, ctx) ?? 'number', t = translate(e, ctx);
+    if (t.t === 'num') return { value: t.v, kind: 'number' };
+    if (t.t === 'str') return { value: t.v, kind: 'text' };
+    return { col: materialize(t, ctx), kind };
+  }
+  // a new column: f(values, kinds) of the arguments' values (null where missing,
+  // and then the answer is missing unless skip)
+  function valueColumn(ctx, args, f, { text = true, skip = false, date = false, label = 'fn' } = {}) {
+    const inputs = [...new Set(args.filter((a) => a.col).map((a) => a.col))];
+    const at = args.map((a) => (a.col ? inputs.indexOf(a.col) : -1)), ks = args.map((a) => a.kind);
+    const fn = (...vals) => {
+      const xs = args.map((a, i) => (at[i] >= 0 ? (isNull(vals[at[i]], a.kind) ? null : vals[at[i]]) : a.value));
+      if (!skip && xs.includes(null)) return text ? '' : NaN;
+      return f(xs, ks);
+    };
+    const name = `__t${n.hidden++}`;
+    ctx.step({ name, inputs, run: () => { q = q.textmap(name, { inputs, fn, text, date, label }); } });
+    return v(name);
+  }
+  const asType = (x, kind, type) => (x === null ? null : type === 's' ? toText(x, kind) : kind === 'text' ? (type === 't' ? textToDate(x) : textToNumber(x)) : x);
+  function textCall(e, ctx) {
+    const spec = TEXT_FUNCTIONS[e.fn], min = spec.min ?? spec.args.length;
+    const LABEL_TESTS = { STARTS_WITH: 'startsWith', PREFIX: 'startsWith', ENDS_WITH: 'endsWith', SUFFIX: 'endsWith', CONTAINS: 'contains' };
+    if (LABEL_TESTS[e.fn] && e.args.length === 2 && e.args[0].k === 'col' && e.args[1].k === 'str' && kindOf(e.args[0], ctx) === 'text')
+    { const x = translate(e.args[0], ctx); return cond(bin('==', x, { t: 'str', v: '' }), num(NaN), cond(call(LABEL_TESTS[e.fn], x, { t: 'str', v: e.args[1].v }), num(1), num(0))); } // (a column: label by label, in the fused pass; missing stays missing)
+    if (e.fn === 'STRFTIME' && e.args.length === 2 && e.args[1].k === 'str') { // times rounded to what the format shows: fewer distinct values to format
+      const f = e.args[1].v.replace(/%%/g, '');
+      const unit = /%[MSfTcXsz]/.test(f) ? null : /%[HIpk]/.test(f) ? 'hourStart' : /%[dejaAwuUWVGgFDx]/.test(f) ? 'dayStart' : /%[mbBh]/.test(f) ? 'monthStart' : /%[Yy]/.test(f) ? 'yearStart' : null;
+      if (unit && kindOf(e.args[0], ctx) !== 'text') {
+        const t = call(unit, translate(e.args[0], ctx));
+        return valueColumn(ctx, [{ col: materialize(t, ctx), kind: 'date' }, { value: e.args[1].v, kind: 'text' }], ([x, fmt]) => spec.f(x, fmt), { label: 'strftime' });
+      }
+    }
+    if (e.args.length < min || (!spec.rest && e.args.length > spec.args.length)) fail(`${e.fn}() takes ${min === spec.args.length && !spec.rest ? min : `${min}${spec.rest ? ' or more' : ` to ${spec.args.length}`}`} value(s)`);
+    const args = e.args.map((a) => argOf(a, ctx)), type = (i) => spec.args[i] ?? spec.rest;
+    return valueColumn(ctx, args, (xs, ks) => spec.f(...xs.map((x, i) => asType(x, ks[i], type(i)))), { text: spec.out === 'text', skip: spec.skip, label: e.fn.toLowerCase() });
+  }
+  // comparing text: as text; text with a number or a date: as numbers or dates
+  function compareValues(op, e, ctx) {
+    const args = [argOf(e.l, ctx), argOf(e.r, ctx)];
+    const asOf = args.some((a) => a.kind === 'date') ? 'date' : args.some((a) => a.kind === 'number' && a.value !== null) ? 'number' : 'text';
+    const conv = (x, k) => (asOf === 'text' ? toText(x, k) : k !== 'text' ? x : asOf === 'date' ? textToDate(x) : textToNumber(x));
+    const test = { '==': (c) => c === 0, '!=': (c) => c !== 0, '<': (c) => c < 0, '<=': (c) => c <= 0, '>': (c) => c > 0, '>=': (c) => c >= 0 }[op];
+    return valueColumn(ctx, args, ([a, b], [ka, kb]) => {
+      const x = conv(a, ka), y = conv(b, kb);
+      if (x !== x || y !== y) return NaN;
+      return test(x < y ? -1 : x > y ? 1 : 0) ? 1 : 0;
+    }, { text: false, label: op });
+  }
   function translate(e, ctx) {
     const T = (x) => translate(x, ctx);
     switch (e.k) {
@@ -719,13 +894,27 @@ function compileSelect(ast, env, outer, tail) {
         if (e.op === 'AND') return bin('&&', T(e.l), T(e.r));
         if (e.op === 'OR') return bin('||', T(e.l), T(e.r));
         const op = { '=': '==', '<>': '!=' }[e.op] ?? e.op;
+        if (['==', '!=', '<', '<=', '>', '>='].includes(op)) {
+          const lk = kindOf(e.l, ctx), rk = kindOf(e.r, ctx);
+          if (lk === 'text' || rk === 'text') {
+            if ((lk === 'date' && e.r.k === 'str') || (rk === 'date' && e.l.k === 'str')) // a date written as text
+              return bin(op, e.l.k === 'str' ? T({ k: 'date', v: e.l.v }) : T(e.l), e.r.k === 'str' ? T({ k: 'date', v: e.r.v }) : T(e.r));
+            const lit = e.l.k === 'str' ? e.r : e.r.k === 'str' ? e.l : null;
+            if ((op === '==' || op === '!=') && lit && lit.k !== 'str' && kindOf(lit, ctx) === 'text') return bin(op, T(e.l), T(e.r)); // (a column and a label: by code)
+            return bin('==', compareValues(op, e, ctx), num(1));
+          }
+        }
         if (op === '%') { // SQL: the sign of the dividend (truncate the quotient toward 0)
           const a = T(e.l), b = T(e.r), qt = bin('/', a, b);
           return bin('-', a, bin('*', cond(bin('>=', qt, num(0)), call('floor', qt), call('ceil', qt)), b));
         }
         return bin(op, T(e.l), T(e.r));
       }
-      case 'between': { const x = T(e.x); return bin('&&', bin('>=', x, T(e.lo)), bin('<=', x, T(e.hi))); }
+      case 'between': {
+        if (kindOf(e.x, ctx) === 'text') return T({ k: 'bin', op: 'AND', l: { k: 'bin', op: '>=', l: e.x, r: e.lo }, r: { k: 'bin', op: '<=', l: e.x, r: e.hi } });
+        const x = T(e.x);
+        return bin('&&', bin('>=', x, T(e.lo)), bin('<=', x, T(e.hi)));
+      }
       case 'in': {
         const x = T(e.x);
         if (kindOf(e.x, ctx) === 'text') {
@@ -735,13 +924,22 @@ function compileSelect(ast, env, outer, tail) {
         return e.list.map((i) => bin('==', x, T(i))).reduce((a, b) => bin('||', a, b));
       }
       case 'like': {
-        if (e.pattern.k !== 'str') fail('LIKE needs a pattern in quotes');
-        if (kindOf(e.x, ctx) !== 'text') fail('LIKE works on text columns');
+        if (e.pattern.k !== 'str') fail(`${e.ci ? 'ILIKE' : 'LIKE'} needs a pattern in quotes`);
+        if (kindOf(e.x, ctx) !== 'text') fail(`${e.ci ? 'ILIKE' : 'LIKE'} works on text`);
+        if (e.ci && e.x.k === 'col') return call('ilike', T(e.x), { t: 'str', v: e.pattern.v }); // (a column: label by label)
+        if (e.ci) return T({ k: 'like', x: { k: 'call', fn: 'LOWER', args: [e.x] }, pattern: { k: 'str', v: e.pattern.v.toLowerCase() } });
         return call('like', T(e.x), { t: 'str', v: e.pattern.v });
       }
       case 'isnull': return kindOf(e.x, ctx) === 'text' ? bin('==', T(e.x), { t: 'str', v: '' }) : call('isMissing', T(e.x));
       case 'case': {
-        let out = e.otherwise.k === 'str' || e.whens.some((w) => w.v.k === 'str') ? fail('CASE can give numbers (or dates), not text') : T(e.otherwise);
+        if (kindOf(e, ctx) === 'text') { // which branch (a number), then that branch's value as text
+          const branches = [...e.whens.map((w) => w.v), e.otherwise];
+          let which = num(branches.length - 1);
+          for (let i = e.whens.length - 1; i >= 0; i--) which = cond(e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : T(e.whens[i].c), num(i), which);
+          const args = [which.t === 'num' ? { value: which.v, kind: 'number' } : { col: materialize(which, ctx), kind: 'number' }, ...branches.map((b) => argOf(b, ctx))];
+          return valueColumn(ctx, args, (xs, ks) => { const x = xs[1 + xs[0]]; return x === null ? '' : toText(x, ks[1 + xs[0]]); }, { skip: true, label: 'case' });
+        }
+        let out = T(e.otherwise);
         for (let i = e.whens.length - 1; i >= 0; i--) {
           const c = e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : T(e.whens[i].c);
           out = cond(c, T(e.whens[i].v), out);
@@ -749,6 +947,14 @@ function compileSelect(ast, env, outer, tail) {
         return out;
       }
       case 'cast': {
+        const from = kindOf(e.x, ctx);
+        if (TEXT_TYPES.has(e.type)) return from === 'text' ? T(e.x) : valueColumn(ctx, [argOf(e.x, ctx)], ([x], [k]) => toText(x, k), { label: 'text' });
+        if (e.x.k === 'str' && !(e.type === 'DATE' || e.type === 'TIMESTAMP')) { const x = textToNumber(e.x.v); return num(['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT'].includes(e.type) ? Math.trunc(x) : x); }
+        if (from === 'text' && e.x.k !== 'str') { // text to a number or a date (missing where it isn't one)
+          const whole = ['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT'].includes(e.type), date = e.type === 'DATE' || e.type === 'TIMESTAMP';
+          if (!whole && !date && !['DOUBLE', 'FLOAT', 'REAL', 'DECIMAL', 'NUMERIC'].includes(e.type)) fail(`CAST to ${e.type} is not supported`);
+          return valueColumn(ctx, [argOf(e.x, ctx)], ([x]) => { if (date) { const t = textToDate(x); return e.type === 'DATE' ? Math.floor(t / 86_400_000) * 86_400_000 : t; } const v = textToNumber(x); return whole ? Math.trunc(v) : v; }, { text: false, date, label: e.type.toLowerCase() });
+        }
         const x = T(e.x);
         if (['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT'].includes(e.type)) return cond(bin('>=', x, num(0)), call('floor', x), call('ceil', x));
         if (['DOUBLE', 'FLOAT', 'REAL', 'DECIMAL', 'NUMERIC'].includes(e.type)) return x;
@@ -757,6 +963,13 @@ function compileSelect(ast, env, outer, tail) {
       }
       case 'call': {
         if (isAgg(e)) return ctx.agg(e);
+        if (TEXT_FUNCTIONS[e.fn]) return textCall(e, ctx);
+        if (['COALESCE', 'IFNULL', 'NVL', 'NULLIF'].includes(e.fn) && kindOf(e, ctx) === 'text') {
+          if (e.args.length < 2 || (e.fn === 'NULLIF' && e.args.length !== 2)) fail(`${e.fn}() needs ${e.fn === 'NULLIF' ? 'two values' : 'two values or more'}`);
+          const args = e.args.map((x) => argOf(x, ctx));
+          if (e.fn === 'NULLIF') return valueColumn(ctx, args, ([a, b], [ka, kb]) => (a === null ? '' : b !== null && toText(a, ka) === toText(b, kb) ? '' : toText(a, ka)), { skip: true, label: 'nullif' });
+          return valueColumn(ctx, args, (xs, ks) => { const i = xs.findIndex((x) => x !== null); return i < 0 ? '' : toText(xs[i], ks[i]); }, { skip: true, label: 'coalesce' });
+        }
         const a = e.args.map(T), need = (k) => { if (a.length !== k) fail(`${e.fn}() takes ${k} value(s)`); };
         switch (e.fn) {
           case 'ABS': case 'SQRT': case 'FLOOR': need(1); return call(e.fn.toLowerCase(), a[0]);
@@ -778,7 +991,6 @@ function compileSelect(ast, env, outer, tail) {
           case 'DOW': case 'DAYOFWEEK': need(1); { const w = call('weekday', a[0]); return bin('-', w, bin('*', call('floor', bin('/', w, num(7))), num(7))); } // 0 = Sunday
           case 'WEEKDAY': case 'ISODOW': need(1); return call('weekday', a[0]);
           case 'NOW': case 'CURRENT_TIMESTAMP': return num(Date.now());
-          case 'CONCAT': fail('text can be compared and grouped, not joined with || or CONCAT (yet)');
           default:
             if (DATE_PART[e.fn]) { need(1); return call(DATE_PART[e.fn], a[0]); }
             if (WINDOW_FNS[e.fn] && !AGG[e.fn]) fail(`${e.fn}() needs OVER (...)`);
@@ -789,6 +1001,8 @@ function compileSelect(ast, env, outer, tail) {
     fail(`can't use ${e.k} here`);
   }
   const src = (a) => toSourceAst(a);
+
+  for (const j of ast.joins) addJoin(j);
 
   if (ast.where) {
     if (hasAgg(ast.where)) fail('aggregates (SUM, COUNT...) can\'t be used in WHERE: use HAVING');
@@ -804,7 +1018,15 @@ function compileSelect(ast, env, outer, tail) {
       const from = e.table ? scope.filter((s) => s.alias.toLowerCase() === e.table.toLowerCase()) : scope;
       if (!from.length) fail(`no table or alias "${e.table}"`);
       const seen = new Set(items.map((i) => i.name));
-      for (const s of from) for (const out of new Set(s.names.values())) if (!seen.has(out) && !out.startsWith('__')) { seen.add(out); items.push({ e: { k: 'col', name: out, resolved: true }, name: out }); }
+      for (const s of from) {
+        for (const [orig, out] of s.names) {
+          const u = e.table ? null : usingMap.get(orig.toLowerCase()); // (a USING key once)
+          const label = u ? orig : out;
+          if (seen.has(label) || (!u && out.startsWith('__'))) continue;
+          seen.add(label);
+          items.push({ e: { k: 'col', name: u ?? out, resolved: true }, name: label });
+        }
+      }
       return;
     }
     items.push({ e, alias, name: alias ?? null });
@@ -915,7 +1137,7 @@ function compileSelect(ast, env, outer, tail) {
       let name;
       if (t.t === 'var') name = t.name;
       else { name = `__g${keys.length}_${n.hidden++}`; q = q.derive(name, src(t)); }
-      keys.push({ name, sqlKey: key(e), colName: t.t === 'var' ? t.name : null, kind: e.k === 'col' ? kinds.get(t.name) : 'number' });
+      keys.push({ name, sqlKey: key(e), colName: t.t === 'var' ? t.name : null, kind: e.k === 'col' ? kinds.get(t.name) : kindOf(e, plain) });
     }
     // aggregates, each once
     const aggs = new Map(); // sqlKey -> name
@@ -933,6 +1155,7 @@ function compileSelect(ast, env, outer, tail) {
         spec[name] = `min(${qn})`;
         return v(name);
       }
+      if ((e.fn === 'MIN' || e.fn === 'MAX' || e.fn === 'SUM' || e.fn === 'AVG' || e.fn === 'MEAN') && e.args[0] && kindOf(e.args[0], plain) === 'text') fail(`${e.fn}() of text is not supported yet (COUNT and COUNT(DISTINCT) are)`);
       const fn = e.fn === 'COUNT' && e.star ? 'count' : e.fn === 'COUNT' && e.distinct ? 'countDistinct' : AGG[e.fn];
       if (e.distinct && e.fn !== 'COUNT') fail(`${e.fn}(DISTINCT ...) is not supported (COUNT(DISTINCT x) is)`);
       if (!e.star && e.args.length !== 1) fail(`${e.fn}() takes one value`);
@@ -940,7 +1163,9 @@ function compileSelect(ast, env, outer, tail) {
       return v(name);
     };
     // after grouping: aggregates and keys by name; other columns must be keys
+    const deferred = []; // columns made from grouped values: after grouping
     const post = windowCtx({
+      step: (st) => deferred.push(st),
       agg: aggOf,
       col: (ref) => {
         const k = keys.find((x) => x.sqlKey === key(ref) || (x.colName && x.colName === (ref.resolved ? ref.name : resolve(ref))));
@@ -955,33 +1180,39 @@ function compileSelect(ast, env, outer, tail) {
       return translate(e, post);
     };
     planWindows(translatePost, (x) => kindOf(x, post));
-    const outs = items.map((it) => ({ ...it, ast: translatePost(it.e) }));
+    const outs = withCols(items.map((it) => ({ ...it, ast: translatePost(it.e) })));
     const havingAst = ast.having ? translatePost(ast.having) : null;
     const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, translatePost) }));
     q = q.groupBy([...keys.map((k) => k.name), ...extraKeys]).agg(Object.keys(spec).length ? spec : { __a_rows: 'count()' });
+    const late = new Set(windowVars.values()), after = []; // (those using window values: after the windows)
+    for (const st of deferred) if (st.inputs.some((x) => late.has(x))) { late.add(st.name); after.push(st); } else st.run();
     if (havingAst) q = q.filter(src(havingAst));
     applyWindows();
-    for (const o of outs) if (!(o.ast.t === 'var' && o.ast.name === o.name)) q = q.derive(o.name, src(o.ast));
+    for (const st of after) st.run();
+    for (const o of outs) if (o.ast.t !== 'var') q = q.derive(o.col, src(o.ast));
     for (const o of orderAsts) sortKey(o);
     return finish(outs, (o) => (o.e.k === 'col' ? post.kindOfCol(o.e) ?? kinds.get(resolveSafe(o.e)) : kindOf(o.e, post)));
   }
   const pre = windowCtx(plain);
   planWindows((e) => (e.k === 'col' ? colOf(e) : translate(e, pre)), (x) => kindOf(x, pre));
   applyWindows();
-  const outs = items.map((it) => ({ ...it, ast: it.e.k === 'col' ? colOf(it.e) : translate(it.e, pre) }));
+  const outs = withCols(items.map((it) => ({ ...it, ast: it.e.k === 'col' ? colOf(it.e) : translate(it.e, pre) })));
   const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, (e) => (e.k === 'col' ? colOf(e) : translate(e, pre))) }));
-  for (const o of outs) if (!(o.ast.t === 'var' && o.ast.name === o.name)) q = q.derive(o.name, src(o.ast));
+  for (const o of outs) if (o.ast.t !== 'var') q = q.derive(o.col, src(o.ast));
   for (const o of orderAsts) sortKey(o);
-  if (ast.distinct) q = q.groupBy(outs.map((o) => o.name)).agg({ __distinct_rows: 'count()' });
+  if (ast.distinct) q = q.groupBy([...new Set(outs.map((o) => o.col))]).agg({ __distinct_rows: 'count()' });
   return finish(outs, (o) => (o.e.k === 'col' ? kinds.get(o.e.resolved ? o.e.name : resolve(o.e)) : kindOf(o.e, pre)));
 
+  // each output's column while the query runs: a column as it is, or a
+  // hidden one (renamed at the end: an output may take a name in use)
+  function withCols(outs) { for (const o of outs) o.col = o.ast.t === 'var' ? o.ast.name : `__s${n.hidden++}`; return outs; }
   function resolveSafe(e) { try { return e.resolved ? e.name : resolve(e); } catch { return null; } }
   // ORDER BY item -> an output name or an expression
   function orderTarget(e, outs, tr) {
-    if (e.k === 'num') { const o = outs[e.v - 1]; if (!o) fail(`ORDER BY ${e.v}: there is no select item ${e.v}`); return v(o.name); }
-    if (e.k === 'col' && !e.table) { const o = outs.find((x) => x.name === e.name); if (o) return v(o.name); }
+    if (e.k === 'num') { const o = outs[e.v - 1]; if (!o) fail(`ORDER BY ${e.v}: there is no select item ${e.v}`); return v(o.col); }
+    if (e.k === 'col' && !e.table) { const o = outs.find((x) => x.name === e.name); if (o) return v(o.col); }
     const t = tr(e), same = outs.find((o) => toSourceAst(o.ast) === toSourceAst(t));
-    return same ? v(same.name) : t;
+    return same ? v(same.col) : t;
   }
   function sortKey(o) {
     let k;
@@ -997,6 +1228,12 @@ function compileSelect(ast, env, outer, tail) {
     else if (tail.offset) fail('OFFSET needs LIMIT');
     const names = outs.map((o) => o.name);
     const outKinds = new Map(outs.map((o) => [o.name, kindFn(o) ?? 'number']));
+    if (outs.some((o) => o.col !== o.name)) { // (through fresh names: an output may be named like another's column)
+      const tmp = new Map([...new Set(outs.map((o) => o.col))].map((c) => [c, `__f${n.hidden++}`]));
+      for (const [c, t] of tmp) out = out.derive(t, c);
+      out = out.select(...tmp.values());
+      for (const o of outs) out = out.derive(o.name, tmp.get(o.col));
+    }
     return { query: out.select(...names), names, kinds: outKinds };
   }
 }

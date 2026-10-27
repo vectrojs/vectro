@@ -87,6 +87,10 @@ export class Query {
     const right = other instanceof Query ? other.node : { op: 'scan', table: other };
     return new Query({ op: 'join', left: this.node, right, opts: opts ?? {} });
   }
+  // (SQL) a column computed by a JavaScript function of whole values, once
+  // per distinct combination (text functions): see Table._textmap. The spec's
+  // state keeps the labels, so it is made here once for this step.
+  textmap(name, spec) { return new Query({ op: 'textmap', input: this.node, name, inputs: spec.inputs ?? [], fn: spec.fn, text: spec.text ?? true, date: spec.date ?? false, label: spec.label ?? 'fn', state: spec.state ?? { dict: [], codes: new Map() } }); }
   // (SQL) window functions: see Table._window for the spec
   window(spec) { return new Query({ op: 'window', input: this.node, partition: spec.partition ?? [], order: spec.order ?? [], items: spec.items }); }
   // (SQL) the rows of several queries one after another, columns by position
@@ -128,6 +132,7 @@ export function namesOf(node) {
     case 'aggregate': return [...node.keys, ...Object.keys(node.spec)];
     case 'join': return joinNames(node).all;
     case 'window': return [...namesOf(node.input).filter((n) => !node.items.some((it) => it.name === n)), ...node.items.map((it) => it.name)];
+    case 'textmap': return [...namesOf(node.input).filter((n) => n !== node.name), node.name];
     case 'union': return namesOf(node.inputs[0]);
   }
   return [];
@@ -173,6 +178,9 @@ function pushFilter(node, cond) {
       return { ...node, input: pushFilter(node.input, used.has(node.name) ? inline(cond, new Map([[node.name, { ast: node.ast, date: isDateExpr(node) }]])) : cond) };
     case 'aggregate':
       if ([...used].every((n) => node.keys.includes(n))) return { ...node, input: pushFilter(node.input, cond), pushed: (node.pushed ?? 0) + 1 };
+      break;
+    case 'textmap':
+      if (!used.has(node.name)) return { ...node, input: pushFilter(node.input, cond) };
       break;
     case 'window': // (only a filter on the partition keys keeps every window the same)
       if (node.partition.length && [...used].every((n) => node.partition.includes(n))) return { ...node, input: pushFilter(node.input, cond) };
@@ -221,7 +229,8 @@ function* execG(node, needed, temps) {
       return { ...s, derived, visible: [...s.visible.filter((n) => n !== node.name), node.name] };
     }
     case 'select': {
-      for (const n of node.names) if (!namesOf(node.input).includes(n)) throw new Error(`vectro: no column "${n}"`);
+      const have = namesOf(node.input); // (only the columns used: a dataset's chunks hold just those)
+      for (const n of node.names) if ((!needed || needed.has(n)) && !have.includes(n)) throw new Error(`vectro: no column "${n}"`);
       const s = yield* execG(node.input, needed ? new Set(node.names.filter((n) => needed.has(n))) : new Set(node.names), temps);
       return { ...s, visible: node.names };
     }
@@ -254,11 +263,7 @@ function* execG(node, needed, temps) {
         r = yield { table: base, method: k === null ? 'sort' : 'top', args: k === null ? [by] : [k, by] };
       } else r = yield { table: base, method: 'head', args: [k] };
       if (node.offset) r = yield { table: r, method: 'slice', args: [node.offset] };
-      for (const n of keep) {
-        const d = s.derived.get(n);
-        if (!d) continue;
-        r = yield { table: r, method: 'derive', args: [n, toSource(d.ast)], date: d.date };
-        }
+      r = yield* deriveAllG(r, keep.filter((n) => s.derived.has(n)), s.derived);
       return { table: r, derived: new Map(), visible: keep };
     }
     case 'window': {
@@ -270,9 +275,24 @@ function* execG(node, needed, temps) {
       const w = yield { table: t.select(...new Set([...keep, ...inputs])), method: '_window', args: [{ partition: node.partition, order: node.order, items: node.items }] };
       return { table: w, derived: new Map(), visible: [...keep, ...node.items.map((it) => it.name)] };
     }
+    case 'textmap': {
+      const s = yield* execG(node.input, needed ? new Set([...[...needed].filter((n) => n !== node.name), ...node.inputs]) : null, temps);
+      const keep = (needed ? s.visible.filter((n) => needed.has(n) || node.inputs.includes(n)) : s.visible).filter((n) => n !== node.name);
+      const cols = new Set([...keep, ...node.inputs]);
+      const t = yield* materializeG(s, cols, temps, [], true);
+      const out = yield { table: cols.size ? t.select(...cols) : t, method: '_textmap', args: [node.name, node] };
+      return { table: out, derived: new Map(), visible: [...keep, node.name] };
+    }
     case 'union': {
+      // only the columns used later (by position: each input names them its own way)
+      const names0 = namesOf(node.inputs[0]);
+      let at = names0.map((_, k) => k);
+      if (needed) { at = at.filter((k) => needed.has(names0[k])); if (!at.length) at = [0]; } // (the row count needs one)
       const parts = [];
-      for (const input of node.inputs) parts.push(yield* execG({ op: 'output', input }, null, temps));
+      for (const input of node.inputs) {
+        const names = namesOf(input);
+        parts.push(yield* execG({ op: 'output', input: at.length === names.length ? input : { op: 'select', input, names: at.map((k) => names[k]) } }, null, temps));
+      }
       const u = yield { table: parts[0], method: '_concat', args: [parts.slice(1)] };
       return { table: u, derived: new Map(), visible: u.columnNames };
     }
@@ -321,10 +341,23 @@ function* materializeG(s, names, temps, exprs = [], keepVisibleOrder = false) {
   let t = base.size ? s.table.select(...base) : s.table;
   if (!derivedNames.length) return t;
   if (t.pred) t = yield { table: t, method: 'collect', args: [] };
-  for (const n of derivedNames) {
-    const d = s.derived.get(n);
-    t = yield { table: t, method: 'derive', args: [n, toSource(d.ast)], date: d.date };
+  return yield* deriveAllG(t, derivedNames, s.derived);
+}
+
+// The derived columns `names` on table t. One named like a column t still
+// has (shadowed: SELECT price AS cust, cust AS price) is made under a fresh
+// name, then the names are swapped in a view; a derived name for that very
+// column is the column itself.
+function* deriveAllG(t, names, derived) {
+  const swap = new Map();
+  for (const n of names) {
+    const d = derived.get(n);
+    if (d.ast.t === 'var' && d.ast.name === n && t.cols.has(n)) continue;
+    const at = t.cols.has(n) ? `__vectro_d${swap.size}_${n}` : n;
+    if (at !== n) swap.set(at, n);
+    t = yield { table: t, method: 'derive', args: [at, toSource(d.ast)], date: d.date };
   }
+  if (swap.size) t = t._renamed(swap);
   return t;
 }
 
@@ -430,6 +463,7 @@ function describe(node, depth = 0) {
       : `${describe(node.input, depth)}\n${pad}limit ${node.n}${node.offset ? ` offset ${node.offset}` : ''}`;
     case 'join': return `${pad}join ${JSON.stringify(node.opts.on)} ${node.opts.how ?? 'inner'}\n${pad}  left:\n${describe(node.left, depth + 2)}\n${pad}  right:\n${describe(node.right, depth + 2)}`;
     case 'output': return describe(node.input, depth);
+    case 'textmap': return `${describe(node.input, depth)}\n${pad}${node.text ? 'text' : 'value'} ${node.name} = ${node.label}(${node.inputs.join(', ')}) (once per distinct value)`;
     case 'window': return `${describe(node.input, depth)}\n${pad}window ${node.items.map((it) => `${it.name} = ${it.fn}(${it.arg ?? ''})`).join(', ')}${node.partition.length ? ` partition by ${node.partition.join(', ')}` : ''}${node.order.length ? ` order by ${node.order.map((o) => (o.desc ? `-${o.name}` : o.name)).join(', ')}` : ''}`;
     case 'union': return `${pad}union all\n${node.inputs.map((i) => describe(i, depth + 1)).join(`\n${pad}  and\n`)}`;
     case 'total': return `${describe(node.input, depth)}\n${pad}totals: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}`;

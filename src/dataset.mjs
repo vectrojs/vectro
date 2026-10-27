@@ -673,6 +673,7 @@ function needs(node, need, ds) {
     case 'sort': return needs(node.input, need && union(need, node.by.flatMap((b) => [...vars(parse(String(b)))])), ds);
     case 'limit': return needs(node.input, need, ds);
     case 'output': return needs(node.input, null, ds);
+    case 'textmap': return needs(node.input, need && new Set([...[...need].filter((n) => n !== node.name), ...node.inputs]), ds);
     case 'window': {
       const made = new Set(node.items.map((it) => it.name));
       const inputs = [...node.partition, ...node.order.map((o) => o.name), ...node.items.map((it) => it.arg).filter(Boolean)];
@@ -869,7 +870,7 @@ function* runChunksG(plan, path, sink) {
   const pieces = ds._piecesFor(conds);
   ds.lastRun.skipped = ds.chunkCount - pieces.length;
   const list = pieces.length ? pieces : [{ i: -1, lo: 0, hi: 0 }]; // (no rows, but the plan still runs once for the result's shape)
-  const derived = new Set(path.slice(0, -1).filter((n) => n.op === 'derive' || n.op === 'join').flatMap((n) => (n.op === 'derive' ? [n.name] : namesOf(n.right))));
+  const derived = new Set(path.slice(0, -1).filter((n) => n.op === 'derive' || n.op === 'textmap' || n.op === 'join').flatMap((n) => (n.op === 'join' ? namesOf(n.right) : [n.name])));
   const acc = accumulator(kind, B, engine, sink, ds, derived);
   let finalTable = null;
   engine._joinRuns = (engine._joinRuns ?? 0) + 1; // joins keep their right side's build while a dataset runs

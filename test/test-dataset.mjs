@@ -447,6 +447,14 @@ for (const [label, make] of engines) {
     'SELECT cust, price, ROW_NUMBER() OVER (PARTITION BY cust ORDER BY price DESC, ts) AS rn FROM orders WHERE cust < 9 AND price IS NOT NULL ORDER BY cust, rn LIMIT 30',
     'SELECT region, MEDIAN(price) AS m, PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY qty) AS p FROM orders GROUP BY region ORDER BY region',
     "SELECT COUNT(lp) AS n, SUM(lp) AS s FROM (SELECT LAG(price) OVER (PARTITION BY region ORDER BY ts) AS lp FROM orders) x",
+    'SELECT UPPER(region) AS r, COUNT(*) AS n FROM orders GROUP BY r ORDER BY r',
+    "SELECT region || '-' || CAST(qty AS VARCHAR) AS k, SUM(price) AS s FROM orders GROUP BY k ORDER BY k LIMIT 10",
+    "SELECT COUNT(*) AS n FROM orders WHERE LOWER(region) LIKE 'e%' OR LENGTH(region) > 3",
+    "SELECT CASE WHEN price > 500 THEN 'hi' WHEN price > 0 THEN 'lo' ELSE 'none' END AS b, COUNT(*) AS n FROM orders GROUP BY b ORDER BY b",
+    "SELECT STRFTIME(ts, '%Y-%m-%d %H') AS h, COUNT(*) AS n FROM orders GROUP BY h ORDER BY n DESC, h LIMIT 5",
+    'SELECT cust, UPPER(region) AS r, CAST(ts AS VARCHAR) AS t FROM orders ORDER BY price DESC, cust LIMIT 5',
+    'SELECT c.cust, COUNT(o.cust) AS n FROM orders o RIGHT JOIN customers c ON o.cust = c.cust GROUP BY c.cust ORDER BY n, c.cust LIMIT 10',
+    'SELECT COUNT(*) AS n, COUNT(o.cust) AS a, COUNT(c.cust) AS b FROM orders o FULL JOIN customers c ON o.cust = c.cust',
   ]) {
     const want = sql(q, { orders: t, customers: cs }).toRows();
     let got, gotAsync;

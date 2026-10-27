@@ -16,6 +16,7 @@ import { joinTablesG, joinViewG } from './join.mjs';
 import { Query } from './plan.mjs';
 import { bounds, windowValues } from './window.mjs';
 import { copyRows } from './rows.mjs';
+import { textmapRows } from './textmap.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
 import { DATE_FNS, DATE_RESULT, parseDateText, toMillis } from './dates.mjs';
@@ -985,6 +986,55 @@ export class Table {
   // keys and then the order keys, with one new column per item:
   //   spec = { partition: [names], order: [{ name, desc }], items: [{ name,
   //     fn, arg (a column name or null), frame, offset, def, k, p }] }
+  // A view with columns renamed (map: old name -> new name); a column the new
+  // names replace is left out. The view owns nothing (see plan.mjs deriveAllG).
+  _renamed(map) {
+    const taken = new Set(map.values()), cols = new Map();
+    for (const [name, c] of this.cols) {
+      if (map.has(name)) cols.set(map.get(name), c);
+      else if (!taken.has(name)) cols.set(name, c);
+    }
+    return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params, zones: false });
+  }
+
+  // (SQL text functions) a new column `name` = fn(values of the input
+  // columns), run once per distinct combination of them (see textmap.mjs):
+  // text answers make a category column with state's labels ({ dict, codes },
+  // shared by every call with that state), else numbers (date: true marks dates).
+  _textmap(name, spec) { return this.engine._drive(this.#textmapG(name, spec)); }
+  _textmapAsync(name, spec) { return this.engine._driveAsync(this.#textmapG(name, spec)); }
+
+  *#textmapG(name, { inputs = [], fn, text = true, date = false, state = { dict: [], codes: new Map() } }) {
+    checkName(name);
+    const { engine } = this;
+    const t = this.pred ? yield* this.#collectG() : this;
+    if (t.cols.has(name)) throw new Error(`vectro: column "${name}" already exists`);
+    const ins = inputs.map((k) => t.cols.get(k) ?? (() => { throw new Error(`vectro: no column "${k}"`); })());
+    const ranges = [], made = []; // number columns' [min, max, values not whole] (every thread)
+    for (let k = 0; k < ins.length; k++) {
+      const c = ins[k];
+      if (c.dict || c.strings || c.enc || !t.n) { ranges.push(null); continue; } // (packed: read value by value)
+      const r = yield* engine.evalG(['min(k)', 'max(k)', 'count(k == k && k != floor(k))'], { k: c.data });
+      if (r && !r[2] && r[1] - r[0] < 2 ** 22) { ranges.push(r); continue; }
+      // others: numbered by the hash group kernel (every thread), each number's value once
+      const one = new Table(engine, new Map([['v', c]]), t.n, { zones: false });
+      const ids = engine.jit && t.n >= 4096 ? yield* one.#hashGroupsParallelG(['v']) : one.#hashGroups(['v']);
+      for (const x of ids.extra ?? []) engine.free(x);
+      made.push(ids.data);
+      const vals = ids.keyColumn(0, Array.from({ length: ids.K }, (_, g) => g));
+      ins[k] = { data: ids.data, dict: null, numbered: (g) => vals[g] };
+      ranges.push([0, Math.max(0, ids.K - 1), 0]);
+    }
+    const data = engine.alloc(t.type, t.n);
+    try { textmapRows(engine, ins, t.n, t.type === Float32Array, fn, text, state, engine.live(data), ranges); } finally { for (const x of made) engine.free(x); }
+    const cols = new Map(t.cols), owned = t === this ? [] : [...t.owned];
+    if (t !== this) t.owned = [];
+    cols.set(name, text ? { data, dict: state.dict, codes: state.codes } : { data, dict: null, codes: null, date: date || undefined });
+    owned.push(name);
+    for (const c of cols.values()) c.data = engine.live(c.data);
+    return new Table(engine, cols, t.n, { owned, ownedBuffers: t === this ? [] : t.ownedBuffers.splice(0), zones: false });
+  }
+
   _window(spec) { return this.engine._drive(this.#windowG(spec)); }
   _windowAsync(spec) { return this.engine._driveAsync(this.#windowG(spec)); }
 
@@ -1422,6 +1472,7 @@ const TEXT_FNS = {
   contains: (label, [p]) => label.includes(p),
   in: (label, list) => list.includes(label),
   like: (label, [pattern], re) => re.test(label),
+  ilike: (label, [pattern], re) => re.test(label), // (the pattern ignoring case)
 };
 const MAX_RANGES = 256;
 
@@ -1434,7 +1485,7 @@ function textCall(n, cols, src) {
   if (!rest.length || rest.some((a) => a.t !== 'str')) throw new SyntaxError(`vectro: ${n.fn}(${colNode.name}, …) needs text in quotes after the column, in "${src}"`);
   if (n.fn !== 'in' && rest.length !== 1) throw new SyntaxError(`vectro: ${n.fn}() takes a column and one text, in "${src}"`);
   const args = rest.map((a) => a.v);
-  const re = n.fn === 'like' ? new RegExp(`^${args[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`) : null;
+  const re = n.fn === 'like' || n.fn === 'ilike' ? new RegExp(`^${args[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`, n.fn === 'ilike' ? 'iu' : '') : null;
   const match = c.dict.map((label) => TEXT_FNS[n.fn](label, args, re));
   // runs of consecutive codes that match (or, if shorter, that don't)
   const runs = (want) => {

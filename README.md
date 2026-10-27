@@ -101,8 +101,8 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
       { orders, customers }).toRows();
   ```
 
-  SELECT [DISTINCT], FROM with aliases, [INNER | LEFT | CROSS] JOIN ... ON /
-  USING, WHERE, GROUP BY (columns, expressions, select aliases or positions),
+  SELECT [DISTINCT], FROM with aliases, [INNER | LEFT | RIGHT | FULL [OUTER]
+  | CROSS] JOIN ... ON / USING, WHERE, GROUP BY (columns, expressions, select aliases or positions),
   HAVING, ORDER BY ... ASC/DESC [NULLS FIRST | LAST], LIMIT / OFFSET / FETCH
   FIRST; COUNT(*), COUNT(x), COUNT(DISTINCT x), SUM, AVG, MIN, MAX,
   APPROX_COUNT_DISTINCT, MEDIAN, PERCENTILE_CONT / PERCENTILE_DISC WITHIN GROUP
@@ -137,12 +137,32 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
        WHERE r <= 3 ORDER BY region, spend DESC`, { orders, customers }).toRows();
   ```
 
-  `compare/check-sql.mjs` runs 24 such queries (CTEs, set operations,
-  correlated subqueries, windows, percentiles, missing values) in Vectro and
-  DuckDB on the same 200K rows; every answer is the same. Not yet: RIGHT /
-  FULL JOIN, INTERSECT ALL / EXCEPT ALL, correlation on anything but
-  equalities, and computing text (`||`, UPPER): text can be compared, matched
-  and grouped. The MCP server has
+  **Text:** UPPER, LOWER, TRIM / LTRIM / RTRIM (and `TRIM(LEADING 'x' FROM
+  s)`), SUBSTRING / SUBSTR (and `FROM ... FOR`), LEFT, RIGHT, LENGTH,
+  REPLACE, REVERSE, REPEAT, LPAD, RPAD, SPLIT_PART, STRPOS / POSITION(a IN
+  b), STARTS_WITH, ENDS_WITH, CONTAINS, CONCAT, CONCAT_WS, `||`, ASCII, CHR,
+  REGEXP_MATCHES / REGEXP_REPLACE / REGEXP_EXTRACT, STRFTIME, ILIKE, text
+  CASE / COALESCE / NULLIF, `CAST(x AS VARCHAR)` and text to numbers or
+  dates, and comparing text with `<` / `>`. Each function runs once per
+  distinct value, not per row (a category column has few labels), and the
+  answer is a category column again, so it groups, sorts and joins like any
+  other: `GROUP BY UPPER(region)` on 10M rows 31 ms (DuckDB 40), `region ||
+  '-' || qty` as a key 84 ms (88), `STRFTIME(ts, '%Y-%m')` 48 ms (59; times
+  are rounded to the month first), ILIKE on a column 30 ms (45). Missing text
+  is `''`, as everywhere in Vectro, and positions count characters from 1 as
+  in DuckDB.
+
+  **Outer joins:** RIGHT and FULL JOIN (with ON or USING) are the matching
+  rows (FULL: plus the left rows without a match) followed by the right rows
+  whose keys no left row has; slower than DuckDB for now (RIGHT JOIN + group
+  90 vs 53 ms, FULL JOIN + count 59 vs 26 ms).
+
+  `compare/check-sql.mjs` runs 40 such queries (CTEs, set operations,
+  correlated subqueries, windows, percentiles, text functions on awkward
+  strings, outer joins, missing values) in Vectro and DuckDB on the same
+  200K rows; every answer is the same. Not yet: INTERSECT ALL / EXCEPT ALL,
+  correlation on anything but equalities, MIN / MAX of text, and STRING_AGG.
+  The MCP server has
   a `sql` tool. The same SQL text vs DuckDB on 10M orders + 100K customers
   (`compare/bench-sql.mjs`, answers checked): filtered totals 3.0 vs 9.5 ms,
   group by region 6.6 vs 31.8 ms, join + filter + group 21.4 vs 30.6 ms, top 10
