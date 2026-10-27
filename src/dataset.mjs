@@ -71,18 +71,18 @@ export class DatasetWriter {
   // rowsPerChunk: rows per chunk (the last one may be shorter); append: add
   // to an existing dataset (same columns) instead of replacing it.
   // bitPack: false stores packed codes in whole bytes (bigger files, no unpacking).
-  constructor(engine, path, { rowsPerChunk = CHUNK_ROWS, append = false, bitPack = true } = {}) {
+  // path: a path (Node) or a writable file object (see createDatasetAsync).
+  constructor(engine, path, { rowsPerChunk = CHUNK_ROWS, append = false, bitPack = true, footer = null } = {}) {
     this.engine = engine;
     this.bitPack = bitPack;
-    this.path = path;
+    this.path = typeof path === 'string' ? path : path.name;
     this.rowsPerChunk = Math.max(1, Math.floor(rowsPerChunk));
     this.pending = null; // rows waiting for a full chunk (a table this writer owns)
     this.meta = null;
     this.labels = new Map(); // category column -> { dict, codes }: one dictionary for the dataset
-    this.file = need('writing a dataset').openWrite(path, { append });
+    this.file = typeof path === 'string' ? need('writing a dataset').openWrite(path, { append }) : path;
     if (this.file.existed) {
-      let footer;
-      try { footer = readFooter(this.file); } catch (err) { this.file.close(); throw err; }
+      if (!footer) try { footer = readFooter(this.file); } catch (err) { this.file.close(); throw err; }
       const { meta, footerStart } = footer;
       this.meta = meta;
       this.pos = footerStart; // new chunks overwrite the old footer
@@ -153,14 +153,20 @@ export class DatasetWriter {
     }
   }
 
-  // Stop without a footer (the file is left unreadable as a dataset).
+  // Stop without a footer (the file is left unreadable as a dataset; a
+  // browser file is discarded).
   abort() {
     if (this.summary || this.aborted) return;
     this.aborted = true;
     this.pending?.dispose();
     this.pending = null;
-    this.file.close();
+    if (this.file.abort) this.file.abort(); else this.file.close();
   }
+
+  // The same as append / close, then waiting until the bytes are written
+  // (browser files write in the background; in Node they already are).
+  async appendAsync(source, lo, hi) { this.append(source, lo, hi); await this.file.flush?.(); return this; }
+  async closeAsync() { const summary = this.close(); await this.file.done?.(); return summary; }
 
   #schema(t) {
     const kindOf = (c) => (c.strings ? 'text' : c.dict ? 'category' : c.date ? 'date' : 'number');
@@ -656,7 +662,7 @@ function driveSync(gen) {
   while (!step.done) {
     const v = step.value;
     let out, err = null;
-    try { out = v.run ? execute(v.run, true) : v.read ? v.read._readSync(v.piece, v.names) : undefined; } catch (e) { err = e; }
+    try { out = v.run ? execute(v.run, true) : v.read ? v.read._readSync(v.piece, v.names) : undefined; } catch (e) { err = e; } // ({ flush }: nothing to wait for)
     step = err ? gen.throw(err) : gen.next(out);
   }
   return step.value;
@@ -671,6 +677,7 @@ async function driveAsync(gen) {
       let out, err = null;
       try {
         if (v.run) out = await execute(v.run, false);
+        else if (v.flush) await v.flush.file?.flush?.(); // (a writer's bytes on disk before more come)
         else if (v.prefetch) {
           const key = `${v.prefetch.path}\0${v.piece.i}\0${v.piece.lo}`;
           if (!pending.has(key)) { const p = v.prefetch._readAsync(v.piece, v.names); p.catch(() => {}); pending.set(key, p); }
@@ -980,6 +987,7 @@ function accumulator(kind, B, engine, sink, ds, derived) {
       if (sink && kind === 'collect') { // straight to the dataset being written (or to spill partitions)
         if (sink.appendG) { yield* sink.appendG(yield* keep(engine, r, chunk)); return; }
         try { sink.append(r); } finally { if (r !== chunk) r.dispose(); }
+        yield { flush: sink };
         return;
       }
       parts.push(yield* keep(engine, r, chunk));
@@ -1545,38 +1553,46 @@ function countBits(bits, from, to) {
 export function csvToDataset(engine, csvPath, outPath, opts = {}) {
   const file = need('csvToDataset').openRead(csvPath);
   try {
-    const gen = csvPiecesG(engine, file.size, outPath, opts);
+    const writer = new DatasetWriter(engine, outPath, opts);
+    const gen = csvPiecesG(engine, file.size, writer, opts);
     let step = gen.next();
     while (!step.done) {
       const v = step.value;
       let out, err = null;
-      try { out = v.read ? file.readSync(v.read, v.pos) : loadBytes(engine, v.parse, v.opts); } catch (e) { err = e; }
+      try { out = v.read ? file.readSync(v.read, v.pos) : v.parse ? loadBytes(engine, v.parse, v.opts) : undefined; } catch (e) { err = e; }
       step = err ? gen.throw(err) : gen.next(out);
     }
-    return step.value;
+    return writer.close();
   } finally { file.close(); }
 }
 
-// The same without blocking: reads with async I/O, parses on the worker threads.
-export async function csvToDatasetAsync(engine, csvPath, outPath, opts = {}) {
-  const file = need('csvToDatasetAsync').openRead(csvPath);
+// The same without blocking: reads with async I/O, parses on the worker
+// threads. csv: a path (Node), a URL, or a File / Blob; out: a path (Node) or
+// a writable file object (browsers: see files-browser.mjs).
+export async function csvToDatasetAsync(engine, csv, out, opts = {}) {
+  const file = typeof csv === 'string' && files && !/^https?:/i.test(csv) ? files.openRead(csv)
+    : typeof csv === 'string' ? await urlFile(csv) : typeof Blob === 'function' && csv instanceof Blob ? blobFile(csv) : csv;
   try {
-    const gen = csvPiecesG(engine, file.size, outPath, opts);
-    let step = gen.next();
-    while (!step.done) {
-      const v = step.value;
-      let out, err = null;
-      try { out = v.read ? await file.read(v.read, v.pos) : await loadBytesAsync(engine, v.parse, v.opts); } catch (e) { err = e; }
-      step = err ? gen.throw(err) : gen.next(out);
-    }
-    return step.value;
+    const writer = await createDatasetAsync(engine, out, opts);
+    try {
+      const gen = csvPiecesG(engine, file.size, writer, opts);
+      let step = gen.next();
+      while (!step.done) {
+        const v = step.value;
+        let got, err = null;
+        try { got = v.read ? await file.read(v.read, v.pos) : v.parse ? await loadBytesAsync(engine, v.parse, v.opts) : await writer.file.flush?.(); } catch (e) { err = e; }
+        step = err ? gen.throw(err) : gen.next(got);
+      }
+    } catch (err) { writer.abort(); throw err; }
+    return await writer.closeAsync();
   } finally { file.close(); }
 }
 
-// Yields { read: bytes, pos } (fill bytes from the file at pos) and
-// { parse: engine bytes, opts } (a table); appends each piece's rows.
-function* csvPiecesG(engine, size, outPath, { rowsPerChunk, bitPack, pieceBytes = 64 << 20, header = true, delimiter = ',', types = {}, sampleRows, ...rest } = {}) {
-  const writer = new DatasetWriter(engine, outPath, { rowsPerChunk, bitPack });
+// Yields { read: bytes, pos } (fill bytes from the file at pos), { parse:
+// engine bytes, opts } (a table) and { flush } (wait for the writer); appends
+// each piece's rows to the writer (aborted on an error).
+// opts.onProgress({ bytes, size, rows }) is called after each piece.
+function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = true, delimiter = ',', types = {}, sampleRows, rowsPerChunk, bitPack, append, onProgress, ...rest } = {}) {
   try {
     let pos = 0, carry = new Uint8Array(0), head = new Uint8Array(0), kinds = null;
     while (true) {
@@ -1601,6 +1617,8 @@ function* csvPiecesG(engine, size, outPath, { rowsPerChunk, bitPack, pieceBytes 
         bytes.set(rows, head.length);
         const t = yield { parse: bytes, opts: { delimiter, header, types: kinds, ...rest } };
         try { writer.append(t); } finally { t.dispose(); }
+        yield { flush: writer };
+        onProgress?.({ bytes: pos, size, rows: writer.meta.rows + (writer.pending?.n ?? 0) });
       }
       if (last) break;
       carry = buf.slice(Math.max(start, end));
@@ -1609,7 +1627,6 @@ function* csvPiecesG(engine, size, outPath, { rowsPerChunk, bitPack, pieceBytes 
     writer.abort();
     throw err;
   }
-  return writer.close();
 }
 
 // Where the last complete row of buf[start..] ends (quotes may hold newlines).
@@ -1640,4 +1657,30 @@ export function writeDataset(engine, path, source, opts) {
     throw err;
   }
   return writer.close();
+}
+
+// A writer for a path (Node) or a writable file object (browsers), reading
+// the footer first when appending to a file that has one.
+export async function createDatasetAsync(engine, target, opts = {}) {
+  const file = typeof target === 'string' ? need('writing a dataset').openWrite(target, { append: opts.append }) : target;
+  let footer = null;
+  if (file.existed) try { footer = file.readSync ? readFooter(file) : await readFooterAsync(file); } catch (err) { file.close(); throw err; }
+  return new DatasetWriter(engine, file, { ...opts, footer });
+}
+
+// writeDataset without blocking: queries run with the async calls, and the
+// writer's bytes are on disk before more are made.
+export async function writeDatasetAsync(engine, target, source, opts) {
+  const writer = await createDatasetAsync(engine, target, opts);
+  try {
+    if (source instanceof Query || source?.isDataset) {
+      const plan = optimize({ op: 'output', input: (source.isDataset ? source.lazy() : source).node });
+      if (findDataset(plan)) await driveAsync(runPlanG(plan, writer));
+      else { const t = await execute(plan, false); try { await writer.appendAsync(t); } finally { t.dispose(); } }
+    } else await writer.appendAsync(source);
+  } catch (err) {
+    writer.abort();
+    throw err;
+  }
+  return writer.closeAsync();
 }

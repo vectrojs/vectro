@@ -232,9 +232,24 @@ sql('SELECT region, COUNT(DISTINCT cust) FROM orders GROUP BY region', { orders 
 
   A billion rows (a 5.1 GB file) open in a page in 51 ms; "the last day"
   answers in 24 ms reading 0.3 MB; a full group-by streams 2.7 GB in 7 s
-  from a local server. Try `examples/dataset/` (serve it with
+  from a local server.
+
+  Pages also **write** datasets, into the browser's own file storage (OPFS),
+  to a file the user chose (`showSaveFilePicker()`), or into memory
+  (`memoryFile()`, then `.blob()`). Bytes stream to disk chunk by chunk, so a
+  CSV bigger than memory converts too:
+
+  ```js
+  await engine.csvToDataset(droppedFile, 'orders.vectro', { onProgress: (p) => show(p) });
+  await engine.writeDataset('eu.vectro', orders.filter("region == 'EU'"));
+  const orders = await engine.openStoredDataset('orders.vectro');
+  await engine.storedDatasets();   // [{ name, size }]; also storedDatasetFile(name) to download
+  ```
+
+  A 246 MB CSV (5M rows) becomes a 24 MB dataset in browser storage in
+  2.8 s. Try `examples/dataset/` (serve it with
   `node examples/browser-threads/serve.mjs 8780 --data <folder of .vectro files>`).
-  Writing datasets and spilling to disk need Node.
+  Spilling to disk (huge group-bys, sorts and joins) still needs Node.
 - **Also:** `append: true` adds to an existing dataset; `ds.lastRun` tells
   how many chunks and bytes a query read; `explain()` shows the plan; the MCP
   server opens `.vectro` files.
@@ -546,8 +561,8 @@ answers.
 
 ## Not done yet
 
-64-bit integers beyond 2^53 and time zones other than UTC. Datasets are
-written in Node (browsers read them) by one writer at a time; a join on text keys needs its
+64-bit integers beyond 2^53 and time zones other than UTC. A dataset is
+written by one writer at a time; spilling needs Node; a join on text keys needs its
 other side to fit in memory, exact distinct counts of non-ID values don't
 spill, and `approxDistinct` on a dataset counts exactly. Joins are for normal
 tables (not split tables or streams yet), inner and left only. Split tables

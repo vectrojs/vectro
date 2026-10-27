@@ -23,14 +23,25 @@
 </head>
 <body>
 <h1>Query a dataset of any size, in the browser</h1>
-<p class="muted">A <code>.vectro</code> dataset is read in pieces: from a URL with HTTP range requests, or from a file on this computer. Only the chunks and columns a query needs are read, so a file far bigger than the browser's memory works.</p>
+<p class="muted">A <code>.vectro</code> dataset is read in pieces: from a URL with HTTP range requests, from a file on this computer, or from the browser's own storage. Only the chunks and columns a query needs are read, so a file far bigger than the browser's memory works.</p>
 
+<h3>Make one from a CSV</h3>
+<p class="muted">The CSV is read in pieces and written to this browser's storage (it never has to fit in memory).</p>
+<div class="row">
+  <input type="file" id="csv" accept=".csv,.tsv,text/csv">
+  <button id="sample">or make a sample CSV</button>
+  <input type="text" id="sampleRows" value="5000000" size="9"> rows
+  <span id="convert" class="muted"></span>
+</div>
+<div class="row" id="stored"></div>
+
+<h3>Open one</h3>
 <div class="row">
   <select id="served"><option value="">datasets on this server…</option></select>
   <input type="text" id="url" placeholder="or a URL" size="40">
   <button id="openUrl">Open URL</button>
 </div>
-<div id="drop">Drop a .vectro file here, or <input type="file" id="pick" accept=".vectro"></div>
+<div id="drop">Drop a .vectro file (or a CSV to convert) here, or <input type="file" id="pick" accept=".vectro"></div>
 <p id="info" class="muted">No dataset open.</p>
 
 <div class="examples row" id="examples"></div>
@@ -39,7 +50,7 @@
 <div id="out"></div>
 
 <script type="module">
-import { Engine, threadsAvailable, sql } from '../../src/browser.mjs';
+import { Engine, threadsAvailable, sql, storageAvailable } from '../../src/browser.mjs';
 
 const $ = (id) => document.getElementById(id);
 const engine = new Engine();
@@ -122,6 +133,66 @@ async function run() {
   } finally { $('run').disabled = false; }
 }
 
+// ---- making datasets in browser storage ----
+async function listStored() {
+  const box = $('stored');
+  if (!storageAvailable()) { box.innerHTML = '<span class="muted">This browser has no file storage for datasets.</span>'; return; }
+  const list = await engine.storedDatasets();
+  box.innerHTML = list.length ? '<span class="muted">In this browser:</span>' : '<span class="muted">No datasets stored in this browser yet.</span>';
+  for (const { name, size } of list) {
+    const open_ = document.createElement('button');
+    open_.textContent = `${name} (${mb(size)})`;
+    open_.onclick = async () => open(await engine.storedDatasetFile(name), `${name} (in this browser)`);
+    const dl = document.createElement('button');
+    dl.textContent = '⤓';
+    dl.title = 'download';
+    dl.onclick = async () => { const a = document.createElement('a'); a.href = URL.createObjectURL(await engine.storedDatasetFile(name)); a.download = name; a.click(); };
+    const rm = document.createElement('button');
+    rm.textContent = '✕';
+    rm.title = 'delete';
+    rm.onclick = async () => { await engine.removeStoredDataset(name); listStored(); };
+    box.append(open_, dl, rm);
+  }
+  R.stored = list;
+}
+
+async function convert(csv, name) {
+  $('convert').textContent = 'Converting…';
+  const t0 = performance.now();
+  try {
+    const s = await engine.csvToDataset(csv, name, {
+      onProgress: ({ bytes, size, rows }) => { $('convert').textContent = `${(100 * bytes / size).toFixed(0)}% · ${rows.toLocaleString()} rows · ${ms(performance.now() - t0)}`; },
+    });
+    const took = performance.now() - t0;
+    $('convert').innerHTML = `<span class="ok">${s.rows.toLocaleString()} rows → ${name}, ${mb(s.bytes)} (the CSV was ${mb(csv.size)}) in ${ms(took)}</span>`;
+    R.converts = [...(R.converts ?? []), { name, rows: s.rows, bytes: s.bytes, csvBytes: csv.size, ms: took }];
+    await listStored();
+    await open(await engine.storedDatasetFile(name), `${name} (in this browser)`);
+  } catch (err) {
+    $('convert').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
+    R.converts = [...(R.converts ?? []), { name, error: err.message }];
+  }
+}
+
+// a sample orders CSV made here, in pieces (a Blob of strings: no big string in memory)
+function sampleCSV(n) {
+  const parts = ['order_id,customer,region,price,qty,ts\n'], R5 = ['EU', 'US', 'APAC', 'LATAM', 'MEA'];
+  const t0 = Date.UTC(2024, 0, 1);
+  for (let lo = 0; lo < n; lo += 100_000) {
+    let s = '';
+    for (let i = lo; i < Math.min(n, lo + 100_000); i++) {
+      s += `${i},${(i * 7919) % 100_003},${R5[(i * 31) % 5]},${((i * 48271) % 100_000) / 100},${1 + ((i * 31337) % 9)},${new Date(t0 + i * 6000).toISOString()}\n`;
+    }
+    parts.push(s);
+  }
+  return new Blob(parts, { type: 'text/csv' });
+}
+
+$('csv').onchange = () => { const f = $('csv').files[0]; if (f) convert(f, f.name.replace(/\.\w+$/, '') + '.vectro'); };
+$('sample').onclick = () => { const n = Math.max(1, Number($('sampleRows').value) || 1e6); $('convert').textContent = 'Making the CSV…'; setTimeout(() => convert(sampleCSV(n), `sample-${n}.vectro`), 0); };
+listStored();
+window.__convertSample = (n) => convert(sampleCSV(n), `sample-${n}.vectro`); // (for automated checks)
+
 $('run').onclick = run;
 $('sql').onkeydown = (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) run(); };
 $('served').onchange = () => { if ($('served').value) open($('served').value, $('served').value.split('/').pop()); };
@@ -130,7 +201,12 @@ $('pick').onchange = () => { const f = $('pick').files[0]; if (f) open(f, f.name
 const drop = $('drop');
 drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
 drop.ondragleave = () => drop.classList.remove('over');
-drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); const f = e.dataTransfer.files[0]; if (f) open(f, f.name); };
+drop.ondrop = (e) => { // a dataset opens; a CSV is converted first
+  e.preventDefault(); drop.classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (!f) return;
+  if (/\.(csv|tsv)$/i.test(f.name)) convert(f, f.name.replace(/\.\w+$/, '') + '.vectro'); else open(f, f.name);
+};
 const auto = new URL(location.href).searchParams.get('open'); // ?open=/data/name.vectro
 if (auto) open(new URL(auto, location.href).href, auto.split('/').pop());
 </script>

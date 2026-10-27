@@ -12,7 +12,8 @@
 //   const orders = await engine.loadCSV('/orders.csv');
 //   await orders.filter("region == 'EU'").sumAsync('price * qty');
 import { Engine as CoreEngine } from './engine.mjs';
-import { openDatasetAsync } from './dataset.mjs';
+import { openDatasetAsync, writeDatasetAsync, csvToDatasetAsync, createDatasetAsync } from './dataset.mjs';
+import { writableFile, storedFiles, storedFile, removeStored } from './files-browser.mjs';
 
 export const browserPlatform = {
   canBlock: false,
@@ -59,7 +60,25 @@ export class Engine extends CoreEngine {
   //   const orders = await engine.openDataset(input.files[0]);
   //   await sql('SELECT region, COUNT(*) FROM orders GROUP BY region', { orders }).toRowsAsync();
   openDataset(source) { return openDatasetAsync(this, source); }
+
+  // Writing datasets in the browser: into its file storage (OPFS) by name,
+  // or to a file the user chose (a FileSystemFileHandle), or memoryFile().
+  // Big inputs stream: each chunk is on disk before the next is made.
+  //   await engine.csvToDataset(droppedCsvFile, 'orders.vectro');   // a CSV of any size
+  //   await engine.writeDataset('eu.vectro', orders.filter("region == 'EU'"));
+  //   const orders = await engine.openStoredDataset('orders.vectro');
+  async writeDataset(target, source, opts) { return writeDatasetAsync(this, await target_(target, opts), source, opts); }
+  async csvToDataset(csv, target, opts) { return csvToDatasetAsync(this, csv, await target_(target, opts), opts); }
+  // A writer: appendAsync(table or columns) as often as needed, then closeAsync().
+  async createDataset(target, opts) { return createDatasetAsync(this, await target_(target, opts), opts); }
+  async storedDatasets() { return (await storedFiles()).filter((f) => f.name.endsWith('.vectro')); }
+  async openStoredDataset(name) { return openDatasetAsync(this, await storedFile(name)); }
+  storedDatasetFile(name) { return storedFile(name); } // (a File: to download, or to open)
+  removeStoredDataset(name) { return removeStored(name); }
 }
+
+// a name in browser storage or a FileSystemFileHandle -> a writable file; file objects as they are
+const target_ = (t, opts) => (typeof t === 'string' || typeof t?.createWritable === 'function' ? writableFile(t, { append: opts?.append }) : t);
 
 // ---- split tables: multi-core on pages WITHOUT isolation headers ------------
 // No shared memory: each Web Worker owns a slice of every table and answers
@@ -104,4 +123,5 @@ export { BatchEncoder, FrameReader, encodeSchema, encodeEnd } from './frames.mjs
 export { readArrow, writeArrow, ArrowReader, ArrowEncoder } from './arrow.mjs';
 export { DistinctSketch } from './sketch.mjs';
 export { sql } from './sql.mjs';
-export { Dataset, openDatasetAsync, blobFile, urlFile } from './dataset.mjs';
+export { Dataset, openDatasetAsync, blobFile, urlFile, writeDatasetAsync, csvToDatasetAsync, createDatasetAsync } from './dataset.mjs';
+export { memoryFile, writableFile, storageAvailable } from './files-browser.mjs';

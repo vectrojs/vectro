@@ -302,6 +302,71 @@ for (const [label, make] of engines) {
   await single.close();
 }
 
+// writing without blocking, to a file that writes in the background (as
+// browser files do): bytes queue in order, appendAsync / closeAsync wait
+{
+  const { writeDatasetAsync, csvToDatasetAsync, createDatasetAsync, openDatasetAsync } = await import('../src/dataset.mjs');
+  const { memoryFile } = await import('../src/files-browser.mjs');
+  const asyncFile = (name, before = null) => {
+    const parts = [];
+    let size = before?.length ?? 0, queued = 0, peak = 0, chain = Promise.resolve(), closed = false, aborted = false;
+    const later = (fn) => { chain = chain.then(() => new Promise((r) => setTimeout(r, 0))).then(fn); };
+    return {
+      name, existed: !!before, size,
+      async read(u8, pos) { u8.set(before.subarray(pos, pos + u8.length)); },
+      write(u8, pos) { const d = u8.slice(); queued += d.length; peak = Math.max(peak, queued); later(() => { parts.push([pos, d]); size = Math.max(size, pos + d.length); queued -= d.length; }); },
+      truncate(n) { later(() => { size = n; }); },
+      close() { later(() => { closed = true; }); },
+      abort() { aborted = true; },
+      flush: () => chain,
+      done: () => chain,
+      bytes() { const out = new Uint8Array(size); if (before) out.set(before.subarray(0, Math.min(before.length, size))); for (const [p, d] of parts) out.set(d.subarray(0, Math.max(0, Math.min(d.length, size - p))), p); return out; },
+      stats: () => ({ peak, closed, aborted }),
+    };
+  };
+  const e = new Engine();
+  const n = 120_000;
+  const t1 = e.table({ id: Float64Array.from({ length: n }, (_, i) => i), r: Array.from({ length: n }, (_, i) => ['x', 'y'][i % 2]), ts: Array.from({ length: n }, (_, i) => new Date(Date.UTC(2024, 0, 1) + i * 60_000)) });
+  const t2 = e.table({ id: Float64Array.from({ length: 1000 }, (_, i) => n + i), r: Array.from({ length: 1000 }, () => 'z'), ts: Array.from({ length: 1000 }, (_, i) => new Date(Date.UTC(2025, 0, 1) + i * 1000)) });
+  // a table
+  const f = asyncFile('a.vectro');
+  const s1 = await writeDatasetAsync(e, f, t1, { rowsPerChunk: 20_000 });
+  check(f.stats().closed && s1.rows === n && s1.bytes === f.bytes().length, `async write ${JSON.stringify(s1)} ${JSON.stringify(f.stats())}`);
+  const d1 = await openDatasetAsync(e, new Blob([f.bytes()]));
+  same(await d1.lazy().groupBy('r').agg({ c: 'count()', m: 'max(id)' }).toRowsAsync(), t1.lazy().groupBy('r').agg({ c: 'count()', m: 'max(id)' }).toRows(), 'async-written dataset');
+  // appended to (its footer read asynchronously)
+  const g = asyncFile('a.vectro', f.bytes());
+  const w = await createDatasetAsync(e, g, { rowsPerChunk: 20_000 });
+  await w.appendAsync(t2);
+  await w.closeAsync();
+  const d2 = await openDatasetAsync(e, new Blob([g.bytes()]));
+  same([d2.length, await d2.lazy().groupBy('r').agg({ c: 'count()' }).toRowsAsync()], [n + 1000, [{ r: 'x', c: n / 2 }, { r: 'y', c: n / 2 }, { r: 'z', c: 1000 }]], 'async append');
+  // a query over a dataset, streamed: only about a chunk waits at a time
+  const h = asyncFile('b.vectro');
+  await writeDatasetAsync(e, h, d1.lazy().filter("r == 'y'").select('id', 'ts'), { rowsPerChunk: 5_000 });
+  const d3 = await openDatasetAsync(e, new Blob([h.bytes()]));
+  same(await d3.aggAsync({ c: 'count()', s: 'sum(id)' }), t1.filter("r == 'y'").agg({ c: 'count()', s: 'sum(id)' }), 'async streamed query');
+  check(h.stats().peak < 200_000, `queued at most ${h.stats().peak} bytes`);
+  // a CSV given as a Blob
+  const csv = 'k,v,day\n' + Array.from({ length: 30_000 }, (_, i) => `${['p', 'q', 'r'][i % 3]},${i / 4},2024-0${1 + (i % 9)}-1${i % 10}`).join('\n');
+  const c = asyncFile('c.vectro');
+  const sc = await csvToDatasetAsync(e, new Blob([csv]), c, { pieceBytes: 50_000, rowsPerChunk: 4_000 });
+  const d4 = await openDatasetAsync(e, new Blob([c.bytes()]));
+  same([sc.rows, await d4.lazy().groupBy('k').agg({ s: 'sum(v)', n: 'count()' }).toRowsAsync()], [30_000, e.parseCSV(csv).lazy().groupBy('k').agg({ s: 'sum(v)', n: 'count()' }).toRows()], 'async csv from a Blob');
+  check(d4.cols.get('day').date, 'csv date column from a Blob');
+  // in memory (browsers without file storage)
+  const m = memoryFile();
+  await writeDatasetAsync(e, m, t2);
+  same((await openDatasetAsync(e, m.blob())).length, 1000, 'memory file');
+  // an error on the way: nothing is committed
+  const bad = asyncFile('bad.vectro');
+  let msg = '';
+  try { await writeDatasetAsync(e, bad, d1.lazy().filter('nope > 1')); } catch (err) { msg = err.message; }
+  check(msg.includes('nope') && bad.stats().aborted && !bad.stats().closed, `aborted write ${msg} ${JSON.stringify(bad.stats())}`);
+  for (const d of [d1, d2, d3, d4]) await d.close();
+  await e.close();
+}
+
 // errors say what's wrong
 {
   const e = new Engine();

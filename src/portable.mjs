@@ -17,4 +17,5 @@ export { BatchEncoder, FrameReader, encodeSchema, encodeEnd } from './frames.mjs
 export { readArrow, writeArrow, ArrowReader, ArrowEncoder } from './arrow.mjs';
 export { DistinctSketch } from './sketch.mjs';
 export { sql } from './sql.mjs';
-export { Dataset, openDatasetAsync, blobFile, urlFile } from './dataset.mjs'; // (datasets from a Blob or URL, read asynchronously)
+export { Dataset, openDatasetAsync, blobFile, urlFile, writeDatasetAsync, csvToDatasetAsync, createDatasetAsync } from './dataset.mjs'; // (datasets from a Blob or URL, read asynchronously; written to a file object)
+export { memoryFile } from './files-browser.mjs';

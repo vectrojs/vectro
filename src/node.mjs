@@ -6,7 +6,7 @@ import { openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { Engine as CoreEngine } from './engine.mjs';
 import { loadBytes, loadBytesAsync } from './csv.mjs';
-import { Dataset, DatasetWriter, writeDataset, csvToDataset, csvToDatasetAsync, openDatasetAsync, setFiles } from './dataset.mjs';
+import { Dataset, DatasetWriter, writeDataset, csvToDataset, csvToDatasetAsync, openDatasetAsync, writeDatasetAsync, createDatasetAsync, setFiles } from './dataset.mjs';
 import { nodeFiles } from './files-node.mjs';
 setFiles(nodeFiles);
 
@@ -74,13 +74,17 @@ export class Engine extends CoreEngine {
   createDataset(path, opts) { return new DatasetWriter(this, path, opts); }
   // A table, a query (over a dataset: written chunk by chunk) or columns.
   writeDataset(path, source, opts) { return writeDataset(this, path, source, opts); }
-  // A CSV file of any size, read in pieces.
+  // A CSV file of any size, read in pieces (async: also from a URL or Blob).
   csvToDataset(csvPath, path, opts) { return csvToDataset(this, csvPath, path, opts); }
-  csvToDatasetAsync(csvPath, path, opts) { return csvToDatasetAsync(this, csvPath, path, opts); }
+  csvToDatasetAsync(csv, path, opts) { return csvToDatasetAsync(this, csv, path, opts); }
+  // writeDataset / createDataset without blocking (a writer with appendAsync / closeAsync).
+  writeDatasetAsync(path, source, opts) { return writeDatasetAsync(this, path, source, opts); }
+  createDatasetAsync(path, opts) { return createDatasetAsync(this, path, opts); }
 }
 
 export { canCompileWasm } from './engine.mjs';
 export { Dataset, DatasetWriter, blobFile, urlFile } from './dataset.mjs';
+export { memoryFile } from './files-browser.mjs';
 export { Table } from './table.mjs';
 
 // ---- split tables and streams: each worker thread owns its rows --------------
