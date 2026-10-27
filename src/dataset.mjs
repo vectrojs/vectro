@@ -41,7 +41,7 @@ import { parse, toSource, isMask } from './fuse.mjs';
 import { KINDS, decodeOne } from './pack.mjs';
 import { conditions, mayMatch, computeZones } from './zones.mjs';
 import { STR_SHIFT, STR_ESCAPED } from './csv-kernel.mjs';
-import { inspectCSV, loadBytes } from './csv.mjs';
+import { inspectCSV, loadBytes, loadBytesAsync } from './csv.mjs';
 import { freeBuild } from './join.mjs';
 import { OP } from './kernels.mjs';
 import { bitPlan, packBits, unpackBits, unpackModule, seqModule } from './bitpack.mjs';
@@ -55,8 +55,8 @@ export const CHUNK_ROWS = 1 << 22;
 const BLOCK = 1 << 16; // min / max per block of rows inside a chunk: a query reads only the blocks that can match
 // partial groups are merged again once this many pile up (tests make it small)
 // how often partial results went to disk (tests, benchmarks)
-export const stats = { spills: 0, resplits: 0 };
-export const tuning = { mergeRows: 1 << 20, denseMin: undefined, spillRows: 1 << 23, partitionRows: 1 << 24 };
+export const stats = { spills: 0, resplits: 0, joinPartitions: 0 };
+export const tuning = { mergeRows: 1 << 20, denseMin: undefined, spillRows: 1 << 23, partitionRows: 1 << 24, joinRows: 1 << 24 };
 
 // ---- writing --------------------------------------------------------------------------
 
@@ -683,6 +683,76 @@ function* keep(engine, r, chunk) {
   return copy;
 }
 
+// A join whose two sides are both too big for memory (a "grace" hash join):
+// both sides' rows go to partition files by ranges of the (first) join key,
+// with the same split points; then for each range, its right rows are held
+// in memory and its left rows stream past them chunk by chunk, through the
+// rest of the per-chunk plan (acc). Rows come out range by range, not in the
+// left table's order.
+function* partitionedJoinG(J, viewTop, ds, names, acc) {
+  const { engine } = ds;
+  const [lk, rk] = onKeys(J.opts.on);
+  const Rds = findDataset(J.right);
+  const count = Math.min(64, Math.max(2, Math.ceil((2 * J.partitioned.rows) / tuning.joinRows)));
+  const splitters = (Rds.cols.has(rk[0]) ? zoneSplitters(Rds, rk[0], count) : null) ?? (ds.cols.has(lk[0]) ? zoneSplitters(ds, lk[0], count) : null) ?? [];
+  const rs = new Spill(engine, rk[0], splitters), ls = new Spill(engine, lk[0], splitters);
+  stats.joinPartitions++;
+  try {
+    yield* runPlanG({ op: 'output', input: J.right }, rs);
+    const keep = namesOf(J.left).filter((n) => names.includes(n) || !ds.cols.has(n)); // (the left columns used, and derived ones)
+    yield* runPlanG({ op: 'output', input: { op: 'select', names: keep, input: J.left } }, ls);
+    const rp = rs.close(), lp = ls.close();
+    let ran = false;
+    for (let j = 0; j < lp.length && !acc.done; j++) {
+      if (!lp[j] || (!rp[j] && (J.opts.how ?? 'inner') !== 'left')) continue; // (no rows can come out of this range)
+      const R = rp[j] ? yield* readAll(engine, rp[j]) : emptyLike(engine, rs);
+      const L = new Dataset(engine, lp[j]);
+      try {
+        for (let i = 0; i < L.chunkCount && !acc.done; i++) {
+          const c = yield { read: L, piece: { i, lo: 0, hi: L.meta.chunks[i].rows }, names: L.columnNames };
+          try {
+            ds.lastRun.rows += c.n;
+            ran = true;
+            yield* acc.chunk(substitute(viewTop, J, { ...J, left: { op: 'scan', table: c }, right: { op: 'scan', table: R } }), c);
+          } finally { c.dispose(); }
+        }
+      } finally {
+        L.close();
+        const builds = engine._joinBuilds?.get(R.cols.get(rk[0])?.data); // (this range's hash table: freed now)
+        if (builds) { for (const b of builds.values()) freeBuild(engine, b); engine._joinBuilds.delete(R.cols.get(rk[0]).data); }
+        R.dispose();
+      }
+    }
+    if (!ran) { // no rows on one side: the plan still runs once, on no rows, for the result's shape
+      const scan = (function find(n) { return n.op === 'scan' ? n : find(n.op === 'join' ? n.left : n.input); })(J.left);
+      const empty = yield { read: ds, piece: { i: -1, lo: 0, hi: 0 }, names };
+      const R = emptyLike(engine, rs);
+      try { yield* acc.chunk(substitute(substitute(viewTop, J, { ...J, right: { op: 'scan', table: R } }), scan, { op: 'scan', table: empty }), empty); } finally { empty.dispose(); R.dispose(); }
+    }
+  } finally { rs.cleanup(); ls.cleanup(); }
+}
+
+// A dataset's rows as one table in memory.
+function* readAll(engine, path) {
+  const D = new Dataset(engine, path), parts = [];
+  try {
+    yield* eachChunk(D, function* (t) { parts.push(t); });
+    return copyRows(engine, parts.map((t) => [t, 0, t.n]));
+  } finally { for (const t of parts) t.dispose(); D.close(); }
+}
+
+// A table with no rows and the columns a spill was given.
+function emptyLike(engine, spill) {
+  const w = spill.writers.find((x) => x.meta);
+  const cols = new Map(), owned = [];
+  for (const c of w.meta.columns) {
+    const labels = c.kind === 'category' ? w.labels.get(c.name).dict : null;
+    cols.set(c.name, c.kind === 'text' ? { data: engine.alloc(Float64Array, 0), dict: null, codes: null, strings: engine.alloc(Uint8Array, 0) } : { data: engine.alloc(Float64Array, 0), dict: labels, codes: labels && new Map(labels.map((s, i) => [s, i])), date: c.kind === 'date' });
+    owned.push(c.name);
+  }
+  return new Table(engine, cols, 0, { owned, ownedBuffers: [...cols.values()].filter((c) => c.strings).map((c) => c.strings) });
+}
+
 // Every join's right side (the build side) as one plain table, made once:
 // a dataset there is read in full (its matching rows and used columns), a
 // filtered or packed table is collected / decoded, so each chunk's join finds
@@ -692,6 +762,13 @@ function* materializeRights(node, temps) {
   if (node.op === 'join') {
     const left = yield* materializeRights(node.left, temps);
     let right = node.right;
+    const L = findDataset(left), Rds = findDataset(right);
+    if (L && Rds) { // both on disk: too many right rows to hold? then both sides go to disk by key range
+      const [lk, rk] = onKeys(node.opts.on);
+      const textKey = L.cols.get(lk[0])?.dict || Rds.cols.get(rk[0])?.dict; // (codes differ between files: not by range)
+      const rows = textKey ? 0 : (yield* runPlanG({ op: 'total', spec: { n: parse('count()') }, input: right })).n;
+      if (rows > tuning.joinRows) return { ...node, left, right, partitioned: { rows } };
+    }
     const plain = right.op === 'scan' && !right.table.isDataset && !right.table.pred && ![...right.table.cols.values()].some((c) => c.enc);
     if (!plain) {
       let t = findDataset(right) ? yield* runPlanG({ op: 'output', input: right }) : yield { run: { op: 'output', input: right } };
@@ -758,7 +835,10 @@ function* runChunksG(plan, path, sink) {
   engine._joinRuns = (engine._joinRuns ?? 0) + 1; // joins keep their right side's build while a dataset runs
   engine._joinBuilds ??= new Map();
   try {
-    for (let k = 0; k < list.length; k++) {
+    let pj = viewTop;
+    while (pj.op !== 'scan' && !(pj.op === 'join' && pj.partitioned)) pj = pj.op === 'join' ? pj.left : pj.input;
+    if (pj.op === 'join') yield* partitionedJoinG(pj, viewTop, ds, names, acc);
+    else for (let k = 0; k < list.length; k++) {
       if (k > 0 && acc.done) break;
       const chunk = yield { read: ds, piece: list[k], names };
       if (k + 1 < list.length && !acc.done) yield { prefetch: ds, piece: list[k + 1], names };
@@ -824,7 +904,8 @@ function accumulator(kind, B, engine, sink, ds, derived) {
       else if (kind === 'head') node = { op: 'output', input: { op: 'limit', n: B.n + (B.offset ?? 0) - rows, offset: 0, input: P } };
       else node = { op: 'output', input: P };
       const r = yield { run: node };
-      if (sink && kind === 'collect') { // straight to the dataset being written
+      if (sink && kind === 'collect') { // straight to the dataset being written (or to spill partitions)
+        if (sink.appendG) { yield* sink.appendG(yield* keep(engine, r, chunk)); return; }
         try { sink.append(r); } finally { if (r !== chunk) r.dispose(); }
         return;
       }
@@ -874,6 +955,8 @@ class Spill {
     this.writers = this.paths.map((p) => new DatasetWriter(engine, p, { rowsPerChunk: 1 << 18 }));
     this.rows = 0;
   }
+
+  *appendG(t) { yield* this.add(t); } // (as a sink: runPlanG writes a query's rows here)
 
   // t's rows, each to its partition (t is freed)
   *add(t) {
@@ -1386,17 +1469,48 @@ function countBits(bits, from, to) {
 // ---- CSV of any size -> dataset ------------------------------------------------------------
 // Read in pieces (pieceBytes, cut at row ends), each parsed on every thread
 // with the column types found in the first piece. Returns the writer's summary.
-export function csvToDataset(engine, csvPath, outPath, { rowsPerChunk, pieceBytes = 64 << 20, header = true, delimiter = ',', types = {}, sampleRows, ...rest } = {}) {
+export function csvToDataset(engine, csvPath, outPath, opts = {}) {
   const fd = openSync(csvPath, 'r');
-  const writer = new DatasetWriter(engine, outPath, { rowsPerChunk });
   try {
-    const size = fstatSync(fd).size;
+    const gen = csvPiecesG(engine, fstatSync(fd).size, outPath, opts);
+    let step = gen.next();
+    while (!step.done) {
+      const v = step.value;
+      let out, err = null;
+      try { out = v.read ? readFully(fd, v.read, v.pos) : loadBytes(engine, v.parse, v.opts); } catch (e) { err = e; }
+      step = err ? gen.throw(err) : gen.next(out);
+    }
+    return step.value;
+  } finally { closeSync(fd); }
+}
+
+// The same without blocking: reads with async I/O, parses on the worker threads.
+export async function csvToDatasetAsync(engine, csvPath, outPath, opts = {}) {
+  const fh = await openFile(csvPath, 'r');
+  try {
+    const gen = csvPiecesG(engine, (await fh.stat()).size, outPath, opts);
+    let step = gen.next();
+    while (!step.done) {
+      const v = step.value;
+      let out, err = null;
+      try { out = v.read ? await readFullyAsync(fh, v.read, v.pos) : await loadBytesAsync(engine, v.parse, v.opts); } catch (e) { err = e; }
+      step = err ? gen.throw(err) : gen.next(out);
+    }
+    return step.value;
+  } finally { await fh.close(); }
+}
+
+// Yields { read: bytes, pos } (fill bytes from the file at pos) and
+// { parse: engine bytes, opts } (a table); appends each piece's rows.
+function* csvPiecesG(engine, size, outPath, { rowsPerChunk, bitPack, pieceBytes = 64 << 20, header = true, delimiter = ',', types = {}, sampleRows, ...rest } = {}) {
+  const writer = new DatasetWriter(engine, outPath, { rowsPerChunk, bitPack });
+  try {
     let pos = 0, carry = new Uint8Array(0), head = new Uint8Array(0), kinds = null;
     while (true) {
       const want = Math.min(pieceBytes, size - pos);
       const buf = new Uint8Array(carry.length + want);
       buf.set(carry, 0);
-      readFully(fd, buf.subarray(carry.length), pos);
+      yield { read: buf.subarray(carry.length), pos };
       pos += want;
       const last = pos >= size;
       let start = 0;
@@ -1407,16 +1521,12 @@ export function csvToDataset(engine, csvPath, outPath, { rowsPerChunk, pieceByte
         start = info.start;
       }
       const end = last ? buf.length : rowsEnd(buf, start);
-      if (end > start) {
-        const bytes = engine.alloc(Uint8Array, head.length + end - start);
+      if (end > start || (!writer.meta && last)) { // (a header and no rows: still the columns)
+        const rows = end > start ? buf.subarray(start, end) : new Uint8Array(0);
+        const bytes = engine.alloc(Uint8Array, head.length + rows.length);
         bytes.set(head, 0);
-        bytes.set(buf.subarray(start, end), head.length);
-        const t = loadBytes(engine, bytes, { delimiter, header, types: kinds, ...rest });
-        try { writer.append(t); } finally { t.dispose(); }
-      } else if (!writer.meta && last) { // a header and no rows
-        const bytes = engine.alloc(Uint8Array, head.length);
-        bytes.set(head, 0);
-        const t = loadBytes(engine, bytes, { delimiter, header, types: kinds, ...rest });
+        bytes.set(rows, head.length);
+        const t = yield { parse: bytes, opts: { delimiter, header, types: kinds, ...rest } };
         try { writer.append(t); } finally { t.dispose(); }
       }
       if (last) break;
@@ -1425,8 +1535,6 @@ export function csvToDataset(engine, csvPath, outPath, { rowsPerChunk, pieceByte
   } catch (err) {
     writer.abort();
     throw err;
-  } finally {
-    closeSync(fd);
   }
   return writer.close();
 }

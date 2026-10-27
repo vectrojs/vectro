@@ -176,7 +176,7 @@ size has no limit from memory (an engine holds at most 4 GB), and it opens
 instantly. Node only.
 
 ```js
-engine.csvToDataset('orders.csv', 'orders.vectro');     // a CSV of any size, read in pieces
+engine.csvToDataset('orders.csv', 'orders.vectro');     // a CSV of any size, read in pieces (or csvToDatasetAsync)
 const w = engine.createDataset('events.vectro');         // or append tables (or { column: values })
 w.append(todaysEvents); w.close();
 engine.writeDataset('eu.vectro', orders.filter("region == 'EU'")); // a table, or a query
@@ -208,7 +208,12 @@ sql('SELECT region, COUNT(DISTINCT cust) FROM orders GROUP BY region', { orders 
   memory and, past 8M groups, **spill** them to disk split by key range; each
   range is merged on its own (split again if still too big), in key order.
 - **Joins:** the other table (or a dataset's matching rows) is the build
-  side, hashed once for all chunks.
+  side, hashed once for all chunks (IDs in a small range use a direct lookup
+  array instead). When both sides are datasets and the other side has more
+  than 16M matching rows, both go to disk split by key range and each range is
+  joined on its own (a "grace" hash join): 100M orders x 20M accounts in 7.6 s
+  with 406 MB of engine memory. Rows then come out range by range rather than
+  in the left table's order.
 - **Results** come back as normal tables. `writeDataset(path, query)` writes
   a query's result as a new dataset chunk by chunk, so it needn't fit in
   memory either; a full `sort` written this way is an external sort (by
@@ -523,8 +528,9 @@ answers.
 ## Not done yet
 
 64-bit integers beyond 2^53 and time zones other than UTC. Datasets are
-Node-only and written by one writer at a time; a join's right side must fit
-in memory, and `approxDistinct` on a dataset counts exactly. Joins are for normal
+Node-only and written by one writer at a time; a join on text keys needs its
+other side to fit in memory, exact distinct counts of non-ID values don't
+spill, and `approxDistinct` on a dataset counts exactly. Joins are for normal
 tables (not split tables or streams yet), inner and left only. Split tables
 have `topAsync` but no full sort.
 Binary streams have number and category columns only; Arrow ZSTD compression isn't supported.

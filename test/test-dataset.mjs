@@ -109,6 +109,19 @@ for (const [label, make] of engines) {
   const cds = new Dataset(e, cpath);
   same(t.lazy().filter('qty == 2').join(cds, { on: 'cust' }).groupBy('tier').agg({ n: 'count()' }).toRows(), t.lazy().filter('qty == 2').join(c, { on: 'cust' }).groupBy('tier').agg({ n: 'count()' }).toRows(), `${label} dataset on the right`);
   same(ds.lazy().filter('qty == 2').join(cds.lazy().filter('tier != 3'), { on: 'cust' }).groupBy('tier').agg({ n: 'count()' }).toRows(), t.lazy().filter('qty == 2').join(c.lazy().filter('tier != 3'), { on: 'cust' }).groupBy('tier').agg({ n: 'count()' }).toRows(), `${label} two datasets`);
+  // both sides too big for memory (made small here): partitioned by key range
+  Object.assign(tuning, { joinRows: 300 });
+  {
+    const before = stats.joinPartitions;
+    const sorted = (rows) => rows.map((r) => JSON.stringify(r)).sort();
+    same(ds.lazy().filter('qty == 2').join(cds.lazy().filter('tier != 3'), { on: 'cust' }).groupBy('tier').agg({ n: 'count()', s: 'sum(price)' }).toRows(), t.lazy().filter('qty == 2').join(c.lazy().filter('tier != 3'), { on: 'cust' }).groupBy('tier').agg({ n: 'count()', s: 'sum(price)' }).toRows(), `${label} partitioned join, groups`);
+    same(sorted(ds.lazy().filter('cust >= 2400 && qty > 6').join(cds, { on: 'cust', how: 'left' }).select('cust', 'ts', 'name', 'tier').toRows()), sorted(t.lazy().filter('cust >= 2400 && qty > 6').join(c, { on: 'cust', how: 'left' }).select('cust', 'ts', 'name', 'tier').toRows()), `${label} partitioned left join, rows`);
+    same(ds.lazy().join(cds, { on: 'cust' }).top(5, ['-price', 'ts']).toRows(), t.lazy().join(c, { on: 'cust' }).top(5, ['-price', 'ts']).toRows(), `${label} partitioned join, top`);
+    same(ds.lazy().filter('qty > 100').join(cds, { on: 'cust' }).agg({ n: 'count()', s: 'sum(price)' }), { n: 0, s: 0 }, `${label} partitioned join, no rows`);
+    check(stats.joinPartitions - before === 4, `${label}: partitioned ${stats.joinPartitions - before} of 4 joins`);
+  }
+  Object.assign(tuning, { joinRows: 1 << 24 });
+
   // a query over a dataset written as a dataset (chunk by chunk), and an aggregate
   const fpath = file(`filtered-${label}.vectro`);
   const fs = writeDataset(e, fpath, ds.lazy().filter("region == 'MEA'").derive('rev', 'price * qty').select('ts', 'rev', 'region'), { rowsPerChunk: 3000 });
@@ -229,6 +242,12 @@ for (const [label, make] of engines) {
   same(dc.lazy().groupBy('city').agg({ s: 'sum(amount)', n: 'count()' }).sort('city').toRows(), mem.lazy().groupBy('city').agg({ s: 'sum(amount)', n: 'count()' }).sort('city').toRows(), 'csv groups');
   same(dc.filter("day >= '2024-05-01' && comment == 'two\nlines, quoted'").count(), mem.filter("day >= '2024-05-01' && comment == 'two\nlines, quoted'").count(), 'csv quoted newlines');
   same(dc.toRows(3), mem.toRows(3), 'csv first rows');
+  // async: the same dataset
+  const sa = await e.csvToDatasetAsync(csvPath, file('csv-async.vectro'), { pieceBytes: 4096, rowsPerChunk: 1500, types: { comment: 'category' } });
+  const da = e.openDataset(file('csv-async.vectro'));
+  check(sa.rows === s.rows && sa.chunks === s.chunks, `async csv ${JSON.stringify(sa)} vs ${JSON.stringify(s)}`);
+  same(da.toRows(), dc.toRows(), 'async csv rows');
+  await da.close();
   await dc.close();
   await e.close();
 }
