@@ -228,21 +228,23 @@ formulas exact in both, answers compared; best of 3, busy laptop):
 
 | Query | 100M rows: Vectro | DuckDB | 1 billion rows: Vectro | DuckDB |
 |---|---|---|---|---|
-| scan everything (count, revenue) | 66 ms | 84 ms | 549 ms | 812 ms |
-| filter: region and quantity | 111 ms | 90 ms | 825 ms | 839 ms |
-| the last day (1 chunk read) | 2 ms | 1 ms | 1 ms | 4 ms |
-| group by region | 137 ms | 157 ms | 1.35 s | 1.42 s |
-| top 10 of 1M customers | 549 ms | 563 ms | 6.44 s | 6.73 s |
-| top 10 rows by price | 339 ms | 121 ms | 3.88 s | 1.00 s |
-| join 1M customers, group by tier | 327 ms | 79 ms | 3.19 s | 0.83 s |
-| distinct customers per region | 276 ms | 606 ms | 2.81 s | 10.6 s |
+| scan everything (count, revenue) | 49 ms | 66 ms | 549 ms | 641 ms |
+| filter: region and quantity | 84 ms | 76 ms | 825 ms | 694 ms |
+| the last day (1 chunk read) | 1 ms | 1 ms | 1 ms | 4 ms |
+| group by region | 120 ms | 126 ms | 1.27 s | 1.27 s |
+| top 10 of 1M customers | 531 ms | 502 ms | 5.53 s | 6.73 s |
+| top 10 rows by price | 131 ms | 90 ms | 2.77 s | 0.87 s |
+| join 1M customers, group by tier | 154 ms | 72 ms | 1.55 s | 0.62 s |
+| distinct customers per region | 251 ms | 520 ms | 2.57 s | 7.79 s |
 | file on disk | 0.5 GB | 0.5 GB | 5.1 GB | 5.4 GB |
-| peak memory (RSS) | 439 MB | 3.3 GB | **393 MB** | 4.5 GB |
+| peak memory (RSS) | 380 MB | 3.2 GB | **0.3–0.4 GB** | 4.5–5.6 GB |
 
 A billion rows would take 37 GB as plain columns in memory (this laptop has
-16 GB); Vectro's engine never used more than 245 MB for them. Vectro is
-level or faster on 6 of the 8 queries; DuckDB is still faster at picking
-the top rows and at joins on data this big.
+16 GB); Vectro's engine never used more than 245 MB for them. On this busy
+machine runs differ by up to 2x, so the billion-row column is each system's
+best of two runs. Vectro is level or faster on 5 of the 8 queries; DuckDB is
+still faster at picking the top rows (3x) and at joins (2.5x) on data this
+big.
 
 ## For AI assistants (MCP server)
 
