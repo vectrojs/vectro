@@ -53,6 +53,26 @@ const need = (what) => {
   return files;
 };
 
+// Temporary files for spilling (huge group-bys, sorts, joins): Node's temp
+// folder (from its files), or browser storage (files-browser.mjs: opfsTemp,
+// registered by vectrojs/browser). Its calls may be async; the spilling code
+// asks for them as { call } requests that the drivers resolve.
+let tempStorage = null;
+export function setTempStorage(t) { tempStorage = t; }
+const temp = () => {
+  const t = tempStorage ?? (files && { dir: files.tempDir, join: files.join, openWrite: (p) => files.openWrite(p), openRead: (p) => files.openRead(p), remove: files.remove });
+  if (!t) throw new Error('vectro: this query needs to spill to disk (too many groups, a big sort or join), which needs Node or browser file storage');
+  return t;
+};
+function* tempDataset(engine, path) { // (a spill file, written and closed)
+  const file = yield { call: () => temp().openRead(path) };
+  const footer = file.readSync ? readFooter(file) : yield { call: () => readFooterAsync(file) };
+  return new Dataset(engine, file, footer);
+}
+function* tempWriter(engine, path, opts) { return new DatasetWriter(engine, yield { call: () => temp().openWrite(path) }, opts); }
+function* closeWriter(w) { w.close(); yield { call: () => w.file.done?.() }; }
+const removeTemp = (path) => { try { const r = tempStorage ? tempStorage.remove(path) : files?.remove(path); r?.catch?.(() => {}); } catch { /* (best effort) */ } };
+
 const MAGIC = new TextEncoder().encode('VECTRODS');
 const VERSION = 2; // (2: bit-packed columns; version 1 files read too)
 const HEADER = 16, TAIL = 24, ALIGN = 64;
@@ -662,7 +682,10 @@ function driveSync(gen) {
   while (!step.done) {
     const v = step.value;
     let out, err = null;
-    try { out = v.run ? execute(v.run, true) : v.read ? v.read._readSync(v.piece, v.names) : undefined; } catch (e) { err = e; } // ({ flush }: nothing to wait for)
+    try {
+      out = v.run ? execute(v.run, true) : v.read ? v.read._readSync(v.piece, v.names) : v.call ? v.call() : undefined; // ({ flush }: nothing to wait for)
+      if (typeof out?.then === 'function') throw new Error('vectro: this needs the async calls (toRowsAsync, aggAsync, writeDatasetAsync...)');
+    } catch (e) { err = e; }
     step = err ? gen.throw(err) : gen.next(out);
   }
   return step.value;
@@ -678,6 +701,7 @@ async function driveAsync(gen) {
       try {
         if (v.run) out = await execute(v.run, false);
         else if (v.flush) await v.flush.file?.flush?.(); // (a writer's bytes on disk before more come)
+        else if (v.call) out = await v.call();
         else if (v.prefetch) {
           const key = `${v.prefetch.path}\0${v.piece.i}\0${v.piece.lo}`;
           if (!pending.has(key)) { const p = v.prefetch._readAsync(v.piece, v.names); p.catch(() => {}); pending.set(key, p); }
@@ -775,18 +799,20 @@ function* partitionedJoinG(J, viewTop, ds, names, acc) {
   const Rds = findDataset(J.right);
   const count = Math.min(64, Math.max(2, Math.ceil((2 * J.partitioned.rows) / tuning.joinRows)));
   const splitters = (Rds.cols.has(rk[0]) ? zoneSplitters(Rds, rk[0], count) : null) ?? (ds.cols.has(lk[0]) ? zoneSplitters(ds, lk[0], count) : null) ?? [];
-  const rs = new Spill(engine, rk[0], splitters), ls = new Spill(engine, lk[0], splitters);
+  const rs = yield* Spill.create(engine, rk[0], splitters);
+  let ls;
+  try { ls = yield* Spill.create(engine, lk[0], splitters); } catch (err) { rs.cleanup(); throw err; }
   stats.joinPartitions++;
   try {
     yield* runPlanG({ op: 'output', input: J.right }, rs);
     const keep = namesOf(J.left).filter((n) => names.includes(n) || !ds.cols.has(n)); // (the left columns used, and derived ones)
     yield* runPlanG({ op: 'output', input: { op: 'select', names: keep, input: J.left } }, ls);
-    const rp = rs.close(), lp = ls.close();
+    const rp = yield* rs.closeG(), lp = yield* ls.closeG();
     let ran = false;
     for (let j = 0; j < lp.length && !acc.done; j++) {
       if (!lp[j] || (!rp[j] && (J.opts.how ?? 'inner') !== 'left')) continue; // (no rows can come out of this range)
       const R = rp[j] ? yield* readAll(engine, rp[j]) : emptyLike(engine, rs);
-      const L = new Dataset(engine, lp[j]);
+      const L = yield* tempDataset(engine, lp[j]);
       try {
         for (let i = 0; i < L.chunkCount && !acc.done; i++) {
           const c = yield { read: L, piece: { i, lo: 0, hi: L.meta.chunks[i].rows }, names: L.columnNames };
@@ -814,7 +840,7 @@ function* partitionedJoinG(J, viewTop, ds, names, acc) {
 
 // A dataset's rows as one table in memory.
 function* readAll(engine, path) {
-  const D = new Dataset(engine, path), parts = [];
+  const D = yield* tempDataset(engine, path), parts = [];
   try {
     yield* eachChunk(D, function* (t) { parts.push(t); });
     return copyRows(engine, parts.map((t) => [t, 0, t.n]));
@@ -933,7 +959,7 @@ function* runChunksG(plan, path, sink) {
     const merged = yield* acc.finish();
     if (kind === 'total' || merged === null) return merged;
     if (merged.isDataset) { // spilled groups: the rest of the plan reads them from disk
-      try { return yield* runPlanG(substitute(plan, B, { op: 'scan', table: merged }), sink); } finally { merged.close(); files.remove(merged.temporary); }
+      try { return yield* runPlanG(substitute(plan, B, { op: 'scan', table: merged }), sink); } finally { merged.close(); removeTemp(merged.temporary); }
     }
     finalTable = merged;
     const rest = substitute(plan, kind === 'group' ? B : top, { op: 'scan', table: merged });
@@ -1027,14 +1053,20 @@ function accumulator(kind, B, engine, sink, ds, derived) {
 // its own.
 const PART = '__vectro_part';
 class Spill {
-  constructor(engine, key, splitters) {
-    this.engine = engine;
-    this.dir = need('spilling to disk (too many groups, a big sort or join)').tempDir('vectro-spill-');
+  // (made with yield* Spill.create(...): the files may open asynchronously)
+  constructor(engine, key, splitters, dir, paths, writers) {
     const P = splitters.length + 2;
+    Object.assign(this, { engine, dir, paths, writers, rows: 0 });
     this.partAst = parse(`(${key}) != (${key}) ? ${P - 1} : (0${splitters.map((v) => ` + ((${key}) >= ${toSource({ t: 'num', v })})`).join('')})`);
-    this.paths = Array.from({ length: P }, (_, j) => files.join(this.dir, `part-${j}.vectro`));
-    this.writers = this.paths.map((p) => new DatasetWriter(engine, p, { rowsPerChunk: 1 << 18 }));
-    this.rows = 0;
+  }
+
+  static *create(engine, key, splitters) {
+    const store = temp();
+    const dir = yield { call: () => store.dir('vectro-spill-') };
+    const paths = Array.from({ length: splitters.length + 2 }, (_, j) => store.join(dir, `part-${j}.vectro`));
+    const writers = [];
+    try { for (const p of paths) writers.push(yield* tempWriter(engine, p, { rowsPerChunk: 1 << 18 })); } catch (err) { for (const w of writers) w.abort(); removeTemp(dir); throw err; }
+    return new Spill(engine, key, splitters, dir, paths, writers);
   }
 
   *appendG(t) { yield* this.add(t); } // (as a sink: runPlanG writes a query's rows here)
@@ -1045,6 +1077,7 @@ class Spill {
       if (!t.n) return;
       this.rows += t.n;
       const S = yield { run: { op: 'output', input: { op: 'sort', by: [PART], input: { op: 'derive', name: PART, ast: this.partAst, input: { op: 'scan', table: t } } } } };
+      const touched = new Set();
       try {
         const part = this.engine.live(S.cols.get(PART).data), view = S.select(...t.columnNames);
         for (let a = 0; a < S.n; ) {
@@ -1052,19 +1085,21 @@ class Spill {
           let b = a;
           while (b < S.n && part[b] === j) b++;
           this.writers[j].append(view, a, b);
+          touched.add(this.writers[j]);
           a = b;
         }
       } finally { S.dispose(); }
+      for (const w of touched) yield { flush: w }; // (browser files: written before more comes)
     } finally { t.dispose(); }
   }
 
-  // the partition files in key order (null: no rows)
-  close() {
-    for (const w of this.writers) { if (!w.meta) w.abort(); else w.close(); }
+  // the partition files in key order (null: no rows), closed
+  *closeG() {
+    for (const w of this.writers) { if (!w.meta) w.abort(); else yield* closeWriter(w); }
     return this.paths.map((p, j) => (this.writers[j].meta ? p : null));
   }
 
-  cleanup() { for (const w of this.writers) w.abort(); files.remove(this.dir); }
+  cleanup() { for (const w of this.writers) w.abort(); removeTemp(this.dir); }
 }
 
 // Up to P - 1 split points for a column, from the dataset's min / max per
@@ -1116,25 +1151,25 @@ function sortSpillAccumulator(B, engine, ds, derived, first) {
           for (let i = 0; i < t.n; i++) if (v[i] === v[i]) vals.push(v[i]);
           splitters = quantiles(vals.sort((a, b) => a - b), count);
         }
-        spill = new Spill(engine, first.expr, splitters ?? []);
+        spill = yield* Spill.create(engine, first.expr, splitters ?? []);
         stats.spills++;
       }
       yield* spill.add(t);
     },
     *finish() {
-      spill ??= new Spill(engine, first.expr, []);
-      const paths = spill.close();
+      spill ??= yield* Spill.create(engine, first.expr, []);
+      const paths = yield* spill.closeG();
       const ordered = first.desc ? [...paths.slice(0, -1).reverse(), paths[paths.length - 1]] : paths;
-      const outPath = files.join(spill.dir, 'sorted.vectro');
-      const out = new DatasetWriter(engine, outPath);
+      const outPath = temp().join(spill.dir, 'sorted.vectro');
+      const out = yield* tempWriter(engine, outPath);
       let ok = false;
       try {
         for (const p of ordered) if (p) yield* sortPartition(p, 0, out);
         if (!out.meta) out.append(empty); // (no rows at all)
-        out.close();
+        yield* closeWriter(out);
         ok = true;
       } finally { if (!ok) out.abort(); }
-      const result = new Dataset(engine, outPath);
+      const result = yield* tempDataset(engine, outPath);
       result.temporary = spill.dir;
       spill = null;
       return result;
@@ -1143,15 +1178,15 @@ function sortSpillAccumulator(B, engine, ds, derived, first) {
   };
 
   function* sortPartition(path, depth, out) {
-    const D = new Dataset(engine, path);
+    const D = yield* tempDataset(engine, path);
     try {
       const splitters = D.length > tuning.partitionRows && depth < 4 ? zoneSplitters(D, first.expr, 16) : null;
       if (splitters) { // split again
-        const sub = new Spill(engine, first.expr, splitters);
+        const sub = yield* Spill.create(engine, first.expr, splitters);
         stats.resplits++;
         try {
           yield* eachChunk(D, (t) => sub.add(t));
-          const ps = sub.close();
+          const ps = yield* sub.closeG();
           for (const p of first.desc ? [...ps.slice(0, -1).reverse(), ps[ps.length - 1]] : ps) if (p) yield* sortPartition(p, depth + 1, out);
         } finally { sub.cleanup(); }
         return;
@@ -1165,6 +1200,7 @@ function sortSpillAccumulator(B, engine, ds, derived, first) {
       let sorted;
       try { sorted = yield* keep(engine, yield { run: { op: 'output', input: { op: 'sort', by: B.by, input: { op: 'scan', table: all } } } }, all); } finally { all.dispose(); }
       try { out.append(sorted); } finally { sorted.dispose(); }
+      yield { flush: out };
     } finally { D.close(); }
   }
 }
@@ -1270,7 +1306,7 @@ function groupAccumulator(kind, B, engine, ds, derived) {
             for (let i = 0; i < g.n; i++) if (v[i] === v[i]) vals.push(v[i]);
             splitters = quantiles(vals.sort((a, b) => a - b), P);
           }
-          if (splitters) { spill = new Spill(engine, k0, splitters); stats.spills++; }
+          if (splitters) { spill = yield* Spill.create(engine, k0, splitters); stats.spills++; }
         }
         if (spill) { for (const t of main.parts.splice(0)) yield* spill.add(t); main.rows = 0; }
       }
@@ -1319,16 +1355,16 @@ function groupAccumulator(kind, B, engine, ds, derived) {
   // dataset of the result (the rest of the plan reads it chunk by chunk).
   // A partition too big to merge in memory is split again by its first key.
   function* finishSpilled() {
-    const paths = spill.close();
-    const outPath = files.join(spill.dir, 'groups.vectro');
-    const out = new DatasetWriter(engine, outPath);
+    const paths = yield* spill.closeG();
+    const outPath = temp().join(spill.dir, 'groups.vectro');
+    const out = yield* tempWriter(engine, outPath);
     let ok = false;
     try {
       for (const p of paths) if (p) yield* mergePartition(p, 0, out);
-      out.close();
+      yield* closeWriter(out);
       ok = true;
     } finally { if (!ok) out.abort(); }
-    const result = new Dataset(engine, outPath);
+    const result = yield* tempDataset(engine, outPath);
     const dir = spill.dir;
     spill = null;
     result.temporary = dir; // (deleted after the rest of the plan ran)
@@ -1336,16 +1372,16 @@ function groupAccumulator(kind, B, engine, ds, derived) {
   }
 
   function* mergePartition(path, depth, out) {
-    const D = new Dataset(engine, path);
+    const D = yield* tempDataset(engine, path);
     try {
       if (!D.length) return;
       const splitters = D.length > tuning.partitionRows && depth < 4 ? zoneSplitters(D, keys[0], 16) : null;
       if (splitters) { // split again
-        const sub = new Spill(engine, keys[0], splitters);
+        const sub = yield* Spill.create(engine, keys[0], splitters);
         stats.resplits++;
         try {
           yield* eachChunk(D, (t) => sub.add(t));
-          for (const p of sub.close()) if (p) yield* mergePartition(p, depth + 1, out);
+          for (const p of yield* sub.closeG()) if (p) yield* mergePartition(p, depth + 1, out);
         } finally { sub.cleanup(); }
         return;
       }
@@ -1359,6 +1395,7 @@ function groupAccumulator(kind, B, engine, ds, derived) {
       try { G = yield* keep(engine, yield { run: { op: 'output', input: { op: 'aggregate', keys, spec: merge, input: { op: 'scan', table: all } } } }, all); } finally { all.dispose(); }
       const F = finalize(G, []);
       try { out.append(F); } finally { F.dispose(); }
+      yield { flush: out };
     } finally { D.close(); }
   }
 

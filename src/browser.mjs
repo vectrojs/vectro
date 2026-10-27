@@ -13,7 +13,9 @@
 //   await orders.filter("region == 'EU'").sumAsync('price * qty');
 import { Engine as CoreEngine } from './engine.mjs';
 import { openDatasetAsync, writeDatasetAsync, csvToDatasetAsync, createDatasetAsync } from './dataset.mjs';
-import { writableFile, storedFiles, storedFile, removeStored } from './files-browser.mjs';
+import { writableFile, storedFiles, storedFile, removeStored, storageAvailable, opfsTemp } from './files-browser.mjs';
+import { setTempStorage } from './dataset.mjs';
+if (storageAvailable()) setTempStorage(opfsTemp); // (huge group-bys, sorts and joins spill to browser storage)
 
 export const browserPlatform = {
   canBlock: false,

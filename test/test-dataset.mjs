@@ -367,6 +367,48 @@ for (const [label, make] of engines) {
   await e.close();
 }
 
+// spilling through temporary files that open, write and read asynchronously
+// (as in browsers: datasets from Blobs, temp files in browser storage)
+{
+  const { setTempStorage, openDatasetAsync, writeDatasetAsync } = await import('../src/dataset.mjs');
+  const { memoryFile } = await import('../src/files-browser.mjs');
+  const files = new Map();
+  let dirs = 0;
+  const later = () => new Promise((r) => setTimeout(r, 0));
+  const store = {
+    async dir(prefix) { await later(); return `${prefix}${dirs++}`; },
+    join: (d, name) => `${d}/${name}`,
+    async openWrite(path) {
+      await later();
+      const m = memoryFile(path);
+      let chain = Promise.resolve();
+      return { ...m, write(u8, pos) { const d = u8.slice(); chain = chain.then(later).then(() => m.write(d, pos)); }, truncate(n) { chain = chain.then(() => m.truncate(n)); }, close() { chain = chain.then(async () => { files.set(path, new Uint8Array(await m.blob().arrayBuffer())); }); }, abort() {}, flush: () => chain, done: () => chain };
+    },
+    async openRead(path) { await later(); const b = files.get(path); return { name: path, size: b.length, async read(u8, pos) { u8.set(b.subarray(pos, pos + u8.length)); }, close() {} }; },
+    async remove(path) { for (const k of [...files.keys()]) if (k === path || k.startsWith(`${path}/`)) files.delete(k); },
+  };
+  setTempStorage(store);
+  const e = new Engine();
+  const n = 40_000;
+  const t = e.table({ k: Float64Array.from({ length: n }, (_, i) => ((i * 7919) % 9973) / 4), g: Array.from({ length: n }, (_, i) => ['a', 'b', 'c', 'd'][i % 4]), v: Float64Array.from({ length: n }, (_, i) => i % 13) });
+  const acc = e.table({ k: Float64Array.from({ length: 9973 }, (_, i) => i / 4), seg: Float64Array.from({ length: 9973 }, (_, i) => i % 5) });
+  const asBlob = (x, rows) => { writeDataset(e, file('tmp-blob.vectro'), x, { rowsPerChunk: rows }); return new Blob([readFileSync(file('tmp-blob.vectro'))]); };
+  const d = await openDatasetAsync(e, asBlob(t, 4_000)), da = await openDatasetAsync(e, asBlob(acc, 2_000));
+  Object.assign(tuning, { mergeRows: 500, spillRows: 2_000, partitionRows: 3_000, joinRows: 1_000 });
+  const before = { ...stats };
+  same(await d.lazy().groupBy('k').agg({ n: 'count()', s: 'sum(v)' }).toRowsAsync(), t.lazy().groupBy('k').agg({ n: 'count()', s: 'sum(v)' }).toRows(), 'async spilled groups');
+  const m = memoryFile();
+  await writeDatasetAsync(e, m, d.lazy().filter('v > 3').sort(['-k', 'v']), { rowsPerChunk: 3_000 });
+  same(await (await openDatasetAsync(e, m.blob())).toRowsAsync(), t.lazy().filter('v > 3').sort(['-k', 'v']).toRows(), 'async external sort');
+  same(await d.lazy().join(da, { on: 'k' }).groupBy('seg').agg({ n: 'count()', s: 'sum(v)' }).toRowsAsync(), t.lazy().join(acc, { on: 'k' }).groupBy('seg').agg({ n: 'count()', s: 'sum(v)' }).toRows(), 'async partitioned join');
+  check(stats.spills > before.spills && stats.resplits > before.resplits && stats.joinPartitions > before.joinPartitions, `async spills ${JSON.stringify(stats)} vs ${JSON.stringify(before)}`);
+  check(files.size === 0, `temporary files left: ${[...files.keys()].slice(0, 3)}`);
+  Object.assign(tuning, { mergeRows: 1 << 20, spillRows: 1 << 23, partitionRows: 1 << 24, joinRows: 1 << 24 });
+  setTempStorage(null);
+  await d.close(); await da.close();
+  await e.close();
+}
+
 // errors say what's wrong
 {
   const e = new Engine();

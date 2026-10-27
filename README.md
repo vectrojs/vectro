@@ -249,7 +249,9 @@ sql('SELECT region, COUNT(DISTINCT cust) FROM orders GROUP BY region', { orders 
   A 246 MB CSV (5M rows) becomes a 24 MB dataset in browser storage in
   2.8 s. Try `examples/dataset/` (serve it with
   `node examples/browser-threads/serve.mjs 8780 --data <folder of .vectro files>`).
-  Spilling to disk (huge group-bys, sorts and joins) still needs Node.
+  Spilling works in the browser too: huge group-bys, sorts written as
+  datasets and joins of two big datasets put their partitions in a
+  temporary folder in browser storage, removed when the query ends.
 - **Also:** `append: true` adds to an existing dataset; `ds.lastRun` tells
   how many chunks and bytes a query read; `explain()` shows the plan; the MCP
   server opens `.vectro` files.
@@ -562,7 +564,7 @@ answers.
 ## Not done yet
 
 64-bit integers beyond 2^53 and time zones other than UTC. A dataset is
-written by one writer at a time; spilling needs Node; a join on text keys needs its
+written by one writer at a time; a join on text keys needs its
 other side to fit in memory, exact distinct counts of non-ID values don't
 spill, and `approxDistinct` on a dataset counts exactly. Joins are for normal
 tables (not split tables or streams yet), inner and left only. Split tables

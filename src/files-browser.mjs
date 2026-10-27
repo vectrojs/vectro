@@ -76,3 +76,29 @@ export async function storedFiles() {
 export async function storedFile(name) { return (await (await storageDir()).getFileHandle(name)).getFile(); }
 
 export async function removeStored(name) { await (await storageDir()).removeEntry(name); }
+
+// Temporary files for spilling (see dataset.mjs setTempStorage): a folder
+// per spill in browser storage, removed when the query ends.
+export const opfsTemp = {
+  async dir(prefix) {
+    const name = `${prefix}${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    await (await storageDir()).getDirectoryHandle(name, { create: true });
+    return name;
+  },
+  join: (dir, name) => `${dir}/${name}`,
+  async openWrite(path) { return writableFile(await fileHandle(path, true)); },
+  async openRead(path) {
+    const file = await (await fileHandle(path, false)).getFile();
+    return { name: path, size: file.size, async read(u8, pos) { u8.set(new Uint8Array(await file.slice(pos, pos + u8.length).arrayBuffer())); }, close() {} };
+  },
+  async remove(path) {
+    const [dir, name] = path.split('/');
+    const root = await storageDir();
+    if (name) await (await root.getDirectoryHandle(dir)).removeEntry(name); else await root.removeEntry(dir, { recursive: true });
+  },
+};
+
+async function fileHandle(path, create) {
+  const [dir, name] = path.split('/');
+  return (await (await storageDir()).getDirectoryHandle(dir, { create })).getFileHandle(name, { create });
+}
