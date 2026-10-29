@@ -15,40 +15,24 @@
 // given; with a token, requests need "Authorization: Bearer <token>" (or
 // ?token=, for tools that can't send headers).
 import { createServer } from 'node:http';
-import { realpathSync } from 'node:fs';
-import { resolve, relative } from 'node:path';
+import { relative } from 'node:path';
 import { once } from 'node:events';
 import { timingSafeEqual } from 'node:crypto';
-import { Engine, sql } from '../node.mjs';
-import { filesIn, loadFile, release, LoadError } from './catalog.mjs';
+import { sql } from '../node.mjs';
+import { openTables, LoadError } from './catalog.mjs';
 import { FORMATS, columnsOf, encode } from './formats.mjs';
 
 const MAX_BODY = 1 << 20;
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 
-export async function serve({ tables = {}, root = null, engine = null, port = 8787, host = '127.0.0.1', token = null, cors = false, log = () => {} } = {}) {
-  const own = !engine && !Object.values(tables).some((t) => t?.engine);
-  engine ??= Object.values(tables).find((t) => t?.engine)?.engine ?? new Engine();
-  const catalog = new Map(); // name -> { table, source, owned }
-  for (const [name, table] of Object.entries(tables)) catalog.set(name, { table, source: 'given', owned: false });
-  const rootPath = root ? realpathSync(resolve(String(root).replace(/^~(?=\/|$)/, process.env.HOME ?? '~'))) : null;
-
-  async function reload() {
-    if (!rootPath) throw new HttpError(400, 'this server has no data folder to reload');
-    for (const [name, e] of catalog) if (e.owned) { release(e.table); catalog.delete(name); }
-    const loaded = [], failed = [];
-    for (const { name, path } of filesIn(rootPath)) {
-      if (catalog.has(name)) continue; // (tables given in code win)
-      try {
-        const { table } = await loadFile(engine, path);
-        catalog.set(name, { table, source: path, owned: true });
-        loaded.push(name);
-      } catch (err) { failed.push({ file: path, error: err.message }); log(`skipped ${path}: ${err.message}`); }
-    }
-    return { loaded, failed };
-  }
-  if (rootPath) await reload();
+// catalog: tables opened with openTables (catalog.mjs), to share them with
+// the PostgreSQL server; else tables / root / engine open them here.
+export async function serve({ tables = {}, root = null, engine = null, catalog = null, port = 8787, host = '127.0.0.1', token = null, cors = false, log = () => {} } = {}) {
+  const shared = !!catalog;
+  catalog ??= await openTables({ tables, root, engine, log });
+  const entries = catalog.entries, rootPath = catalog.root;
+  const reload = () => catalog.reload().catch((err) => { throw new HttpError(400, err.message); });
 
   const allowed = (req, url) => {
     if (!token) return true;
@@ -56,7 +40,7 @@ export async function serve({ tables = {}, root = null, engine = null, port = 87
     const a = Buffer.from(given), b = Buffer.from(token);
     return a.length === b.length && timingSafeEqual(a, b);
   };
-  const named = () => Object.fromEntries([...catalog].map(([n, e]) => [n, e.table]));
+  const named = () => catalog.named();
   const describe = (name, { table, source }) => ({ name, rows: table.length, columns: columnsOf(table), ...(table.isDataset ? { on_disk: true } : {}), ...(source === 'given' ? {} : { file: relative(rootPath, source) }) });
 
   async function body(req) {
@@ -131,9 +115,9 @@ export async function serve({ tables = {}, root = null, engine = null, port = 87
       return answer(res, q, format, {}, 'result');
     }
     if (parts[0] === 'tables' && req.method === 'GET') {
-      if (parts.length === 1) return json(res, 200, { tables: [...catalog].map(([n, e]) => describe(n, e)) });
-      const e = catalog.get(parts[1]);
-      if (!e) throw new HttpError(404, `no table "${parts[1]}" (tables: ${[...catalog.keys()].join(', ') || 'none'})`);
+      if (parts.length === 1) return json(res, 200, { tables: [...entries].map(([n, e]) => describe(n, e)) });
+      const e = entries.get(parts[1]);
+      if (!e) throw new HttpError(404, `no table "${parts[1]}" (tables: ${[...entries.keys()].join(', ') || 'none'})`);
       if (parts.length === 2) return json(res, 200, describe(parts[1], e));
       if (parts.length === 3 && parts[2] === 'rows') {
         const format = formatOf(url), limit = limitOf(url);
@@ -146,7 +130,7 @@ export async function serve({ tables = {}, root = null, engine = null, port = 87
       return json(res, 200, {
         server: 'vectro',
         endpoints: { sql: '/sql?q=SELECT ...&format=json|csv|ndjson|arrow', tables: '/tables', table: '/tables/<name>', rows: '/tables/<name>/rows?format=csv' },
-        tables: [...catalog.keys()],
+        tables: [...entries.keys()],
       });
     }
     throw new HttpError(404, `no such endpoint: ${req.method} ${path} (see /)`);
@@ -167,14 +151,14 @@ export async function serve({ tables = {}, root = null, engine = null, port = 87
     url: `http://${host.includes(':') ? `[${host}]` : host}:${actual}`,
     port: actual,
     server,
-    engine,
-    tables: catalog,
+    engine: catalog.engine,
+    tables: entries,
+    catalog,
     reload,
     async close() {
       server.closeAllConnections?.();
       await new Promise((r) => server.close(r));
-      for (const e of catalog.values()) if (e.owned) release(e.table);
-      if (own) await engine.close();
+      if (!shared) await catalog.close();
     },
   };
 }

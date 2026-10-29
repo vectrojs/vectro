@@ -5,6 +5,7 @@
 // Each cell is text made once per label (a category's labels are few), or a
 // number / date written straight away.
 import { writeArrow } from '../arrow.mjs';
+import { displayName } from '../sql.mjs';
 
 const SLICE = 65_536;
 
@@ -15,7 +16,7 @@ export const FORMATS = {
   arrow: 'application/vnd.apache.arrow.stream',
 };
 
-export const columnsOf = (table) => [...table.cols].map(([name, c]) => ({ name, type: c.dict || c.strings ? 'text' : c.date ? 'date' : 'number' }));
+export const columnsOf = (table) => [...table.cols].map(([name, c]) => ({ name: displayName(name), col: name, type: c.dict || c.strings ? 'text' : c.date ? 'date' : 'number' }));
 
 // RFC 4180: quoted when it holds a comma, a quote or a line break
 const csvText = (v) => (/[",\r\n]/.test(v) ? `"${v.replaceAll('"', '""')}"` : v);
@@ -52,10 +53,10 @@ function cells(col, d, format) {
 // The body as chunks (strings or bytes), for res.write one after another.
 export function* encode(format, columns, data, n, extra = {}) {
   if (format === 'arrow') {
-    yield writeArrow(data, { dates: columns.filter((c) => c.type === 'date').map((c) => c.name) });
+    yield writeArrow(Object.fromEntries(columns.map((c) => [c.name, data[c.col ?? c.name]])), { dates: columns.filter((c) => c.type === 'date').map((c) => c.name) });
     return;
   }
-  const cell = columns.map((c) => cells(c, data[c.name], format));
+  const cell = columns.map((c) => cells(c, data[c.col ?? c.name], format));
   const K = cell.length;
   const rows = (a, b, start, sep, end, keys) => {
     let s = '';
@@ -77,7 +78,7 @@ export function* encode(format, columns, data, n, extra = {}) {
     return;
   }
   // json: { columns, rows: [[...]...], ... }
-  yield `{"columns":${JSON.stringify(columns)},"rows":[`;
+  yield `{"columns":${JSON.stringify(columns.map(({ name, type }) => ({ name, type })))},"rows":[`;
   for (let a = 0; a < n; a += SLICE) {
     const s = rows(a, Math.min(n, a + SLICE), '[', ',', '],', null);
     yield a + SLICE >= n ? s.slice(0, -1) : s; // (no comma after the last row)

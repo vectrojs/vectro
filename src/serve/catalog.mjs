@@ -5,6 +5,7 @@
 import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { resolve, sep, extname, basename, join } from 'node:path';
 import { VectorIndex } from '../vectors.mjs';
+import { Engine } from '../node.mjs';
 import { parseNDJSON } from '../ndjson.mjs';
 
 export const MAX_FILE_BYTES = 2 ** 31;
@@ -94,6 +95,43 @@ function loadJSONLines(engine, bytes, types) {
   const r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)));
   const cols = Object.fromEntries(names.map((n, k) => [n, r.dicts[k] ? Array.from(r.cols[k], (code) => r.dicts[k][code]) : r.cols[k]]));
   return { table: engine.table(cols), skipped: r.bad };
+}
+
+// The tables a server serves: given in code, or the files in a data folder
+// (reload() reads it again). Shared by the HTTP and PostgreSQL servers.
+//   { engine, entries: Map name -> { table, source, owned }, named(), reload(), version, close() }
+export async function openTables({ tables = {}, root = null, engine = null, log = () => {} } = {}) {
+  const own = !engine && !Object.values(tables).some((t) => t?.engine);
+  engine ??= Object.values(tables).find((t) => t?.engine)?.engine ?? new Engine();
+  const entries = new Map();
+  for (const [name, table] of Object.entries(tables)) entries.set(name, { table, source: 'given', owned: false });
+  const rootPath = root ? realpathSync(resolve(String(root).replace(/^~(?=\/|$)/, process.env.HOME ?? '~'))) : null;
+  const self = {
+    engine, entries, root: rootPath, version: 0,
+    named: () => Object.fromEntries([...entries].map(([n, e]) => [n, e.table])),
+    async reload() {
+      if (!rootPath) throw new LoadError('this server has no data folder to reload');
+      for (const [name, e] of entries) if (e.owned) { release(e.table); entries.delete(name); }
+      const loaded = [], failed = [];
+      for (const { name, path } of filesIn(rootPath)) {
+        if (entries.has(name)) continue; // (tables given in code win)
+        try {
+          const { table } = await loadFile(engine, path);
+          entries.set(name, { table, source: path, owned: true });
+          loaded.push(name);
+        } catch (err) { failed.push({ file: path, error: err.message }); log(`skipped ${path}: ${err.message}`); }
+      }
+      self.version++;
+      return { loaded, failed };
+    },
+    async close() {
+      for (const e of entries.values()) if (e.owned) release(e.table);
+      entries.clear();
+      if (own) await engine.close();
+    },
+  };
+  if (rootPath) await self.reload();
+  return self;
 }
 
 export { realpathSync };

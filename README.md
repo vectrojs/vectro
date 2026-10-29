@@ -358,7 +358,46 @@ curl 'http://127.0.0.1:8787/sql?q=SELECT region, COUNT(*) AS n FROM orders GROUP
 - **In your own app**: `import { serve } from 'vectrojs/serve'; await serve({ tables: { orders }, port: 8787 })`.
 - **Safety**: listens on 127.0.0.1 unless `--host` is given; `--token <secret>` requires `Authorization: Bearer <secret>` (or `&token=` for tools that can't send headers); SQL here only reads; files outside the folder are never read (links that lead out are skipped).
 
-On 10M orders: a group by region answers in 9 ms over HTTP; 1M rows export in 0.6 s as CSV (42 MB) or JSON, 0.07 s as Arrow (28 MB), and all 10M rows as Arrow in 0.45 s. Live connections (Power BI DirectQuery, Tableau, Metabase, Grafana) come with the Postgres protocol, next.
+On 10M orders: a group by region answers in 9 ms over HTTP; 1M rows export in 0.6 s as CSV (42 MB) or JSON, 0.07 s as Arrow (28 MB), and all 10M rows as Arrow in 0.45 s. Live connections (Power BI DirectQuery, Tableau, Metabase, Grafana) use the PostgreSQL protocol, below.
+
+## The PostgreSQL protocol: Power BI, Tableau, Metabase, Grafana, psql
+
+```sh
+npx vectro serve --root ~/data --pg 5433 --user me --password secret
+psql -h 127.0.0.1 -p 5433 -U me vectro
+```
+
+Vectro answers as a PostgreSQL 16 database (read only), so anything with a
+Postgres connector connects live: **Power BI** (Get Data > PostgreSQL
+database, server `localhost:5433`, database `vectro`; Import or DirectQuery),
+**Tableau** (Connect > PostgreSQL), Metabase, Grafana, DBeaver, Excel through
+ODBC, and every driver. Queries arrive in each tool's own SQL and run on Vectro's engine.
+
+- **The protocol**: SCRAM-SHA-256 (or `--auth md5 | password`), TLS with
+  `--tls-cert` / `--tls-key`, the simple and the extended query protocol
+  (prepared statements, `$1` parameters, text and binary values, portals read
+  a part at a time), BEGIN / COMMIT, SET / SHOW, DECLARE / FETCH cursors,
+  cancel requests, PostgreSQL error codes. In code: `import { servePg } from 'vectrojs/serve'`.
+- **Types**: whole-number columns are `bigint`, other numbers `double
+  precision`, text `text`, dates `timestamp` (`date` when every value is at
+  midnight); answers are typed the same way from the query (COUNT is bigint,
+  AVG double, comparisons boolean), before any row is read.
+- **The catalog**: `information_schema` and `pg_catalog` hold the served
+  tables, so tools list tables and columns; the long metadata queries drivers
+  send (Npgsql's type loading, pgJDBC's getTables / getColumns) are answered
+  as PostgreSQL would; other catalog questions (keys, indexes, comments) get
+  empty answers. psql's `\dt` and `\dn` work.
+- **Checked with the real drivers** (`compare/check-drivers.mjs`): pgJDBC
+  42.7.4, which Tableau, DBeaver and Metabase use, and Npgsql 4.0.17, the one
+  Power BI's PostgreSQL connector ships with; both get what PostgreSQL gives,
+  including Power BI's own catalog queries and folded group-bys. Neither
+  Power BI nor Tableau itself has been tried yet.
+- **Speed** (10M orders, same machine as a local PostgreSQL 16 with the same
+  rows): a group by region answers in 20 to 80 ms through psql against
+  PostgreSQL's 480 to 720 ms; 1M rows reach psql in 1.0 s (PostgreSQL 0.7 s)
+  and a Java program through pgJDBC in 0.9 s (PostgreSQL 0.6 to 1.0 s).
+- **Safety**: without `--password` only this machine may connect; with
+  `--host 0.0.0.0` a password is required. Writes (INSERT, CREATE...) are refused.
 
 ## For AI assistants (MCP server)
 
@@ -619,7 +658,7 @@ than memory, quoted-CSV loading.
 ## Layout
 
 ```
-src/         the engine (Node, browser and portable entry points); src/serve: the HTTP SQL server
+src/         the engine (Node, browser and portable entry points); src/serve: the HTTP and PostgreSQL servers
 bin/         the vectro command (vectro serve)
 mcp/         the MCP server for AI assistants
 dist/        vectro.wasm, the precompiled kernels for edge runtimes (npm run build)

@@ -40,12 +40,33 @@ class SqlError extends SyntaxError {}
 const fail = (msg) => { throw new SqlError(`vectro SQL: ${msg}`); };
 
 // ---- tokens ---------------------------------------------------------------------------
-function tokenize(src) {
+// fold: unquoted names in lower case, as PostgreSQL reads them
+function tokenize(src, fold = false) {
   const toks = [];
   let i = 0;
   while (i < src.length) {
     const c = src[i];
     if (/\s/.test(c)) { i++; continue; }
+    if ((c === 'E' || c === 'e') && src[i + 1] === "'") { // E'text' with backslash escapes
+      let v = '';
+      i += 2;
+      const ESC = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f' };
+      for (;;) {
+        if (i >= src.length) fail('a text in quotes is not closed');
+        const ch = src[i];
+        if (ch === "'") { if (src[i + 1] === "'") { v += "'"; i += 2; continue; } i++; break; }
+        if (ch === '\\' && i + 1 < src.length) {
+          const nx = src[i + 1];
+          if (ESC[nx]) { v += ESC[nx]; i += 2; continue; }
+          const hex = nx === 'x' ? /^[0-9a-fA-F]{1,2}/.exec(src.slice(i + 2)) : nx === 'u' ? /^[0-9a-fA-F]{4}/.exec(src.slice(i + 2)) : nx === 'U' ? /^[0-9a-fA-F]{8}/.exec(src.slice(i + 2)) : null;
+          if (hex) { v += String.fromCodePoint(parseInt(hex[0], 16)); i += 2 + hex[0].length; continue; }
+          v += nx; i += 2; continue;
+        }
+        v += ch; i++;
+      }
+      toks.push({ t: 'str', v });
+      continue;
+    }
     if (src.startsWith('--', i)) { while (i < src.length && src[i] !== '\n') i++; continue; }
     if (src.startsWith('/*', i)) { const e = src.indexOf('*/', i + 2); i = e < 0 ? src.length : e + 2; continue; }
     if (c === "'") { // 'text' ('' is a quote)
@@ -71,12 +92,13 @@ function tokenize(src) {
     const id = /^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
     if (id) {
       const up = id[0].toUpperCase();
-      toks.push(KEYWORDS.has(up) ? { t: 'kw', v: up, raw: id[0] } : { t: 'id', v: id[0] });
+      const raw = fold ? id[0].toLowerCase() : id[0];
+      toks.push(KEYWORDS.has(up) ? { t: 'kw', v: up, raw } : { t: 'id', v: raw });
       i += id[0].length;
       continue;
     }
-    const op = ['<>', '!=', '<=', '>=', '||', '::'].find((o) => src.startsWith(o, i)) ?? c;
-    if (op.length === 1 && !'+-*/%=<>(),.;'.includes(op)) fail(`unexpected "${c}"`);
+    const op = ['!~*', '<>', '!=', '<=', '>=', '||', '::', '!~', '~*'].find((o) => src.startsWith(o, i)) ?? c;
+    if (op.length === 1 && !'+-*/%=<>(),.;~'.includes(op)) fail(`unexpected "${c}"`);
     toks.push({ t: 'op', v: op });
     i += op.length;
   }
@@ -87,8 +109,8 @@ function tokenize(src) {
 // Words that are keywords only where they're expected (columns may be named so).
 const SOFT = new Set(['OVER', 'PARTITION', 'ROWS', 'RANGE', 'UNBOUNDED', 'PRECEDING', 'FOLLOWING', 'CURRENT', 'ROW', 'WITHIN', 'FETCH', 'NEXT', 'ONLY', 'FILTER']);
 
-function parseStatement(src) {
-  const toks = tokenize(src);
+function parseStatement(src, fold = false) {
+  const toks = tokenize(src, fold);
   let p = 0;
   const peek = (o = 0) => toks[p + o];
   const isKw = (v, o = 0) => peek(o)?.t === 'kw' && peek(o).v === v;
@@ -118,8 +140,12 @@ function parseStatement(src) {
     if (isKw('IS')) {
       p++;
       const neg = eatKw('NOT');
-      needKw('NULL');
-      return neg ? negate({ k: 'isnull', x: l }) : { k: 'isnull', x: l };
+      let e;
+      if (eatKw('TRUE')) e = { k: 'bin', op: 'IS', l, r: { k: 'num', v: 1, bool: true } };
+      else if (eatKw('FALSE')) e = { k: 'bin', op: 'IS', l, r: { k: 'num', v: 0, bool: true } };
+      else if (eatKw('DISTINCT')) { needKw('FROM'); e = negate({ k: 'bin', op: 'IS', l, r: add() }); } // (IS DISTINCT FROM: not the same, missing counting as a value)
+      else { needKw('NULL'); e = { k: 'isnull', x: l }; }
+      return neg ? negate(e) : e;
     }
     const neg = isKw('NOT') && (isKw('BETWEEN', 1) || isKw('IN', 1) || isKw('LIKE', 1) || isWord('ILIKE', 1)) ? (p++, true) : false;
     if (eatKw('BETWEEN')) { const lo = add(); needKw('AND'); const hi = add(); const e = { k: 'between', x: l, lo, hi }; return neg ? negate(e) : e; }
@@ -134,7 +160,7 @@ function parseStatement(src) {
     }
     if (eatKw('LIKE')) { const e = { k: 'like', x: l, pattern: add() }; return neg ? negate(e) : e; }
     if (eatWord('ILIKE')) { const e = { k: 'like', x: l, pattern: add(), ci: true }; return neg ? negate(e) : e; }
-    const op = ['=', '<>', '!=', '<', '<=', '>', '>='].find((o) => isOp(o));
+    const op = ['=', '<>', '!=', '<', '<=', '>', '>=', '~', '~*', '!~', '!~*'].find((o) => isOp(o));
     if (op) { p++; return { k: 'bin', op, l, r: add() }; }
     return l;
   }
@@ -164,11 +190,20 @@ function parseStatement(src) {
     return e;
   }
   function typeName() {
-    const t = peek();
+    let t = peek();
     if (!t || (t.t !== 'id' && t.t !== 'kw')) fail(`expected a type ${near()}`);
     p++;
-    if (eatOp('(')) { while (!eatOp(')')) p++; } // DECIMAL(10, 2), VARCHAR(20)
-    return t.v.toUpperCase();
+    while (isOp('.') && (peek(1)?.t === 'id' || peek(1)?.t === 'kw')) { p++; t = peek(); p++; } // pg_catalog.text
+    let name = String(t.v).toUpperCase();
+    if (name === 'DOUBLE' && eatWord('PRECISION')) name = 'DOUBLE PRECISION';
+    if ((name === 'CHARACTER' || name === 'CHAR') && eatWord('VARYING')) name = 'VARCHAR';
+    if (eatOp('(')) { while (!eatOp(')')) p++; } // DECIMAL(10, 2), VARCHAR(20), TIMESTAMP(3)
+    if (name === 'TIMESTAMP' || name === 'TIME') {
+      if (isKw('WITH') && isWord('TIME', 1)) { p++; needWord('TIME'); needWord('ZONE'); name += 'TZ'; }
+      else if (eatWord('WITHOUT')) { needWord('TIME'); needWord('ZONE'); }
+    }
+    if (isOp('[')) fail('arrays are not supported');
+    return name;
   }
   function orderItems() {
     const out = [];
@@ -217,8 +252,8 @@ function parseStatement(src) {
     }
     if (t.t === 'kw') {
       if (eatKw('NULL')) return { k: 'null' };
-      if (eatKw('TRUE')) return { k: 'num', v: 1 };
-      if (eatKw('FALSE')) return { k: 'num', v: 0 };
+      if (eatKw('TRUE')) return { k: 'num', v: 1, bool: true };
+      if (eatKw('FALSE')) return { k: 'num', v: 0, bool: true };
       if (isKw('DATE') || isKw('TIMESTAMP')) {
         if (peek(1)?.t === 'str') { p++; return { k: 'date', v: toks[p++].v }; }
       }
@@ -249,7 +284,10 @@ function parseStatement(src) {
       if (isOp('(')) return call(t.v.toUpperCase());
       if (eatOp('.')) {
         if (eatOp('*')) return { k: 'star', table: t.v };
-        return { k: 'col', table: t.v, name: ident() };
+        const second = ident();
+        if (isOp('(')) return call(second.toUpperCase()); // (schema.function(...): the function)
+        if (eatOp('.')) { if (eatOp('*')) return { k: 'star', table: second }; return { k: 'col', table: second, name: ident() }; } // (schema.table.column)
+        return { k: 'col', table: t.v, name: second };
       }
       return { k: 'col', name: t.v };
     }
@@ -310,10 +348,11 @@ function parseStatement(src) {
       if (peek()?.t !== 'id') fail('a subquery in FROM needs a name: (SELECT ...) AS name');
       return { q, alias: ident() };
     }
-    const name = ident();
+    let name = ident(), schema = null;
+    while (eatOp('.')) { schema = name; name = ident(); } // schema.table (db.schema.table: the last two)
     let alias = name;
     if (eatKw('AS')) alias = ident(); else if (aliasNext()) alias = ident();
-    return { name, alias };
+    return { name, schema, alias };
   }
   function selectCore() {
     needKw('SELECT');
@@ -416,8 +455,19 @@ const v = (name) => ({ t: 'var', name });
 const bin = (op, l, r) => ({ t: 'bin', op, l, r });
 const call = (fn, ...args) => ({ t: 'call', fn, args });
 const cond = (c, x, y) => ({ t: 'cond', c, x, y });
-const TEXT_TYPES = new Set(['VARCHAR', 'TEXT', 'STRING', 'CHAR', 'BPCHAR', 'NVARCHAR', 'NCHAR', 'CHARACTER']);
+const TEXT_TYPES = new Set(['VARCHAR', 'TEXT', 'STRING', 'CHAR', 'BPCHAR', 'NVARCHAR', 'NCHAR', 'CHARACTER', 'NAME', 'CITEXT', 'UUID', 'REGCLASS', 'REGTYPE', 'REGPROC', 'REGNAMESPACE', 'REGROLE']);
+const INT_TYPES = new Set(['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT', 'INT2', 'INT4', 'INT8', 'OID', 'XID', 'CID']);
+const FLOAT_TYPES = new Set(['DOUBLE', 'DOUBLE PRECISION', 'FLOAT', 'FLOAT4', 'FLOAT8', 'REAL', 'DECIMAL', 'NUMERIC']);
+const BOOL_TYPES = new Set(['BOOL', 'BOOLEAN']);
+const DATE_TYPES = new Set(['DATE', 'TIMESTAMP', 'TIMESTAMPTZ', 'DATETIME']);
+// session values a bare name reads (current_user), as PostgreSQL has them
+const SESSION_NAMES = new Set(['current_user', 'session_user', 'user', 'current_role', 'current_catalog', 'current_schema']);
 function astVars(t, out = []) { if (t.t === 'var') out.push(t.name); for (const x of [t.x, t.l, t.r, t.c, t.y, ...(t.args ?? [])]) if (x && typeof x === 'object') astVars(x, out); return out; }
+// Column names that aren't plain names ("sum:price", "Order Date") live under
+// a plain one: __q_ then letters and digits as they are, others as _<hex>_.
+const PLAIN = /^[A-Za-z_]\w*$/;
+export const encodeName = (name) => (PLAIN.test(name) ? name : `__q_${[...name].map((ch) => (/[A-Za-z0-9]/.test(ch) ? ch : `_${ch.codePointAt(0).toString(16)}_`)).join('')}`);
+export const displayName = (name) => (name.startsWith('__q_') ? name.slice(4).replace(/_([0-9a-f]+)_/g, (m, h) => String.fromCodePoint(parseInt(h, 16))) : name);
 const constNum = (t) => (t.t === 'num' ? t.v : t.t === 'un' && t.op === '-' && t.x.t === 'num' ? -t.x.v : null);
 const isAgg = (e) => e.k === 'call' && (AGG[e.fn] || PERCENTILE.has(e.fn));
 const key = (e) => JSON.stringify(e);
@@ -440,17 +490,71 @@ const hasWindow = (e) => has(e, (x) => x.k === 'window');
 const conjuncts = (e) => (!e ? [] : e.k === 'bin' && e.op === 'AND' ? [...conjuncts(e.l), ...conjuncts(e.r)] : [e]);
 const andAll = (list) => (list.length ? list.reduce((a, b) => ({ k: 'bin', op: 'AND', l: a, r: b })) : null);
 
-// sql(text, tables) -> Query
-export function sql(text, tables = {}) {
-  const ast = parseStatement(String(text));
+// sql(text, tables[, opts]) -> Query
+//   opts.types: the Query gets .columns = [{ name, type: 'int' | 'float' | 'bool' | 'text' | 'date' | 'day' }]
+//     (day: dates without a time), worked out from the tables' columns, not from the answer
+//   opts.foldCase: unquoted names in lower case (PostgreSQL's way)
+//   opts.session: values of functions such as version(), current_user ({ version: '...' })
+//   opts.database: a schema name that means the tables themselves (as public does)
+//   opts.functions: more functions, { name: { out: 'text' | 'number', f(...values) } }
+//     (run once per distinct set of values; text missing as null)
+// Tables may also be named "schema.table" (pg_catalog.pg_class): they are
+// found by that name; an unqualified name also finds pg_catalog's.
+export function sql(text, tables = {}, opts = {}) {
+  const ast = parseStatement(String(text), !!opts.foldCase);
   const engine = Object.values(tables).find((t) => t?.engine)?.engine ?? null;
-  return compileQuery(ast, { tables, ctes: new Map(), engine, n: { hidden: 0 } }, null).query;
+  const env = { tables, ctes: new Map(), engine, n: { hidden: 0 }, wantTypes: !!opts.types, pgNames: !!opts.foldCase, functions: opts.functions ?? null, session: opts.session ?? null, database: opts.database ?? null };
+  const rel = compileQuery(ast, env, null);
+  if (opts.types) rel.query.columns = rel.names.map((name) => ({ name, type: rel.typeOf?.(name) ?? 'float' }));
+  return rel.query;
+}
+
+// A table by its (maybe schema-qualified) name, case aside; null if none.
+function lookupTable(env, { name, schema }) {
+  const { tables } = env, keys = Object.keys(tables);
+  const get = (k) => tables[k] ?? tables[keys.find((x) => x.toLowerCase() === k.toLowerCase())];
+  const sc = schema?.toLowerCase();
+  if (sc && sc !== 'public' && sc !== env.database?.toLowerCase()) return get(`${schema}.${name}`) ?? null;
+  return get(name) ?? (sc ? null : get(`pg_catalog.${name}`)) ?? null;
+}
+const userTables = (tables) => Object.keys(tables).filter((k) => !k.includes('.'));
+
+// Column types for answers (see sql's opts.types), cached per table and column:
+// whole numbers -> int, others -> float; dates all at midnight -> day.
+const typeCache = new WeakMap();
+const merge = (ts) => {
+  const u = [...new Set(ts.filter(Boolean))];
+  if (u.length <= 1) return u[0] ?? 'text';
+  if (u.includes('text')) return 'text';
+  if (u.every((t) => t === 'int' || t === 'bool')) return 'int';
+  if (u.every((t) => t === 'day' || t === 'date')) return 'date';
+  return 'float';
+};
+function columnType(t, name) {
+  let m = typeCache.get(t);
+  if (!m) typeCache.set(t, (m = new Map()));
+  if (m.has(name)) return m.get(name);
+  const c = t.cols?.get(name);
+  let type = 'float';
+  if (!c) type = 'float';
+  else if (c.dict || c.strings) type = 'text';
+  else if (t.isDataset) { // from the chunks' encodings: whole-number codes
+    const enc = (t.meta?.chunks ?? []).map((ch) => ch.cols?.[name]);
+    if (c.date) type = 'date';
+    else type = enc.length && enc.every((z) => z && (z.missing === z.rows || (z.enc && !z.enc.div && Number.isInteger(z.enc.mul ?? 1) && Number.isInteger(z.enc.base ?? 0)))) ? 'int' : 'float';
+  } else if (c.date) type = t.length && t.agg({ n: `count(${name} == ${name} && ${name} != dayStart(${name}))` }).n === 0 ? 'day' : 'date';
+  else {
+    const a = t.agg({ frac: `count(${name} == ${name} && ${name} != floor(${name}))`, hi: `max(abs(${name}))` });
+    type = a.frac === 0 && !(a.hi >= 2 ** 53) ? 'int' : 'float';
+  }
+  m.set(name, type);
+  return type;
 }
 
 // A relation: { query, names, kinds (name -> 'text' | 'date' | 'number') }.
 const kindOfTable = (t, col) => { const c = t.cols?.get(col); return c?.dict || c?.strings ? 'text' : c?.date ? 'date' : 'number'; };
 function tableRelation(t) {
-  return { query: t.lazy(), names: t.columnNames, kinds: new Map(t.columnNames.map((n) => [n, kindOfTable(t, n)])) };
+  return { query: t.lazy(), names: t.columnNames, kinds: new Map(t.columnNames.map((n) => [n, kindOfTable(t, n)])), typeOf: (n) => columnType(t, n) };
 }
 
 function compileQuery(q, env, outer) {
@@ -496,7 +600,7 @@ function renameRelation(rel, names) {
   // (derive copies values; text and date columns keep their kind through a plain copy)
   let out = q.select(...tmp);
   tmp.forEach((t, k) => { out = out.derive(names[k], t); });
-  return { query: out.select(...names), names, kinds };
+  return { query: out.select(...names), names, kinds, typeOf: (nm) => rel.typeOf?.(rel.names[names.indexOf(nm)]) ?? 'float' };
 }
 
 function compileSet(body, env, outer) {
@@ -510,23 +614,23 @@ function compileSet(body, env, outer) {
   });
   const names = L.names;
   const right = R.query; // (columns by position; named as the left's)
-  if (body.op === 'union all') return { query: Query.union([L.query, right]), names, kinds: L.kinds };
-  if (body.op === 'union') return { query: Query.union([L.query, right]).groupBy(names).agg({ __u: 'count()' }).select(...names), names, kinds: L.kinds };
+  const typeOf = (nm) => { const k = names.indexOf(nm); return merge([L.typeOf?.(nm) ?? 'float', R.typeOf?.(R.names[k]) ?? 'float']); };
+  if (body.op === 'union all') return { query: Query.union([L.query, right]), names, kinds: L.kinds, typeOf };
+  if (body.op === 'union') return { query: Query.union([L.query, right]).groupBy(names).agg({ __u: 'count()' }).select(...names), names, kinds: L.kinds, typeOf };
   // INTERSECT / EXCEPT: both sides marked, grouped by every column
   const mark = (rel, m) => rel.query.derive('__src', String(m)).select(...rel.names, '__src');
   const grouped = Query.union([mark(L, 1), mark(R, 2)]).groupBy(names).agg({ __mn: 'min(__src)', __mx: 'max(__src)' });
   const kept = body.op === 'intersect' ? grouped.filter('__mn == 1 && __mx == 2') : grouped.filter('__mx == 1');
-  return { query: kept.select(...names), names, kinds: L.kinds };
+  return { query: kept.select(...names), names, kinds: L.kinds, typeOf };
 }
 
 // FROM item -> relation
 function relationOf(item, env, outer) {
   if (item.q) return compileQuery(item.q, env, outer);
-  const cte = env.ctes.get(item.name.toLowerCase());
+  const cte = item.schema ? null : env.ctes.get(item.name.toLowerCase());
   if (cte) return cte;
-  const { tables } = env;
-  const t = tables[item.name] ?? Object.entries(tables).find(([k]) => k.toLowerCase() === item.name.toLowerCase())?.[1];
-  if (!t) fail(`no table "${item.name}" (tables: ${Object.keys(tables).join(', ') || 'none given'})`);
+  const t = lookupTable(env, item);
+  if (!t) fail(`no table "${item.schema ? `${item.schema}.` : ''}${item.name}" (tables: ${userTables(env.tables).join(', ') || 'none given'})`);
   return tableRelation(t);
 }
 
@@ -539,8 +643,8 @@ function scopeNamesOf(sel, env) {
       if (body.k === 'select' && body.items.every((it) => it.alias || it.e.k === 'col')) return { alias: item.alias, names: body.items.map((it) => it.alias ?? it.e.name) };
       return { alias: item.alias, names: compileQuery(item.q, env, null).names };
     }
-    const cte = env.ctes.get(item.name.toLowerCase());
-    const t = cte ?? env.tables[item.name] ?? Object.entries(env.tables).find(([k]) => k.toLowerCase() === item.name.toLowerCase())?.[1];
+    const cte = item.schema ? null : env.ctes.get(item.name.toLowerCase());
+    const t = cte ?? lookupTable(env, item);
     return { alias: item.alias, names: cte ? cte.names : t?.columnNames ?? [] };
   };
   return [one(sel.from), ...sel.joins.map(one)];
@@ -559,9 +663,17 @@ function compileSelect(ast, env, outer, tail) {
   const scope = [{ alias: ast.from?.alias ?? '', rel: first, names: new Map(first.names.map((x) => [x, x])) }];
   const outNames = [...first.names];
   const kinds = new Map(first.names.map((x) => [x, first.kinds.get(x)]));
+  const types = new Map(first.names.map((x) => [x, () => first.typeOf?.(x) ?? 'float'])); // (for opts.types: worked out when asked)
 
   // a column reference -> its output name (or, if outer resolves it, an outer marker)
   const find = (ref) => {
+    if (!PLAIN.test(ref.name)) { // a quoted name with spaces or signs: as an output kept it, or as CSV loading wrote it
+      const enc = { ...ref, name: encodeName(ref.name) }, und = { ...ref, name: ref.name.replace(/[^A-Za-z0-9_]/g, '_') };
+      return find1(enc) ?? find1(und) ?? find1(ref);
+    }
+    return find1(ref);
+  };
+  const find1 = (ref) => {
     if (!ref.table && usingMap.has(ref.name.toLowerCase())) return usingMap.get(ref.name.toLowerCase());
     if (ref.table) {
       const s = scope.find((x) => x.alias.toLowerCase() === ref.table.toLowerCase());
@@ -661,6 +773,7 @@ function compileSelect(ast, env, outer, tail) {
       const orig = original.get(x) ?? x;
       rs.names.set(orig, out);
       kinds.set(out, right.kinds.get(orig));
+      types.set(out, () => right.typeOf?.(orig) ?? 'float');
     }
     const keys = on.left.every((x, k) => x === on.right[k]) ? on.left : on;
     if (j.how === 'right' || j.how === 'full') q = outerJoinG(rq, on, j.how, leftNames, rightCols, rightOut);
@@ -674,6 +787,7 @@ function compileSelect(ast, env, outer, tail) {
           out = `__u${n.hidden++}`;
           q = kinds.get(lo) === 'text' ? q.textmap(out, { inputs: [lo, ro], fn: (a, b) => (a !== '' ? a : b), label: 'coalesce' }) : q.derive(out, `coalesce(${lo}, ${ro})`);
           kinds.set(out, kinds.get(lo));
+          types.set(out, types.get(lo));
         }
         usingMap.set(c.toLowerCase(), out);
       });
@@ -794,18 +908,94 @@ function compileSelect(ast, env, outer, tail) {
   const mostKind = (ks) => (ks.includes('text') ? 'text' : ks.includes('date') ? 'date' : 'number');
   function kindOf(e, ctx) {
     switch (e.k) {
-      case 'col': return ctx.kindOfCol?.(e) ?? kinds.get(e.resolved ? e.name : resolve(e));
+      case 'col': { const sv = sessionRef(e); if (sv) return sv.kind; return ctx.kindOfCol?.(e) ?? kinds.get(e.resolved ? e.name : resolve(e)); }
       case 'date': return 'date';
       case 'str': return 'text';
       case 'window': return ctx.windowKind?.(e) ?? 'number';
-      case 'cast': return TEXT_TYPES.has(e.type) ? 'text' : e.type === 'DATE' || e.type === 'TIMESTAMP' ? 'date' : 'number';
+      case 'cast': return TEXT_TYPES.has(e.type) ? 'text' : DATE_TYPES.has(e.type) ? 'date' : 'number';
       case 'case': return mostKind([...e.whens.map((w) => kindOf(w.v, ctx)), kindOf(e.otherwise, ctx)]);
       case 'call':
         if (TEXT_FUNCTIONS[e.fn] && !isAgg(e)) return TEXT_FUNCTIONS[e.fn].out === 'text' ? 'text' : 'number';
         if (['COALESCE', 'IFNULL', 'NVL', 'NULLIF'].includes(e.fn)) return mostKind(e.args.map((a) => kindOf(a, ctx)));
         if (e.fn === 'DATE_TRUNC') return 'date';
+        if (sessionFn(e)) return sessionFn(e).kind;
+        if (extraFn(e)) return extraFn(e).out === 'text' ? 'text' : 'number';
         return 'number';
       default: return 'number';
+    }
+  }
+  // version(), current_user...: { value, kind } or null
+  function sessionFn(e) {
+    const k = e.fn?.toLowerCase();
+    if (!env.session || !k || !Object.hasOwn(env.session, k) || isAgg(e)) return null;
+    const value = env.session[k];
+    return { value, kind: typeof value === 'string' ? 'text' : 'number' };
+  }
+  function extraFn(e) { const k = e.fn?.toLowerCase().replace(/^pg_catalog\./, ''); return env.functions && k && Object.hasOwn(env.functions, k) ? env.functions[k] : null; }
+  function sessionRef(e) {
+    if (e.table || !env.session || !SESSION_NAMES.has(e.name.toLowerCase()) || !Object.hasOwn(env.session, e.name.toLowerCase())) return null;
+    let out = null;
+    try { out = find(e); } catch { return null; }
+    return out === null ? sessionFn({ fn: e.name, args: [] }) : null;
+  }
+  const constValue = (sv, ctx) => (sv.kind === 'text' ? valueColumn(ctx, [], () => sv.value, { label: 'session' }) : num(typeof sv.value === 'boolean' ? +sv.value : sv.value));
+
+  // ---- the type of each answer column (opts.types) -----------------------------------
+  function typeOfExpr(e, ctx) {
+    const T = (x) => typeOfExpr(x, ctx);
+    const kind = kindOf(e, ctx);
+    switch (e.k) {
+      case 'col': {
+        const sv = sessionRef(e);
+        if (sv) return sv.kind === 'text' ? 'text' : 'int';
+        let out = null;
+        try { out = e.resolved ? e.name : find(e); } catch { out = null; }
+        const t = out !== null ? types.get(out) : null;
+        return t ? t() : kind === 'text' ? 'text' : kind === 'date' ? 'date' : 'float';
+      }
+      case 'str': return 'text';
+      case 'date': return e.v.trim().length <= 10 ? 'day' : 'date';
+      case 'num': return e.bool ? 'bool' : Number.isInteger(e.v) ? 'int' : 'float';
+      case 'null': return 'text';
+      case 'neg': return T(e.x) === 'int' ? 'int' : 'float';
+      case 'not': case 'isnull': case 'like': case 'in': case 'between': case 'exists': case 'insub': return 'bool';
+      case 'bin':
+        if (['AND', 'OR', 'IS', '=', '<>', '!=', '<', '<=', '>', '>=', '~', '~*', '!~', '!~*'].includes(e.op)) return 'bool';
+        if (e.op === '/') return 'float';
+        return merge([T(e.l), T(e.r)]) === 'int' ? 'int' : 'float';
+      case 'case': return merge([...e.whens.map((w) => T(w.v)), e.otherwise.k === 'null' ? null : T(e.otherwise)]);
+      case 'cast': return TEXT_TYPES.has(e.type) ? 'text' : INT_TYPES.has(e.type) ? 'int' : BOOL_TYPES.has(e.type) ? 'bool' : e.type === 'DATE' ? 'day' : DATE_TYPES.has(e.type) ? 'date' : 'float';
+      case 'subq': return kind === 'text' ? 'text' : 'float';
+      case 'window': {
+        const fn = WINDOW_FNS[e.call.fn], arg = e.call.args[0];
+        if (['row_number', 'rank', 'dense_rank', 'ntile', 'count'].includes(fn)) return 'int';
+        if (['percent_rank', 'cume_dist', 'avg'].includes(fn)) return 'float';
+        if (fn === 'sum') return arg && T(arg) === 'int' ? 'int' : 'float';
+        return arg ? T(arg) : 'float';
+      }
+      case 'call': {
+        const arg = e.args[0];
+        if (isAgg(e)) {
+          if (e.fn === 'COUNT' || e.fn === 'APPROX_COUNT_DISTINCT') return 'int';
+          if (e.fn === 'SUM') return arg && merge([T(arg)]) === 'int' || (arg && T(arg) === 'bool') ? 'int' : 'float';
+          if (e.fn === 'MIN' || e.fn === 'MAX') return arg ? T(arg) : 'float';
+          if (e.fn === 'PERCENTILE_DISC' || e.fn === 'QUANTILE_DISC') return T(e.within?.e ?? arg);
+          return kind === 'date' ? 'date' : 'float';
+        }
+        const sv = sessionFn(e);
+        if (sv) return sv.kind === 'text' ? 'text' : typeof sv.value === 'boolean' ? 'bool' : Number.isInteger(sv.value) ? 'int' : 'float';
+        if (extraFn(e)) return extraFn(e).out === 'text' ? 'text' : extraFn(e).out === 'bool' ? 'bool' : 'int';
+        if (TEXT_FUNCTIONS[e.fn]) return TEXT_FUNCTIONS[e.fn].out === 'text' ? 'text' : ['STARTS_WITH', 'ENDS_WITH', 'CONTAINS', 'PREFIX', 'SUFFIX', 'REGEXP_MATCHES', 'REGEXP_LIKE'].includes(e.fn) ? 'bool' : 'int';
+        if (DATE_PART[e.fn] || ['DOW', 'DAYOFWEEK', 'WEEKDAY', 'ISODOW', 'FLOOR', 'CEIL', 'CEILING'].includes(e.fn)) return 'int';
+        if (e.fn === 'ROUND') return e.args.length > 1 && !(e.args[1].k === 'num' && e.args[1].v <= 0) ? 'float' : 'int';
+        if (e.fn === 'ABS') return arg ? (T(arg) === 'int' ? 'int' : 'float') : 'float';
+        if (['LEAST', 'GREATEST', 'COALESCE', 'IFNULL', 'NVL'].includes(e.fn)) return merge(e.args.map(T));
+        if (e.fn === 'NULLIF') return arg ? T(arg) : 'float';
+        if (e.fn === 'DATE_TRUNC') return ['day', 'week', 'month', 'year', 'quarter'].includes(String(e.args[0]?.v).toLowerCase()) ? 'day' : 'date';
+        if (e.fn === 'NOW' || e.fn === 'CURRENT_TIMESTAMP') return 'date';
+        return kind === 'text' ? 'text' : kind === 'date' ? 'date' : 'float';
+      }
+      default: return kind === 'text' ? 'text' : kind === 'date' ? 'date' : 'float';
     }
   }
 
@@ -886,7 +1076,7 @@ function compileSelect(ast, env, outer, tail) {
         if (!unit) fail(`INTERVAL '${e.v}': use a number of milliseconds, seconds, minutes, hours, days or weeks (months and years vary in length)`);
         return num(Number(m[1]) * unit);
       }
-      case 'col': return ctx.col(e);
+      case 'col': { const sv = sessionRef(e); return sv ? constValue(sv, ctx) : ctx.col(e); }
       case 'star': fail('* only works as a whole SELECT item (or COUNT(*))');
       case 'neg': return { t: 'un', op: '-', x: T(e.x) };
       case 'not': return { t: 'un', op: '!', x: T(e.x) };
@@ -896,6 +1086,15 @@ function compileSelect(ast, env, outer, tail) {
         if (e.op === 'AND') return bin('&&', T(e.l), T(e.r));
         if (e.op === 'OR') return bin('||', T(e.l), T(e.r));
         const op = { '=': '==', '<>': '!=' }[e.op] ?? e.op;
+        if (op === 'IS') { // a IS b: equal, or both missing
+          const a = T(e.l), b = T(e.r);
+          return bin('||', bin('==', a, b), bin('&&', call('isMissing', a), call('isMissing', b)));
+        }
+        if (op === '~' || op === '~*' || op === '!~' || op === '!~*') { // regular expressions
+          const flags = op.endsWith('*') ? 'i' : '';
+          const m = valueColumn(ctx, [argOf(e.l, ctx), argOf(e.r, ctx)], ([a, b], [ka, kb]) => (TEXT_FUNCTIONS.REGEXP_MATCHES.f(toText(a, ka), toText(b, kb), flags) ? 1 : 0), { text: false, label: op });
+          return op.startsWith('!') ? bin('==', m, num(0)) : bin('==', m, num(1));
+        }
         if (['==', '!=', '<', '<=', '>', '>='].includes(op)) {
           const lk = kindOf(e.l, ctx), rk = kindOf(e.r, ctx);
           if (lk === 'text' || rk === 'text') {
@@ -951,16 +1150,23 @@ function compileSelect(ast, env, outer, tail) {
       case 'cast': {
         const from = kindOf(e.x, ctx);
         if (TEXT_TYPES.has(e.type)) return from === 'text' ? T(e.x) : valueColumn(ctx, [argOf(e.x, ctx)], ([x], [k]) => toText(x, k), { label: 'text' });
-        if (e.x.k === 'str' && !(e.type === 'DATE' || e.type === 'TIMESTAMP')) { const x = textToNumber(e.x.v); return num(['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT'].includes(e.type) ? Math.trunc(x) : x); }
+        const asBool = (v) => (/^\s*(t|true|y|yes|on|1)\s*$/i.test(v) ? 1 : /^\s*(f|false|n|no|off|0)\s*$/i.test(v) ? 0 : NaN);
+        if (e.x.k === 'str' && !DATE_TYPES.has(e.type)) {
+          if (BOOL_TYPES.has(e.type)) return num(asBool(e.x.v));
+          if (!INT_TYPES.has(e.type) && !FLOAT_TYPES.has(e.type)) fail(`CAST to ${e.type} is not supported`);
+          const x = textToNumber(e.x.v);
+          return num(INT_TYPES.has(e.type) ? Math.trunc(x) : x);
+        }
         if (from === 'text' && e.x.k !== 'str') { // text to a number or a date (missing where it isn't one)
-          const whole = ['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT'].includes(e.type), date = e.type === 'DATE' || e.type === 'TIMESTAMP';
-          if (!whole && !date && !['DOUBLE', 'FLOAT', 'REAL', 'DECIMAL', 'NUMERIC'].includes(e.type)) fail(`CAST to ${e.type} is not supported`);
-          return valueColumn(ctx, [argOf(e.x, ctx)], ([x]) => { if (date) { const t = textToDate(x); return e.type === 'DATE' ? Math.floor(t / 86_400_000) * 86_400_000 : t; } const v = textToNumber(x); return whole ? Math.trunc(v) : v; }, { text: false, date, label: e.type.toLowerCase() });
+          const whole = INT_TYPES.has(e.type), date = DATE_TYPES.has(e.type), bool = BOOL_TYPES.has(e.type);
+          if (!whole && !date && !bool && !FLOAT_TYPES.has(e.type)) fail(`CAST to ${e.type} is not supported`);
+          return valueColumn(ctx, [argOf(e.x, ctx)], ([x]) => { if (bool) return asBool(x); if (date) { const t = textToDate(x); return e.type === 'DATE' ? Math.floor(t / 86_400_000) * 86_400_000 : t; } const v = textToNumber(x); return whole ? Math.trunc(v) : v; }, { text: false, date, label: e.type.toLowerCase() });
         }
         const x = T(e.x);
-        if (['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT'].includes(e.type)) return cond(bin('>=', x, num(0)), call('floor', x), call('ceil', x));
-        if (['DOUBLE', 'FLOAT', 'REAL', 'DECIMAL', 'NUMERIC'].includes(e.type)) return x;
-        if (e.type === 'DATE' || e.type === 'TIMESTAMP') return e.x.k === 'str' ? translate({ k: 'date', v: e.x.v }, ctx) : e.type === 'DATE' ? call('dayStart', x) : x;
+        if (INT_TYPES.has(e.type)) return cond(bin('>=', x, num(0)), call('floor', x), call('ceil', x));
+        if (FLOAT_TYPES.has(e.type)) return x;
+        if (BOOL_TYPES.has(e.type)) return cond(bin('==', x, x), cond(bin('!=', x, num(0)), num(1), num(0)), num(NaN));
+        if (DATE_TYPES.has(e.type)) return e.x.k === 'str' ? translate({ k: 'date', v: e.x.v }, ctx) : e.type === 'DATE' ? call('dayStart', x) : x;
         fail(`CAST to ${e.type} is not supported`);
       }
       case 'call': {
@@ -994,6 +1200,8 @@ function compileSelect(ast, env, outer, tail) {
           case 'WEEKDAY': case 'ISODOW': need(1); return call('weekday', a[0]);
           case 'NOW': case 'CURRENT_TIMESTAMP': return num(Date.now());
           default:
+            if (sessionFn(e)) return constValue(sessionFn(e), ctx);
+            if (extraFn(e)) { const fx = extraFn(e); return valueColumn(ctx, e.args.map((x) => argOf(x, ctx)), (xs) => fx.f(...xs), { text: fx.out === 'text', skip: true, label: e.fn.toLowerCase() }); }
             if (DATE_PART[e.fn]) { need(1); return call(DATE_PART[e.fn], a[0]); }
             if (WINDOW_FNS[e.fn] && !AGG[e.fn]) fail(`${e.fn}() needs OVER (...)`);
             fail(`unknown function ${e.fn}()`);
@@ -1024,7 +1232,7 @@ function compileSelect(ast, env, outer, tail) {
         for (const [orig, out] of s.names) {
           const u = e.table ? null : usingMap.get(orig.toLowerCase()); // (a USING key once)
           const label = u ? orig : out;
-          if (seen.has(label) || (!u && out.startsWith('__'))) continue;
+          if (seen.has(label) || (!u && out.startsWith('__') && !out.startsWith('__q_'))) continue;
           seen.add(label);
           items.push({ e: { k: 'col', name: u ?? out, resolved: true }, name: label });
         }
@@ -1038,16 +1246,18 @@ function compileSelect(ast, env, outer, tail) {
     if (!it.name) {
       const c = it.e.k === 'window' ? it.e.call : it.e;
       if (it.e.k === 'col') it.name = it.e.name;
+      else if (env.pgNames && (c.k === 'call' || it.e.k === 'window')) it.name = c.star && c.fn === 'COUNT' ? 'count' : c.fn.toLowerCase(); // (PostgreSQL's names: count, sum, version)
+      else if (env.pgNames && it.e.k === 'cast') it.name = it.e.type.toLowerCase().replace(/ /g, '_');
       else if (isAgg(c) || it.e.k === 'window') it.name = `${c.star ? 'count' : AGG[c.fn] === 'mean' ? 'avg' : c.distinct ? 'count_distinct' : c.fn.toLowerCase()}${c.args[0]?.k === 'col' ? `_${c.args[0].name}` : ''}`;
       else it.name = `col${i + 1}`;
     }
     let nm = it.name, k = 2;
     while (used.has(nm)) nm = `${it.name}_${k++}`;
-    if (!/^[A-Za-z_]\w*$/.test(nm)) fail(`"${nm}" can't be a column name: use AS name`);
+    nm = encodeName(nm); // ("sum:price:ok": kept under a plain name, shown as written)
     it.name = nm;
     used.add(nm);
   });
-  const colOf = (e) => (e.resolved ? v(e.name) : v(resolve(e)));
+  const colOf = (e) => { if (e.resolved) return v(e.name); const sv = sessionRef(e); return sv ? constValue(sv, plain) : v(resolve(e)); };
   const orderBy = tail.orderBy ?? [];
 
   // ---- window functions: after grouping, before ORDER BY / DISTINCT / LIMIT ---------------
@@ -1161,7 +1371,9 @@ function compileSelect(ast, env, outer, tail) {
       const fn = e.fn === 'COUNT' && e.star ? 'count' : e.fn === 'COUNT' && e.distinct ? 'countDistinct' : AGG[e.fn];
       if (e.distinct && e.fn !== 'COUNT') fail(`${e.fn}(DISTINCT ...) is not supported (COUNT(DISTINCT x) is)`);
       if (!e.star && e.args.length !== 1) fail(`${e.fn}() takes one value`);
-      spec[name] = e.star ? 'count()' : `${fn}(${src(translate(e.args[0], plain))})`;
+      const arg = e.star ? null : src(translate(e.args[0], plain));
+      spec[name] = e.star ? 'count()' : `${fn}(${arg})`;
+      if (fn === 'sum') { spec[`${name}_n`] = `count(${arg})`; return cond(bin('>', v(`${name}_n`), num(0)), v(name), num(NaN)); } // (SUM of no values: NULL)
       return v(name);
     };
     // after grouping: aggregates and keys by name; other columns must be keys
@@ -1182,7 +1394,7 @@ function compileSelect(ast, env, outer, tail) {
       return translate(e, post);
     };
     planWindows(translatePost, (x) => kindOf(x, post));
-    const outs = withCols(items.map((it) => ({ ...it, ast: translatePost(it.e) })));
+    const outs = withCols(items.map((it) => ({ ...it, ast: textConst(translatePost(it.e), post) })));
     const havingAst = ast.having ? translatePost(ast.having) : null;
     const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, translatePost) }));
     q = q.groupBy([...keys.map((k) => k.name), ...extraKeys]).agg(Object.keys(spec).length ? spec : { __a_rows: 'count()' });
@@ -1193,18 +1405,20 @@ function compileSelect(ast, env, outer, tail) {
     for (const st of after) st.run();
     for (const o of outs) if (o.ast.t !== 'var') q = q.derive(o.col, src(o.ast));
     for (const o of orderAsts) sortKey(o);
-    return finish(outs, (o) => (o.e.k === 'col' ? post.kindOfCol(o.e) ?? kinds.get(resolveSafe(o.e)) : kindOf(o.e, post)));
+    return finish(outs, (o) => (o.e.k === 'col' ? post.kindOfCol(o.e) ?? kinds.get(resolveSafe(o.e)) : kindOf(o.e, post)), post);
   }
   const pre = windowCtx(plain);
   planWindows((e) => (e.k === 'col' ? colOf(e) : translate(e, pre)), (x) => kindOf(x, pre));
   applyWindows();
-  const outs = withCols(items.map((it) => ({ ...it, ast: it.e.k === 'col' ? colOf(it.e) : translate(it.e, pre) })));
+  const outs = withCols(items.map((it) => ({ ...it, ast: textConst(it.e.k === 'col' ? colOf(it.e) : translate(it.e, pre), pre) })));
   const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, (e) => (e.k === 'col' ? colOf(e) : translate(e, pre))) }));
   for (const o of outs) if (o.ast.t !== 'var') q = q.derive(o.col, src(o.ast));
   for (const o of orderAsts) sortKey(o);
   if (ast.distinct) q = q.groupBy([...new Set(outs.map((o) => o.col))]).agg({ __distinct_rows: 'count()' });
-  return finish(outs, (o) => (o.e.k === 'col' ? kinds.get(o.e.resolved ? o.e.name : resolve(o.e)) : kindOf(o.e, pre)));
+  return finish(outs, (o) => (o.e.k === 'col' ? (sessionRef(o.e)?.kind ?? kinds.get(o.e.resolved ? o.e.name : resolve(o.e))) : kindOf(o.e, pre)), pre);
 
+  // a text literal as an answer column: a column of that text
+  function textConst(ast, ctx) { return ast.t === 'str' ? valueColumn(ctx, [], () => ast.v, { label: 'text' }) : ast; }
   // each output's column while the query runs: a column as it is, or a
   // hidden one (renamed at the end: an output may take a name in use)
   function withCols(outs) { for (const o of outs) o.col = o.ast.t === 'var' ? o.ast.name : `__s${n.hidden++}`; return outs; }
@@ -1223,7 +1437,7 @@ function compileSelect(ast, env, outer, tail) {
     if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, `${k} == ${k} ? 1 : 0`); sortKeys.push(h); }
     sortKeys.push(o.desc ? `-${k}` : k);
   }
-  function finish(outs, kindFn) {
+  function finish(outs, kindFn, ctx) {
     let out = q;
     if (sortKeys.length) out = out.sort(sortKeys);
     if (tail.limit !== null && tail.limit !== undefined) out = out.limit(tail.limit, tail.offset);
@@ -1236,7 +1450,8 @@ function compileSelect(ast, env, outer, tail) {
       out = out.select(...tmp.values());
       for (const o of outs) out = out.derive(o.name, tmp.get(o.col));
     }
-    return { query: out.select(...names), names, kinds: outKinds };
+    const outTypes = env.wantTypes ? new Map(outs.map((o) => [o.name, typeOfExpr(o.e, ctx)])) : null;
+    return { query: out.select(...names), names, kinds: outKinds, typeOf: (nm) => outTypes?.get(nm) ?? 'float' };
   }
 }
 
@@ -1254,4 +1469,4 @@ function toSourceAst(n) {
   throw new Error(`bad node ${n.t}`);
 }
 
-export { Query, namesOf };
+export { Query, namesOf, columnType };
