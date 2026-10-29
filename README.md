@@ -419,6 +419,14 @@ ODBC, and every driver. Queries arrive in each tool's own SQL and run on Vectro'
 
 ![Metabase dashboard on Vectro, 10M orders](docs/img/metabase-vectro.jpg)
 
+- **Packaged connectors** ([connectors](connectors/README.md)): `Vectro.mez`
+  puts Vectro in Power BI's Get Data list (tables through the OData feed, or
+  SQL of your own; anonymous or a token) and `vectro.taco` in Tableau's
+  Connect list (the PostgreSQL protocol with Tableau's PostgreSQL SQL). Built
+  by `node connectors/build.mjs`; the Power Query code parses with Microsoft's
+  parser, the Tableau files validate against the Connector SDK's schemas.
+  Not signed yet, and not yet loaded in the real applications.
+
 ## Arrow Flight SQL: pandas, Polars, DuckDB
 
 ```sh

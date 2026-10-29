@@ -49,6 +49,13 @@ Measured on this sample (10M orders, a laptop): Metabase questions built in
 its editor, including a join to products, answer in 80 to 600 ms end to end;
 Grafana's eight panels in 20 to 220 ms each.
 
+## Packaged connectors
+
+[connectors/](../../connectors/README.md) has `Vectro.mez` (Power BI) and
+`vectro.taco` (Tableau): Vectro by name in each tool's connection list. The
+steps below use the tools' built-in PostgreSQL connectors instead, which need
+nothing installed.
+
 ## 3. Power BI Desktop (Windows)
 
 1. Get Data > **PostgreSQL database**.

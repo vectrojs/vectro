@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Tableau's PostgreSQL SQL, which Vectro's PostgreSQL protocol answers -->
+<dialect name='Vectro'
+         class='vectro'
+         base='PostgreSQL90Dialect'
+         version='18.1'>
+</dialect>
