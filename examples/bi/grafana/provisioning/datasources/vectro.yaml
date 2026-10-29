@@ -1,0 +1,17 @@
+# Vectro as Grafana's PostgreSQL data source (the password comes from the
+# VECTRO_PG_PASSWORD environment variable; see docker-compose.yml)
+apiVersion: 1
+datasources:
+  - name: Vectro
+    uid: vectro
+    type: grafana-postgresql-datasource
+    url: host.docker.internal:5433
+    user: bi
+    isDefault: true
+    jsonData:
+      database: shop
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+    secureJsonData:
+      password: $VECTRO_PG_PASSWORD

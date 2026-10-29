@@ -157,6 +157,14 @@ CASES.push(
   ['SELECT cust AS qty, qty AS cust FROM orders WHERE price > 999 ORDER BY qty, cust', () => O.filter((r) => r.price > 999).map((r) => ({ qty: r.cust, cust: r.qty })).sort((a, b) => a.qty - b.qty || a.cust - b.cust)],
   ['SELECT CAST(cust AS VARCHAR) AS k FROM customers WHERE cust < 3 UNION SELECT region FROM orders ORDER BY k', () => [...new Set(['0', '1', '2', ...O.map((r) => r.region)])].sort(byKey).map((k) => ({ k }))],
 );
+// stage 3 (BI tools): right-side conditions in LEFT JOIN ON, format(), NULL columns in a UNION, epoch and date_part
+CASES.push(
+  ['SELECT c.cust, o.n FROM customers c LEFT JOIN (SELECT cust, qty, COUNT(*) AS n FROM orders GROUP BY cust, qty) o ON o.cust = c.cust AND o.qty = 5 ORDER BY c.cust LIMIT 8',
+    () => C.slice(0, 8).map((c) => ({ cust: c.cust, n: O.filter((r) => r.cust === c.cust && r.qty === 5).length || NaN }))],
+  ["SELECT FORMAT('%s-%s:%I', name, tier, 'My Col') AS f FROM customers ORDER BY cust LIMIT 3", () => C.slice(0, 3).map((c) => ({ f: `${c.name}-${c.tier}:"My Col"` }))],
+  ['SELECT name AS x FROM customers WHERE cust < 2 UNION ALL SELECT NULL ORDER BY x', () => [{ x: '' }, { x: 'c0' }, { x: 'c1' }]],
+  ["SELECT EXTRACT(EPOCH FROM ts) AS e, date_part('month', ts) AS m FROM orders ORDER BY ts LIMIT 3", () => [...O].sort((a, b) => a.ts - b.ts).slice(0, 3).map((r) => ({ e: r.ts.getTime() / 1000, m: r.ts.getUTCMonth() + 1 }))],
+);
 const norm = (v) => (v instanceof Date ? v.getTime() : typeof v === 'number' ? (v !== v ? 'NaN' : Number(v.toPrecision(12))) : v);
 for (const [label, make] of [['threads', () => new Engine()], ['single thread', () => new Engine({ threads: 1 })], ['interpreter', () => new PortableEngine({ jit: false })]]) {
   const e = make();

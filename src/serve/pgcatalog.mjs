@@ -89,6 +89,8 @@ export function catalogTables(engine, described, { database, user, settings }) {
   add('pg_catalog.pg_sequence', 'seqrelid seqtypid seqstart seqincrement seqmax seqmin seqcache seqcycle');
   add('pg_catalog.pg_foreign_table', 'ftrelid ftserver ftoptions:t');
   add('pg_catalog.pg_partitioned_table', 'partrelid partstrat:t partnatts partdefid');
+  for (const k of ['pg_stat_user_tables', 'pg_stat_all_tables']) add(`pg_catalog.${k}`, 'relid schemaname:t relname:t seq_scan seq_tup_read idx_scan idx_tup_fetch n_tup_ins n_tup_upd n_tup_del n_live_tup n_dead_tup n_mod_since_analyze last_vacuum last_autovacuum last_analyze last_autoanalyze',
+    described.map((d) => [d.oid, 'public', d.name, 0, 0, 0, 0, 0, 0, 0, d.rows, 0, 0, NaN, NaN, NaN, NaN]));
   add('pg_catalog.pg_stat_activity', 'datid datname:t pid usename:t application_name:t client_addr:t state:t query:t');
   add('pg_catalog.pg_event_trigger', 'oid evtname:t evtevent:t evtenabled:t');
   add('pg_catalog.pg_publication', 'oid pubname:t');
@@ -142,7 +144,7 @@ const ok = (re, s) => !re || re.test(s);
 const result = (spec, rows) => ({ columns: spec.split(/\s+/).filter(Boolean).map((x) => { const [name, type] = x.split(':'); return { name, type }; }), rows });
 
 // A known driver query -> { columns: [{ name, type }], rows }, or null.
-export function driverAnswer(text, described) {
+export function driverAnswer(text, described, database = 'vectro') {
   if (/\/\*\*\* Load all supported types \*\*\*\//.test(text)) { // Npgsql (Power BI): every type it may meet
     const rows = [];
     for (const t of TYPES) {
@@ -156,9 +158,10 @@ export function driverAnswer(text, described) {
   if (/\/\*\*\* Load field definitions for \(free-standing\) composite types \*\*\*\//.test(text)) return result('oid:oid attname:name atttypid:oid', []);
   if (/\/\*\*\* Load enum fields \*\*\*\//.test(text)) return result('oid:oid enumlabel:name', []);
   // pgJDBC (Tableau, DBeaver, Metabase): DatabaseMetaData
-  if (/AS TABLE_SCHEM,\s*NULL AS TABLE_CATALOG\s+FROM pg_catalog\.pg_namespace/i.test(text)) {
-    const re = patternFor(text, 'nspname');
-    return result('table_schem:name table_catalog:text', ['information_schema', 'pg_catalog', 'public'].filter((s) => ok(re, s)).map((s) => [s, null]));
+  const schemas = /AS "?TABLE_SCHEM"?,\s*(NULL|current_database\(\)) AS "?TABLE_CATALOG"?\s+FROM pg_catalog\.pg_namespace/i.exec(text);
+  if (schemas) { // (older pgJDBC: NULL as the catalog; newer: current_database() and quoted upper-case names)
+    const re = patternFor(text, 'nspname'), quoted = /AS "TABLE_SCHEM"/.test(text);
+    return result(`${quoted ? 'TABLE_SCHEM' : 'table_schem'}:name ${quoted ? 'TABLE_CATALOG' : 'table_catalog'}:${quoted ? 'name' : 'text'}`, ['information_schema', 'pg_catalog', 'public'].filter((x) => ok(re, x)).map((x) => [x, /NULL/i.test(schemas[1]) ? null : database]));
   }
   if (/AS TABLE_TYPE,\s*d\.description AS REMARKS/i.test(text)) {
     const sre = patternFor(text, 'n.nspname'), tre = patternFor(text, 'c.relname');

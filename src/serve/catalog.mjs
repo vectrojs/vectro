@@ -9,6 +9,7 @@ import { Engine } from '../node.mjs';
 import { parseNDJSON } from '../ndjson.mjs';
 
 export const MAX_FILE_BYTES = 2 ** 31;
+export const FREE_TEXT_ROWS = 5_000_000;
 export const LOADABLE = new Set(['.csv', '.tsv', '.jsonl', '.ndjson', '.arrow', '.feather', '.ipc', '.vectro']);
 
 // (a mistake by whoever asked: shown to them as it is)
@@ -37,7 +38,17 @@ export async function loadFile(engine, real, { types } = {}) {
   const bytes = new Uint8Array(readFileSync(real));
   if (ext === '.arrow' || ext === '.feather' || ext === '.ipc') return { table: engine.fromArrow(bytes) };
   if (ext === '.jsonl' || ext === '.ndjson') return loadJSONLines(engine, bytes, types);
-  if (ext === '.csv' || ext === '.tsv' || ext === '.txt') return { table: engine.parseCSV(bytes, { types: types ?? {}, delimiter: ext === '.tsv' ? '\t' : ',' }) };
+  if (ext === '.csv' || ext === '.tsv' || ext === '.txt') {
+    const delimiter = ext === '.tsv' ? '\t' : ',';
+    const table = engine.parseCSV(bytes, { types: types ?? {}, delimiter });
+    // text that rarely repeats (names, titles) loads as free text, which can be
+    // shown but not grouped, filtered or joined on: tools need that, so up to
+    // FREE_TEXT_ROWS rows it is loaded again as categories
+    const free = [...table.cols].filter(([n, c]) => c.strings && !(types && n in types)).map(([n]) => n);
+    if (!free.length || table.length > FREE_TEXT_ROWS) return { table };
+    table.dispose();
+    return { table: engine.parseCSV(bytes, { types: { ...types, ...Object.fromEntries(free.map((n) => [n, 'category'])) }, delimiter }) };
+  }
   throw new LoadError(`can't load ${ext || 'files without an extension'} (CSV, TSV, JSON lines, Arrow / Feather or .vectro)`);
 }
 

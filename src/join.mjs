@@ -184,7 +184,7 @@ export function* joinViewG(L, R, { on, how = 'inner', suffix = '_right' } = {}, 
       const d = engine.live(data), src = c ? engine.live(c.data) : null, rowOf = build.rowOf;
       for (let g = 0; g < K; g++) { const r = rowOf[g]; d[g] = r < 0 ? missing : src ? src[r] : 1; }
       d[K] = missing;
-      build.byGroup.set(name, (x = { data, dict, codes, date: c?.date }));
+      build.byGroup.set(name, (x = { data, dict, codes, date: c?.date, strings: c?.strings ?? null })); // (free text: its places in the right table's text, as the other join path keeps them)
       return x;
     };
     const cols = new Map(left.cols);
@@ -195,7 +195,7 @@ export function* joinViewG(L, R, { on, how = 'inner', suffix = '_right' } = {}, 
       let outName = name;
       while (cols.has(outName)) outName += suffix;
       const x = byGroup(`c:${name}|${arrayId(c.data)}`, c);
-      cols.set(outName, { data: null, dict: x.dict, codes: x.codes, date: x.date });
+      cols.set(outName, { data: null, dict: x.dict, codes: x.codes, date: x.date, strings: x.strings });
       looked.push([outName, x]);
     }
     if (how === 'inner') looked.push([FOUND, byGroup('found', null)]), cols.set(FOUND, { data: null, dict: null, codes: null });

@@ -398,6 +398,14 @@ ODBC, and every driver. Queries arrive in each tool's own SQL and run on Vectro'
   and a Java program through pgJDBC in 0.9 s (PostgreSQL 0.6 to 1.0 s).
 - **Safety**: without `--password` only this machine may connect; with
   `--host 0.0.0.0` a password is required. Writes (INSERT, CREATE...) are refused.
+- **Live dashboards** ([examples/bi](examples/bi/README.md): a 10M-order
+  sample shop, Docker setup, and steps for Power BI, Tableau, Metabase,
+  Grafana and Excel): Metabase v0.64 reads the tables and runs the questions
+  its editor builds (joins included) in 80 to 600 ms; Grafana 13's
+  time-series dashboard (its `$__timeFilter` / `$__timeGroupAlias` macros,
+  a moving average) answers each panel in 20 to 220 ms.
+
+![Metabase dashboard on Vectro, 10M orders](docs/img/metabase-vectro.jpg)
 
 ## For AI assistants (MCP server)
 

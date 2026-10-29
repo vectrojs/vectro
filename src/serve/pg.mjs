@@ -396,7 +396,7 @@ export async function servePg({ tables = {}, root = null, engine = null, catalog
       if (!['SELECT', 'WITH', 'VALUES', 'TABLE', '(', 'SHOW', 'FETCH', 'EXPLAIN'].includes(word)) return null;
       if (word !== 'SELECT' && word !== 'WITH' && word !== '(') { const r = await this.run(text); return r.columns ?? null; }
       const { tables, described } = this.tablesFor();
-      const known = driverAnswer(text, described);
+      const known = driverAnswer(text, described, this.database);
       if (known) return known.columns.map((c) => ({ name: c.name, type: c.type }));
       try {
         const q = sql(t, tables, this.sqlOpts());
@@ -409,7 +409,7 @@ export async function servePg({ tables = {}, root = null, engine = null, catalog
     async run(text) {
       const t = stripComments(text).replace(/;\s*$/, '');
       if (!t.trim()) return { empty: true };
-      if (logQueries) log(`[pg] ${this.user}: ${text.replace(/\s+/g, ' ').trim().slice(0, 500)}`);
+      if (logQueries) log(`[pg] ${this.user}: ${text.replace(/\s+/g, ' ').trim().slice(0, 20_000)}`);
       const word = firstWord(t);
       switch (word) {
         case 'SELECT': case 'WITH': case '(': case 'VALUES': case 'TABLE': return this.query(word === 'TABLE' ? `SELECT * FROM ${t.trim().slice(5)}` : text.replace(/;\s*$/, '')); // (with its comments: known driver queries are told by them)
@@ -444,7 +444,7 @@ export async function servePg({ tables = {}, root = null, engine = null, catalog
     }
     async query(t) {
       const { tables, described } = this.tablesFor();
-      const known = driverAnswer(t, described) ?? specialAnswer(t, this);
+      const known = driverAnswer(t, described, this.database) ?? specialAnswer(t, this);
       if (known) return rowsOf(known.columns, known.rows);
       let q;
       try { q = sql(t, tables, this.sqlOpts()); } catch (err) {
@@ -529,10 +529,11 @@ const SETTINGS = {
 // functions catalog queries call (psql's \\dt, DBeaver, Metabase...)
 function catalogFunctions(session) {
   const yes = { out: 'bool', f: () => 1 }, none = { out: 'text', f: () => null }, zero = { out: 'number', f: () => 0 };
+  const may = { out: 'bool', f: (...args) => (/^\s*(select|usage|connect|execute)\b/i.test(String(args.at(-1) ?? '')) ? 1 : 0) }; // (read only: reading, nothing else)
   return {
     pg_get_userbyid: { out: 'text', f: () => session.user },
     pg_table_is_visible: yes, pg_type_is_visible: yes, pg_function_is_visible: yes,
-    has_table_privilege: yes, has_schema_privilege: yes, has_database_privilege: yes, has_column_privilege: yes, has_any_column_privilege: yes, has_function_privilege: yes, has_sequence_privilege: yes,
+    has_table_privilege: may, has_schema_privilege: may, has_database_privilege: may, has_column_privilege: may, has_any_column_privilege: may, has_function_privilege: may, has_sequence_privilege: may,
     format_type: { out: 'text', f: (oid) => typeName(Number(oid)) ?? 'unknown' },
     pg_get_expr: none, obj_description: none, col_description: none, shobj_description: none,
     pg_get_constraintdef: none, pg_get_indexdef: none, pg_get_viewdef: none, pg_get_triggerdef: none, pg_get_functiondef: none, pg_tablespace_location: none,

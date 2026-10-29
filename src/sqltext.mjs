@@ -117,5 +117,16 @@ export const TEXT_FUNCTIONS = {
   CONCAT: { args: '', rest: 's', out: 'text', skip: true, f: (...xs) => xs.filter((x) => x !== null).join('') },
   CONCAT_WS: { args: 's', rest: 's', out: 'text', skip: true, f: (sep, ...xs) => (sep === null ? '' : xs.filter((x) => x !== null).join(sep)) },
   '||': { args: '', rest: 's', out: 'text', f: (...xs) => xs.join('') },
+  FORMAT: { args: 's', rest: 's', out: 'text', skip: true, f: (fmt, ...xs) => { // PostgreSQL's format(): %s, %I (a name, quoted when needed), %L (a literal)
+    if (fmt === null) return '';
+    let k = 0;
+    return fmt.replace(/%([%sIL])/g, (m, c) => {
+      if (c === '%') return '%';
+      const x = xs[k++];
+      if (c === 's') return x ?? '';
+      if (c === 'I') return /^[a-z_][a-z0-9_$]*$/.test(x ?? '') ? x : `"${String(x ?? '').replaceAll('"', '""')}"`;
+      return x === null || x === undefined ? 'NULL' : `'${String(x).replaceAll("'", "''")}'`;
+    });
+  } },
 };
 for (const [alias, name] of Object.entries({ UCASE: 'UPPER', LCASE: 'LOWER', LEN: 'LENGTH', CHAR_LENGTH: 'LENGTH', CHARACTER_LENGTH: 'LENGTH', STRLEN: 'OCTET_LENGTH', SUBSTR: 'SUBSTRING', INSTR: 'STRPOS', POSITION: 'STRPOS', PREFIX: 'STARTS_WITH', SUFFIX: 'ENDS_WITH', REGEXP_LIKE: 'REGEXP_MATCHES', STR_SPLIT_PART: 'SPLIT_PART' })) TEXT_FUNCTIONS[alias] = TEXT_FUNCTIONS[name];

@@ -1,0 +1,25 @@
+# Metabase and Grafana on this machine, both reading Vectro through the
+# PostgreSQL protocol (see README.md). Start Vectro first:
+#   VECTRO_PG_PASSWORD=... npx vectro serve --root bi-data --no-http --pg 5433 --host 0.0.0.0 --user bi --database shop
+#   VECTRO_PG_PASSWORD=... docker compose up -d
+services:
+  metabase:
+    image: metabase/metabase:v0.64.4
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      MB_CHECK_FOR_UPDATES: "false"
+      MB_ANON_TRACKING_ENABLED: "false"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+  grafana:
+    image: grafana/grafana-oss:13.0.2
+    ports: ["127.0.0.1:3001:3000"]
+    environment:
+      VECTRO_PG_PASSWORD: ${VECTRO_PG_PASSWORD:?set VECTRO_PG_PASSWORD}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    extra_hosts: ["host.docker.internal:host-gateway"]

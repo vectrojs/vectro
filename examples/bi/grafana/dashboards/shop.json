@@ -1,0 +1,362 @@
+{
+ "uid": "vectro-shop",
+ "title": "Shop: 10M orders on Vectro (Grafana)",
+ "time": {
+  "from": "2024-01-01T00:00:00.000Z",
+  "to": "2025-12-31T23:59:59.000Z"
+ },
+ "timezone": "utc",
+ "schemaVersion": 39,
+ "panels": [
+  {
+   "type": "stat",
+   "title": "Orders",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 6,
+    "h": 4
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "vectro"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "vectro"
+     },
+     "rawQuery": true,
+     "editorMode": "code",
+     "format": "table",
+     "rawSql": "SELECT COUNT(*) AS orders FROM orders WHERE $__timeFilter(ts)"
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "#5794F2"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#5794F2",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    }
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Revenue",
+   "gridPos": {
+    "x": 6,
+    "y": 0,
+    "w": 6,
+    "h": 4
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "vectro"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "vectro"
+     },
+     "rawQuery": true,
+     "editorMode": "code",
+     "format": "table",
+     "rawSql": "SELECT SUM(qty * unit_price * (1 - COALESCE(discount, 0))) AS revenue FROM orders WHERE $__timeFilter(ts)"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "currencyUSD",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "#5794F2"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#5794F2",
+        "value": null
+       }
+      ]
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Customers",
+   "gridPos": {
+    "x": 12,
+    "y": 0,
+    "w": 6,
+    "h": 4
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "vectro"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "vectro"
+     },
+     "rawQuery": true,
+     "editorMode": "code",
+     "format": "table",
+     "rawSql": "SELECT COUNT(DISTINCT customer_id) AS customers FROM orders WHERE $__timeFilter(ts)"
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "#5794F2"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#5794F2",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    }
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Average order",
+   "gridPos": {
+    "x": 18,
+    "y": 0,
+    "w": 6,
+    "h": 4
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "vectro"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "vectro"
+     },
+     "rawQuery": true,
+     "editorMode": "code",
+     "format": "table",
+     "rawSql": "SELECT AVG(qty * unit_price * (1 - COALESCE(discount, 0))) AS avg_order FROM orders WHERE $__timeFilter(ts)"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "currencyUSD",
+     "decimals": 2,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "#5794F2"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#5794F2",
+        "value": null
+       }
+      ]
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value"
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Daily revenue by channel",
+   "gridPos": {
+    "x": 0,
+    "y": 4,
+    "w": 16,
+    "h": 10
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "vectro"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "vectro"
+     },
+     "rawQuery": true,
+     "editorMode": "code",
+     "format": "time_series",
+     "rawSql": "SELECT $__timeGroupAlias(ts, '1d'), channel AS metric, SUM(qty * unit_price * (1 - COALESCE(discount, 0))) AS revenue FROM orders WHERE $__timeFilter(ts) GROUP BY 1, 2 ORDER BY 1"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "currencyUSD",
+     "custom": {
+      "fillOpacity": 15,
+      "stacking": {
+       "mode": "normal"
+      },
+      "lineWidth": 1
+     }
+    }
+   }
+  },
+  {
+   "type": "bargauge",
+   "title": "Revenue by region",
+   "gridPos": {
+    "x": 16,
+    "y": 4,
+    "w": 8,
+    "h": 10
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "vectro"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "vectro"
+     },
+     "rawQuery": true,
+     "editorMode": "code",
+     "format": "table",
+     "rawSql": "SELECT region, SUM(qty * unit_price * (1 - COALESCE(discount, 0))) AS revenue FROM orders WHERE $__timeFilter(ts) GROUP BY region ORDER BY revenue DESC"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "currencyUSD",
+     "decimals": 0
+    }
+   },
+   "options": {
+    "orientation": "horizontal",
+    "displayMode": "gradient",
+    "reduceOptions": {
+     "calcs": [],
+     "values": true
+    }
+   }
+  },
+  {
+   "type": "table",
+   "title": "Top products",
+   "gridPos": {
+    "x": 0,
+    "y": 14,
+    "w": 14,
+    "h": 9
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "vectro"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "vectro"
+     },
+     "rawQuery": true,
+     "editorMode": "code",
+     "format": "table",
+     "rawSql": "SELECT p.product, p.category, COUNT(*) AS orders, ROUND(SUM(o.qty * o.unit_price * (1 - COALESCE(o.discount, 0))), 0) AS revenue, ROUND(SUM(o.qty * (o.unit_price - p.unit_cost)), 0) AS margin FROM orders o JOIN products p ON o.product_id = p.product_id WHERE $__timeFilter(o.ts) GROUP BY 1, 2 ORDER BY revenue DESC LIMIT 10"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Weekly orders, 4-week moving average",
+   "gridPos": {
+    "x": 14,
+    "y": 14,
+    "w": 10,
+    "h": 9
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "vectro"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "vectro"
+     },
+     "rawQuery": true,
+     "editorMode": "code",
+     "format": "time_series",
+     "rawSql": "SELECT \"time\", orders, AVG(orders) OVER (ORDER BY \"time\" ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS moving_avg FROM (SELECT $__timeGroupAlias(ts, '7d'), COUNT(*) AS orders FROM orders WHERE $__timeFilter(ts) GROUP BY 1) w ORDER BY 1"
+    }
+   ]
+  }
+ ],
+ "refresh": "",
+ "version": 2
+}

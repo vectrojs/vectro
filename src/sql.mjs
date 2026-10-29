@@ -487,6 +487,7 @@ function has(e, test, intoWindows = false) {
 }
 const hasAgg = (e) => has(e, isAgg);
 const hasWindow = (e) => has(e, (x) => x.k === 'window');
+const colRefs = (e) => { const out = []; has(e, (x) => { if (x.k === 'col') out.push(x); return false; }); return out; };
 const conjuncts = (e) => (!e ? [] : e.k === 'bin' && e.op === 'AND' ? [...conjuncts(e.l), ...conjuncts(e.r)] : [e]);
 const andAll = (list) => (list.length ? list.reduce((a, b) => ({ k: 'bin', op: 'AND', l: a, r: b })) : null);
 
@@ -579,7 +580,7 @@ function compileQuery(q, env, outer) {
     for (const o of q.orderBy) {
       let name = null;
       if (o.e.k === 'num') name = rel.names[o.e.v - 1] ?? fail(`ORDER BY ${o.e.v}: there is no column ${o.e.v}`);
-      else if (o.e.k === 'col' && !o.e.table) name = rel.names.find((n) => n.toLowerCase() === o.e.name.toLowerCase()) ?? fail(`ORDER BY ${o.e.name}: a UNION is ordered by its columns`);
+      else if (o.e.k === 'col' && !o.e.table) name = rel.names.find((n) => n.toLowerCase() === o.e.name.toLowerCase() || n === encodeName(o.e.name)) ?? fail(`ORDER BY ${o.e.name}: a UNION is ordered by its columns`);
       else fail('a UNION / INTERSECT / EXCEPT is ordered by its column names or numbers');
       if (o.nullsFirst) { const h = `__nf${env.n.hidden++}`; out = out.derive(h, `${name} == ${name} ? 1 : 0`); by.push(h); }
       by.push(o.desc ? `-${name}` : name);
@@ -606,22 +607,30 @@ function renameRelation(rel, names) {
 function compileSet(body, env, outer) {
   if (body.k === 'query') return compileQuery(body, env, outer);
   if (body.k === 'select') return compileSelect(body, env, outer, { orderBy: [], limit: null, offset: 0 });
-  const L = compileSet(body.left, env, outer), R = compileSet(body.right, env, outer);
+  let L = compileSet(body.left, env, outer);
+  const R = compileSet(body.right, env, outer);
   if (L.names.length !== R.names.length) fail(`${body.op.toUpperCase()} needs the same number of columns on each side (${L.names.length} and ${R.names.length})`);
+  // NULL columns on one side become the other side's kind (text: '')
+  const asText = (rel, k) => { const tmp = `__nt${env.n.hidden++}`; const names = rel.names.map((nm, j) => (j === k ? tmp : nm)); return { ...rel, query: rel.query.textmap(tmp, { fn: () => '', label: 'null' }).select(...names), names }; };
+  let Lr = L, Rr = R;
   L.names.forEach((n, k) => {
     const a = L.kinds.get(n), b = R.kinds.get(R.names[k]);
-    if ((a === 'text') !== (b === 'text')) fail(`${body.op.toUpperCase()} column ${k + 1} is ${a} on one side and ${b} on the other`);
+    if (a === 'null' && b === 'text') Lr = asText(Lr, k);
+    else if (b === 'null' && a === 'text') Rr = asText(Rr, k);
+    else if (a !== 'null' && b !== 'null' && (a === 'text') !== (b === 'text')) fail(`${body.op.toUpperCase()} column ${k + 1} is ${a} on one side and ${b} on the other`);
   });
   const names = L.names;
-  const right = R.query; // (columns by position; named as the left's)
+  const kindsOut = new Map(L.names.map((n, k) => [n, L.kinds.get(n) === 'null' ? R.kinds.get(R.names[k]) : L.kinds.get(n)]));
+  const right = Rr.query; // (columns by position; named as the left's)
+  L = Lr.names === L.names ? L : { ...L, query: Lr.query.derive(L.names[Lr.names.findIndex((x, j) => x !== L.names[j])], Lr.names[Lr.names.findIndex((x, j) => x !== L.names[j])]).select(...L.names) };
   const typeOf = (nm) => { const k = names.indexOf(nm); return merge([L.typeOf?.(nm) ?? 'float', R.typeOf?.(R.names[k]) ?? 'float']); };
-  if (body.op === 'union all') return { query: Query.union([L.query, right]), names, kinds: L.kinds, typeOf };
-  if (body.op === 'union') return { query: Query.union([L.query, right]).groupBy(names).agg({ __u: 'count()' }).select(...names), names, kinds: L.kinds, typeOf };
+  if (body.op === 'union all') return { query: Query.union([L.query, right]), names, kinds: kindsOut, typeOf };
+  if (body.op === 'union') return { query: Query.union([L.query, right]).groupBy(names).agg({ __u: 'count()' }).select(...names), names, kinds: kindsOut, typeOf };
   // INTERSECT / EXCEPT: both sides marked, grouped by every column
   const mark = (rel, m) => rel.query.derive('__src', String(m)).select(...rel.names, '__src');
   const grouped = Query.union([mark(L, 1), mark(R, 2)]).groupBy(names).agg({ __mn: 'min(__src)', __mx: 'max(__src)' });
   const kept = body.op === 'intersect' ? grouped.filter('__mn == 1 && __mx == 2') : grouped.filter('__mx == 1');
-  return { query: kept.select(...names), names, kinds: L.kinds, typeOf };
+  return { query: kept.select(...names), names, kinds: kindsOut, typeOf };
 }
 
 // FROM item -> relation
@@ -717,7 +726,17 @@ function compileSelect(ast, env, outer, tail) {
   const usingMap = new Map();
   // (the joins run after the translator below is set up: function declarations)
   function addJoin(j) {
-    const right = relationOf(j, env, outer);
+    let right = relationOf(j, env, outer);
+    if (j.on && (j.how === 'left' || j.how === 'right' || j.how === 'full')) { // ON conditions on the right table alone: it is filtered first
+      const own = (c) => !has(c, (x) => x.k === 'subq' || x.k === 'exists' || x.k === 'insub') && colRefs(c).length > 0 && colRefs(c).every((ref) => (ref.table ? ref.table.toLowerCase() === j.alias.toLowerCase() : right.names.includes(ref.name) && !scope.some((s) => s.names.has(ref.name))));
+      const isKey = (c) => c.k === 'bin' && c.op === '=' && c.l.k === 'col' && c.r.k === 'col' && !(own(c));
+      const mine = conjuncts(j.on).filter((c) => !isKey(c) && own(c));
+      if (mine.length && j.how === 'left') {
+        const inner = { k: 'query', ctes: [], body: { k: 'select', distinct: false, items: [{ e: { k: 'star' }, alias: null }], from: { ...j, alias: j.alias }, joins: [], where: andAll(mine), groupBy: [], having: null }, orderBy: [], limit: null, offset: 0 };
+        j = { ...j, q: inner, on: andAll(conjuncts(j.on).filter((c) => !mine.includes(c))) };
+        right = relationOf(j, env, outer);
+      }
+    }
     const rs = { alias: j.alias, rel: right, names: new Map() };
     const rightHas = (name) => right.names.includes(name);
     const outerJoin = j.how === 'left' || j.how === 'right' || j.how === 'full';
@@ -1199,6 +1218,14 @@ function compileSelect(ast, env, outer, tail) {
           case 'DOW': case 'DAYOFWEEK': need(1); { const w = call('weekday', a[0]); return bin('-', w, bin('*', call('floor', bin('/', w, num(7))), num(7))); } // 0 = Sunday
           case 'WEEKDAY': case 'ISODOW': need(1); return call('weekday', a[0]);
           case 'NOW': case 'CURRENT_TIMESTAMP': return num(Date.now());
+          case 'EPOCH': need(1); return bin('/', a[0], num(1000)); // EXTRACT(EPOCH FROM ts): seconds since 1970
+          case 'DATE_PART': { // date_part('year', ts)
+            need(2);
+            const part = e.args[0].k === 'str' ? e.args[0].v.toUpperCase() : null;
+            if (part === 'EPOCH') return bin('/', a[1], num(1000));
+            if (!DATE_PART[part]) fail(`DATE_PART('${e.args[0].v}', ...): use year, month, day, hour, minute, second or epoch`);
+            return call(DATE_PART[part], a[1]);
+          }
           default:
             if (sessionFn(e)) return constValue(sessionFn(e), ctx);
             if (extraFn(e)) { const fx = extraFn(e); return valueColumn(ctx, e.args.map((x) => argOf(x, ctx)), (xs) => fx.f(...xs), { text: fx.out === 'text', skip: true, label: e.fn.toLowerCase() }); }
@@ -1443,7 +1470,7 @@ function compileSelect(ast, env, outer, tail) {
     if (tail.limit !== null && tail.limit !== undefined) out = out.limit(tail.limit, tail.offset);
     else if (tail.offset) fail('OFFSET needs LIMIT');
     const names = outs.map((o) => o.name);
-    const outKinds = new Map(outs.map((o) => [o.name, kindFn(o) ?? 'number']));
+    const outKinds = new Map(outs.map((o) => [o.name, o.e.k === 'null' ? 'null' : kindFn(o) ?? 'number'])); // (a NULL column matches any kind in a UNION)
     if (outs.some((o) => o.col !== o.name)) { // (through fresh names: an output may be named like another's column)
       const tmp = new Map([...new Set(outs.map((o) => o.col))].map((c) => [c, `__f${n.hidden++}`]));
       for (const [c, t] of tmp) out = out.derive(t, c);

@@ -41,6 +41,7 @@ const t = engine.table(orders);
 const customers = engine.table({ cust: Array.from({ length: 300 }, (_, i) => i), tier: Array.from({ length: 300 }, (_, i) => 1 + (i % 3)) });
 // a data folder: CSV, JSON lines, Arrow, a dataset, and a link to a file outside it
 writeFileSync(join(dir, 'people.csv'), 'id,name\n1,Ann\n2,"Bo, Jr"\n');
+writeFileSync(join(dir, 'names.csv'), `cust,label\n${Array.from({ length: 100 }, (_, i) => `${i},Customer number ${i}`).join('\n')}\n`); // (all different: free text, served as categories)
 writeFileSync(join(dir, 'events.jsonl'), '{"k":"a","v":1}\n{"k":"b","v":2.5}\n');
 writeFileSync(join(dir, 'tiers.arrow'), customers.toArrow({ file: true }));
 engine.writeDataset(join(dir, 'big.vectro'), t, { rowsPerChunk: 7000 });
@@ -60,8 +61,10 @@ const QUERIES = [
   'SELECT name, id FROM people ORDER BY id',
   'SELECT k, v FROM events ORDER BY k',
   'SELECT tier, COUNT(*) AS n FROM tiers GROUP BY tier ORDER BY tier',
+  "SELECT n.label, COUNT(*) AS orders FROM orders o JOIN names n ON o.cust = n.cust WHERE n.label LIKE '%7%' GROUP BY 1 ORDER BY orders DESC, 1 LIMIT 5",
+  'SELECT n.label, COUNT(*) AS orders FROM big o JOIN names n ON o.cust = n.cust GROUP BY 1 ORDER BY orders DESC, 1 LIMIT 5',
 ];
-const tablesNow = { orders: t, customers, big: s.tables.get('big')?.table, people: s.tables.get('people')?.table, events: s.tables.get('events')?.table, tiers: s.tables.get('tiers')?.table };
+const tablesNow = { orders: t, customers, names: s.tables.get('names')?.table, big: s.tables.get('big')?.table, people: s.tables.get('people')?.table, events: s.tables.get('events')?.table, tiers: s.tables.get('tiers')?.table };
 check(s.tables.has('big') && s.tables.has('people') && s.tables.has('events') && s.tables.has('tiers'), `folder tables: ${[...s.tables.keys()]}`);
 check(!s.tables.has('secret'), 'a link to a file outside the folder is not served');
 for (const text of QUERIES) {
