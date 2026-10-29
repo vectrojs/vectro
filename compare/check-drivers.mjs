@@ -7,6 +7,8 @@
 //     a parameter, GetSchema
 //   Microsoft's OData libraries (Microsoft.OData.Edm / Core 7.10, Simple.OData.Client):
 //     the OData feed's $metadata parsed and validated, filters, $count, paging
+//   Python (when VECTRO_PYTHON, or python3, has adbc-driver-flightsql, pyarrow,
+//     pandas, polars, duckdb): the Flight SQL server through ADBC and pyarrow.flight
 //   node compare/check-drivers.mjs      (needs java and dotnet; downloads the drivers)
 import { mkdirSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -16,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { Engine } from '../src/node.mjs';
 import { servePg } from '../src/serve/pg.mjs';
 import { serve } from '../src/serve/http.mjs';
+import { serveFlight } from '../src/serve/flight.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url)), drivers = join(here, 'drivers'), cache = join(drivers, '.cache');
 mkdirSync(cache, { recursive: true });
@@ -63,7 +66,22 @@ expect('OData (Microsoft.OData 7.10, Simple.OData.Client)', od.out, [
   /filtered: 1 rows; first 1 2024-01-02T03:04:05\.0000000\+00:00 EU 2/, /count: 1\n/, /paged: 2000 of 2000 rows in 7 pages/, /dates: 2 rows; first signup 2024-/,
 ]);
 await web.close();
+const python = process.env.VECTRO_PYTHON ?? 'python3';
+const has = await run(python, ['-c', 'import adbc_driver_flightsql, pyarrow.flight, pandas, polars, duckdb']);
+let checked = 3;
+if (has.code === 0) {
+  const fs = await serveFlight({ tables: { orders, customers }, port: 0, engine, user: 'me', password: 'pw' });
+  const py = await run(python, [join(drivers, 'flight_check.py'), fs.url, 'me', 'pw']);
+  expect('Flight SQL (ADBC, pandas, Polars, DuckDB, pyarrow.flight)', py.out, [
+    /adbc arrow: \['string', 'int64'\] \[\{'region': 'EU', 'n': 1\}, \{'region': 'US', 'n': 1\}\]/,
+    /pandas: \['int64', 'float64', 'str', 'datetime64\[ms, UTC\]'\] \[np\.int64\(1\), np\.float64\(10\.5\), 'EU', Timestamp\('2024-01-02 03:04:05\+0000', tz='UTC'\)\]/,
+    /polars: Schema\(\{'region': String, 's': Float64\}\) \[\('EU', 10\.5\), \('US', None\)\]/, /duckdb: \[\('EU', 1\), \('US', 1\)\]/,
+    /objects: vectro \['customers', 'orders'\] \['cust', 'name', 'tier', 'signup_date'\]/, /pyarrow flight actions: \['ClosePreparedStatement', 'CreatePreparedStatement'\]/,
+  ]);
+  await fs.close();
+  checked++;
+} else console.log(`(no Python with adbc-driver-flightsql, pyarrow, pandas, polars, duckdb: Flight SQL not checked; set VECTRO_PYTHON)`);
 await server.close();
 await engine.close();
-console.log(bad ? `${bad} of 3 checks differ` : 'every driver gets the answers it expects');
+console.log(bad ? `${bad} of ${checked} checks differ` : `every driver gets the answers it expects (${checked} checks)`);
 process.exit(bad ? 1 : 0);

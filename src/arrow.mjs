@@ -768,3 +768,138 @@ export function writeArrow(columns, { file = false, dates = [] } = {}) {
   tail.set(MAGIC, 4);
   return concatBytes([head, schema, ...parts.map((p) => p.bytes), EOS, footer, tail]);
 }
+
+// ---- typed messages (Flight SQL) ----------------------------------------------------
+// Arrow IPC messages for given column types, one message at a time (a Flight
+// stream sends each as FlightData: its flatbuffer header and its body).
+// fields: [{ name, type, nullable = true }], type one of
+//   utf8, binary, int8, int16, int32, int64, bool, float64,
+//   timestamp (ms, UTC), date32, dict (utf8 labels with int32 codes; one dictionary)
+// Values: arrays; null / undefined (and NaN for numbers) are nulls. A dict
+// column is { codes, labels } (label '' is null) or an array of strings.
+const INT_BITS = { int8: 8, int16: 16, int32: 32, int64: 64 };
+function typedField(f, k) {
+  const nullable = ['bool', f.nullable !== false];
+  if (f.type === 'dict') return tbl(['off', f.name], nullable, ['u8', T.Utf8], ['off', tbl()], ['off', tbl(['i64', k], ['off', tbl(['i32', 32], ['bool', 1])], ['bool', 0])], ['off', { vec: [] }]);
+  const [typeId, type] = INT_BITS[f.type] ? [T.Int, tbl(['i32', INT_BITS[f.type]], ['bool', 1])]
+    : f.type === 'float64' ? [T.FloatingPoint, tbl(['i16', 2])]
+      : f.type === 'utf8' ? [T.Utf8, tbl()] : f.type === 'binary' ? [T.Binary, tbl()] : f.type === 'bool' ? [T.Bool, tbl()]
+        : f.type === 'timestamp' ? [T.Timestamp, tbl(['i16', 1], ['off', 'UTC'])] : f.type === 'date32' ? [T.Date, tbl(['i16', 0])]
+          : (() => { throw new Error(`vectro: Arrow type ${f.type} is not supported here`); })();
+  return tbl(['off', f.name], nullable, ['u8', typeId], ['off', type], null, ['off', { vec: [] }]);
+}
+// The schema message ({ bytes, metaLength, bodyLength }).
+export function typedSchema(fields) { return message(MESSAGE.schema, tbl(['i16', 0], ['off', { vec: fields.map(typedField) }])); }
+
+const missingValue = (v) => v === null || v === undefined || (typeof v === 'number' && v !== v);
+function validity(n, missing) { // a bitmap, or no buffer when nothing is missing
+  let nulls = 0;
+  const bits = new Uint8Array((n + 7) >> 3);
+  for (let i = 0; i < n; i++) { if (missing(i)) nulls++; else bits[i >> 3] |= 1 << (i & 7); }
+  return [nulls, nulls ? bits : new Uint8Array(0)];
+}
+function textBuffers(n, get) { // offsets and bytes of n strings (null: empty)
+  const parts = new Array(n), offsets = new Int32Array(n + 1);
+  for (let i = 0; i < n; i++) { const s = get(i); const b = s === null || s === undefined ? new Uint8Array(0) : typeof s === 'string' ? enc.encode(s) : s; parts[i] = b; offsets[i + 1] = offsets[i] + b.length; }
+  return [asBytes(offsets), concatBytes(parts)];
+}
+// The dictionary message of dict column k ({ bytes, metaLength, bodyLength }).
+export function typedDictionary(k, labels) {
+  const [offs, data] = textBuffers(labels.length, (i) => labels[i]);
+  const rb = recordBatch(labels.length, [[labels.length, 0]], [new Uint8Array(0), offs, data]);
+  return message(MESSAGE.dictionary, tbl(['i64', k], ['off', rb.header], ['bool', 0]), rb.buffers, rb.bodyLength);
+}
+// (number columns in tight loops: no call per value)
+function numberValidity(arr, from, n) {
+  let nulls = 0;
+  const bits = new Uint8Array((n + 7) >> 3);
+  for (let i = 0; i < n; i++) { const v = arr[from + i]; if (v === v) bits[i >> 3] |= 1 << (i & 7); else nulls++; }
+  return [nulls, nulls ? bits : new Uint8Array(0)];
+}
+function int64Words(arr, from, n) {
+  const w = new Int32Array(2 * n);
+  for (let i = 0; i < n; i++) { const v = arr[from + i]; if (v === v) { const x = Math.round(v), hi = Math.floor(x / 4294967296); w[2 * i] = x - hi * 4294967296; w[2 * i + 1] = hi; } }
+  return w;
+}
+function codedText(col, from, n) { // utf8 from { codes, labels }: label bytes made once
+  const bytes = col.labels.map((l) => enc.encode(l ?? '')), codes = col.codes, offsets = new Int32Array(n + 1);
+  const empty = Uint8Array.from(col.labels, (l) => (l === undefined || l === '' ? 1 : 0));
+  const lens = Int32Array.from(bytes, (b) => b.length);
+  const bits = new Uint8Array((n + 7) >> 3);
+  const nulls = textOffsets(codes, from, n, lens, empty, offsets, bits);
+  // all labels' bytes in one array, each row's copied byte by byte (short labels: faster than set())
+  const starts = new Int32Array(bytes.length + 1);
+  bytes.forEach((b, j) => { starts[j + 1] = starts[j] + b.length; });
+  const all = new Uint8Array(starts[bytes.length]);
+  bytes.forEach((b, j) => all.set(b, starts[j]));
+  const data = new Uint8Array(offsets[n]);
+  copyLabels(codes, from, n, starts, all, data, bytes.length);
+  return [nulls, nulls ? bits : new Uint8Array(0), asBytes(offsets), data];
+}
+
+function textOffsets(codes, from, n, lens, empty, offsets, bits) {
+  let nulls = 0, o = 0;
+  const L = lens.length;
+  for (let i = 0; i < n; i++) {
+    const c = codes[from + i];
+    if (c >= L || empty[c]) nulls++; else { bits[i >> 3] |= 1 << (i & 7); o += lens[c]; }
+    offsets[i + 1] = o;
+  }
+  return nulls;
+}
+function copyLabels(codes, from, n, starts, all, data, L) {
+  let o = 0;
+  for (let i = 0; i < n; i++) {
+    const c = codes[from + i];
+    if (c >= L) continue;
+    for (let j = starts[c], e = starts[c + 1]; j < e; j++) data[o++] = all[j];
+  }
+}
+
+// A record batch message of rows [from, to) of columns (arrays as above).
+export function typedBatch(fields, columns, from, to) {
+  const n = to - from, nodes = [], buffers = [];
+  fields.forEach((f, k) => {
+    const col = columns[k], at = (i) => col[from + i];
+    if (col instanceof Float64Array && (f.type === 'float64' || f.type === 'int64' || f.type === 'timestamp')) {
+      const [nulls, valid] = numberValidity(col, from, n);
+      nodes.push([n, nulls]);
+      buffers.push(valid, f.type === 'float64' ? asBytes(col.subarray(from, to)) : asBytes(int64Words(col, from, n)));
+      return;
+    }
+    if (f.type === 'utf8' && col && col.codes) {
+      const [nulls, valid, offsets, data] = codedText(col, from, n);
+      nodes.push([n, nulls]);
+      buffers.push(valid, offsets, data);
+      return;
+    }
+    if (f.type === 'dict') {
+      const coded = col && col.codes, labels = coded ? col.labels : null;
+      const code = coded ? (i) => col.codes[from + i] : null;
+      const [nulls, valid] = validity(n, coded ? (i) => { const l = labels[code(i)]; return l === undefined || l === ''; } : (i) => missingValue(at(i)) || at(i) === '');
+      const codes = new Int32Array(n);
+      if (coded) for (let i = 0; i < n; i++) codes[i] = code(i);
+      else throw new Error('vectro: a dict column needs { codes, labels }');
+      nodes.push([n, nulls]); buffers.push(valid, asBytes(codes));
+      return;
+    }
+    const [nulls, valid] = validity(n, (i) => missingValue(at(i)));
+    nodes.push([n, nulls]);
+    if (f.type === 'utf8' || f.type === 'binary') { const [o, d] = textBuffers(n, at); buffers.push(valid, o, d); return; }
+    if (f.type === 'bool') { const bits = new Uint8Array((n + 7) >> 3); for (let i = 0; i < n; i++) if (!missingValue(at(i)) && at(i)) bits[i >> 3] |= 1 << (i & 7); buffers.push(valid, bits); return; }
+    if (f.type === 'float64') { const v = new Float64Array(n); for (let i = 0; i < n; i++) v[i] = missingValue(at(i)) ? 0 : at(i); buffers.push(valid, asBytes(v)); return; }
+    if (f.type === 'int64' || f.type === 'timestamp') {
+      const w = new Int32Array(2 * n);
+      for (let i = 0; i < n; i++) { const x = at(i); if (missingValue(x)) continue; const v = Math.round(typeof x === 'bigint' ? Number(x) : x), hi = Math.floor(v / 4294967296); w[2 * i] = v - hi * 4294967296; w[2 * i + 1] = hi; }
+      buffers.push(valid, asBytes(w));
+      return;
+    }
+    const Typed = f.type === 'int8' ? Int8Array : f.type === 'int16' ? Int16Array : Int32Array; // int8 / 16 / 32, date32 (days)
+    const v = new Typed(n);
+    for (let i = 0; i < n; i++) { const x = at(i); if (!missingValue(x)) v[i] = f.type === 'date32' ? Math.floor(x / 86_400_000) : x; }
+    buffers.push(valid, asBytes(v));
+  });
+  const rb = recordBatch(n, nodes, buffers);
+  return message(MESSAGE.batch, rb.header, rb.buffers, rb.bodyLength);
+}
+export { EOS as ARROW_EOS };

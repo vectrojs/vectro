@@ -419,6 +419,33 @@ ODBC, and every driver. Queries arrive in each tool's own SQL and run on Vectro'
 
 ![Metabase dashboard on Vectro, 10M orders](docs/img/metabase-vectro.jpg)
 
+## Arrow Flight SQL: pandas, Polars, DuckDB
+
+```sh
+npx vectro serve --root ~/data --flight 31337            # grpc://localhost:31337 (--user / --password, --tls-cert / --tls-key)
+```
+
+```python
+import adbc_driver_flightsql.dbapi as flight              # pip install adbc-driver-flightsql
+with flight.connect('grpc://localhost:31337') as conn:
+    df = conn.cursor().execute('SELECT region, SUM(qty) FROM orders GROUP BY 1').fetch_df()   # pandas
+    # polars.read_database(sql, conn); duckdb.sql('... FROM arrow') on fetch_arrow_table()
+```
+
+Flight SQL answers in Arrow, column by column, so nothing is turned into
+rows on either side: the fastest way to move Vectro's results into Python or
+any Arrow tool. gRPC (HTTP/2) and protobuf are written in `src/serve/flight.mjs`
+with no dependencies. Served: statements and prepared statements, the
+catalog (catalogs, schemas, tables with their Arrow schemas, table types;
+`adbc_get_objects` works), sign-in with a user name and password (Handshake,
+then a bearer token). Columns come typed: whole numbers int64, other numbers
+float64, text utf8, dates timestamp[ms, UTC] (or date32), booleans bool.
+Checked with the ADBC Flight SQL driver, pandas, Polars, DuckDB and
+pyarrow.flight (`compare/check-drivers.mjs`). On 10M orders: a group-by
+answers in 97 ms; all 10M rows (9 columns, 790 MB as Arrow) arrive in 2.9 s,
+against 19.3 s for the same rows through the PostgreSQL protocol (pgJDBC).
+Not yet: parameters for prepared statements (DoPut), writes.
+
 ## For AI assistants (MCP server)
 
 `mcp/server.mjs` lets Claude, ChatGPT or any MCP client analyze your data
@@ -678,7 +705,7 @@ than memory, quoted-CSV loading.
 ## Layout
 
 ```
-src/         the engine (Node, browser and portable entry points); src/serve: the HTTP and PostgreSQL servers
+src/         the engine (Node, browser and portable entry points); src/serve: the HTTP (and OData), PostgreSQL and Flight SQL servers
 bin/         the vectro command (vectro serve)
 mcp/         the MCP server for AI assistants
 dist/        vectro.wasm, the precompiled kernels for edge runtimes (npm run build)

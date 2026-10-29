@@ -2,7 +2,7 @@
 // vectro serve --root ~/data [--port 8787] [--pg 5433] ...
 //   Serves the CSV, TSV, JSON-lines, Arrow and .vectro files in the folder as
 //   SQL tables over HTTP and / or the PostgreSQL protocol (src/serve/).
-import { serve, servePg, openTables } from '../src/serve/index.mjs';
+import { serve, servePg, serveFlight, openTables } from '../src/serve/index.mjs';
 
 const [command, ...rest] = process.argv.slice(2);
 const HELP = `usage: vectro serve --root <folder> [options]
@@ -21,7 +21,10 @@ const HELP = `usage: vectro serve --root <folder> [options]
     --tls-cert <file> --tls-key <file>  encrypted connections
     --database <name>      the database name reported (vectro)
     --log-queries          print every statement clients send
-  Both:
+  Arrow Flight SQL (pandas, Polars, DuckDB through ADBC):
+    --flight 31337         also serve Flight SQL on this port (grpc://host:31337)
+                           (--user / --password and --tls-cert / --tls-key as above)
+  All:
     --host 127.0.0.1       the address to listen on (0.0.0.0: every network)
     --quiet
 
@@ -61,6 +64,13 @@ try {
     });
     running.push(p);
     log(`PostgreSQL at ${p.host}:${p.port} (database ${option('database', 'vectro')}${certFile ? ', TLS' : ''}): psql -h ${p.host} -p ${p.port} -U ${option('user', 'vectro')} ${option('database', 'vectro')}`);
+  }
+  const flightPort = option('flight', null);
+  if (flightPort !== null) {
+    const certFile = option('tls-cert', null), keyFile = option('tls-key', null);
+    const f = await serveFlight({ catalog, port: Number(flightPort), host, user: option('user', null), password: option('password', process.env.VECTRO_PG_PASSWORD ?? null), tls: certFile && keyFile ? { certFile, keyFile } : null, database: option('database', 'vectro'), log, logQueries: rest.includes('--log-queries') });
+    running.push(f);
+    log(`Flight SQL at ${f.url}`);
   }
   log(`${catalog.entries.size} table(s): ${[...catalog.entries].map(([n, e]) => `${n} (${e.table.length.toLocaleString()} rows)`).join(', ') || 'none'}`);
   const stop = () => Promise.all(running.map((s) => s.close())).then(() => catalog.close()).then(() => process.exit(0));
