@@ -83,7 +83,18 @@ must reach Vectro's port.
 Tableau uses the pgJDBC driver, which `compare/check-drivers.mjs` checks
 (schemas, tables, columns, prepared statements, cursors).
 
-## 5. Excel, Google Sheets, pandas (no driver)
+## 5. OData feed: Power BI, Excel and Tableau with no driver
+
+The HTTP server (`--port 8787`, on unless `--no-http`) also serves OData v4 at
+`/odata`. Power BI and Excel: Get Data > **OData feed**, URL
+`http://localhost:8787/odata`; Tableau: Connect > To a Server > **OData**.
+Each table appears with its column types; filters, chosen columns, sorting
+and the first rows are worked out by Vectro, a page of 50,000 rows at a time.
+With `--token secret`, sign in with **Basic**: any user name, the token as
+the password. OData is best for filtered or summarised data (Import mode);
+for live dashboards on large tables, the PostgreSQL connector above is faster.
+
+## 6. Excel, Google Sheets, pandas (no driver)
 
 Start the HTTP server too (`--port 8787`, it runs unless `--no-http`):
 

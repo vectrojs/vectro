@@ -1,3 +1,5 @@
 .cache/
 powerbi/bin/
 powerbi/obj/
+odata/bin/
+odata/obj/

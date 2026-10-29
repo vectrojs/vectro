@@ -5,7 +5,9 @@
 //   Npgsql 4.0.17 (the one inside Power BI's PostgreSQL connector): type
 //     loading, Power BI's own catalog queries, binary rows, a folded group-by,
 //     a parameter, GetSchema
-//   node compare/check-drivers.mjs      (needs java and dotnet; downloads both drivers)
+//   Microsoft's OData libraries (Microsoft.OData.Edm / Core 7.10, Simple.OData.Client):
+//     the OData feed's $metadata parsed and validated, filters, $count, paging
+//   node compare/check-drivers.mjs      (needs java and dotnet; downloads the drivers)
 import { mkdirSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -13,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
 import { Engine } from '../src/node.mjs';
 import { servePg } from '../src/serve/pg.mjs';
+import { serve } from '../src/serve/http.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url)), drivers = join(here, 'drivers'), cache = join(drivers, '.cache');
 mkdirSync(cache, { recursive: true });
@@ -34,7 +37,7 @@ const run = (cmd, args, opts = {}) => new Promise((done) => {
 
 const engine = new Engine();
 const orders = engine.table({ cust: [1, 2], price: [10.5, NaN], qty: [2, 1], region: ['EU', 'US'], ts: [new Date('2024-01-02T03:04:05Z'), NaN], d: [new Date('2024-01-02'), NaN], ok: [1, 0] });
-const customers = engine.table({ cust: [1], name: ['Ann'], tier: [1] });
+const customers = engine.table({ cust: Array.from({ length: 2000 }, (_, i) => i + 1), name: Array.from({ length: 2000 }, (_, i) => `c${i}`), tier: Array.from({ length: 2000 }, (_, i) => 1 + (i % 3)), signup_date: Array.from({ length: 2000 }, (_, i) => new Date(Date.UTC(2024, 0, 1) + i * 86_400_000)) });
 const server = await servePg({ tables: { orders, customers }, port: 0, user: 'postgres', password: 'secret', engine });
 let bad = 0;
 const expect = (label, out, patterns) => {
@@ -53,7 +56,14 @@ expect('Npgsql 4.0.17 (Power BI)', npgsql.out, [
   /server 16\.0/, /UTF8/, /public \| orders \| BASE TABLE/, /cust:bigint:Int64, price:double precision:Double, qty:bigint:Int64, region:text:String, ts:timestamp:DateTime, d:date:DateTime/,
   /1 \| 10\.5 \| 2 \| EU \| 2024-01-02T03:04:05\.0000000 \| 2024-01-02T00:00:00\.0000000 \| 1/, /EU \| 10\.5\n {2}\(1 rows\)/, /param query: 1/, /GetSchema Tables: 2 rows/, /GetSchema Columns: 7 rows/,
 ]);
+const web = await serve({ tables: { orders, customers }, port: 0, engine, odataPage: 300 });
+const od = await run('dotnet', ['run', '--project', join(drivers, 'odata'), '--', `${web.url}/odata/`]);
+expect('OData (Microsoft.OData 7.10, Simple.OData.Client)', od.out, [
+  /metadata valid: True/, /orders: key cust; cust Edm\.Int64, price Edm\.Double, qty Edm\.Int64, region Edm\.String, ts Edm\.DateTimeOffset, d Edm\.Date, ok Edm\.Int64/,
+  /filtered: 1 rows; first 1 2024-01-02T03:04:05\.0000000\+00:00 EU 2/, /count: 1\n/, /paged: 2000 of 2000 rows in 7 pages/, /dates: 2 rows; first signup 2024-/,
+]);
+await web.close();
 await server.close();
 await engine.close();
-console.log(bad ? `${bad} of 2 drivers differ` : 'both drivers get the answers PostgreSQL would give');
+console.log(bad ? `${bad} of 3 checks differ` : 'every driver gets the answers it expects');
 process.exit(bad ? 1 : 0);

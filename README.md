@@ -352,8 +352,20 @@ curl 'http://127.0.0.1:8787/sql?q=SELECT region, COUNT(*) AS n FROM orders GROUP
 | `GET /tables`, `GET /tables/<name>` | table names, rows, column types |
 | `GET /tables/<name>/rows?format=csv` | a whole table |
 | `POST /reload` | reads the data folder again (new files become tables) |
+| `GET /odata`, `/odata/$metadata`, `/odata/<table>?$filter=...` | an OData v4 feed (below) |
 
 - **Excel** (Windows and Mac): Data > Get Data > From Web, then the `/sql?...&format=csv` URL. **Power BI Desktop**: Get Data > Web, the same URL (Import mode; Refresh runs the query again). The Power BI Service and **Google Sheets** (`=IMPORTDATA("https://.../sql?q=...&format=csv&token=...")`) fetch from the cloud, so they need a public address or, for Power BI, a gateway.
+- **OData feed** (`/odata`, OData v4): Power BI and Excel (Get Data > OData
+  feed, `http://host:8787/odata`) and Tableau (OData connector) see every table
+  with its column types, and their filters, column choices, sorting and
+  paging run in Vectro (`$filter`, `$select`, `$orderby`, `$top`, `$skip`,
+  `$count`, `$apply=groupby(...)/aggregate(...)`, pages of 50,000 rows with
+  `@odata.nextLink`). With `--token`, give any user name and the token as the
+  password (Basic). Checked with Microsoft's OData libraries (the CSDL
+  validator and Simple.OData.Client, in `compare/check-drivers.mjs`). On 10M
+  orders: a filtered page answers in 44 ms, a 50,000-row page in 0.13 s, a
+  group-by in 28 ms; for importing all of a very large table, use the
+  PostgreSQL connector (pages far into a table cost more).
 - **pandas / Polars**: `pd.read_csv(url)`, `pl.read_csv(url)`; Arrow is ten times faster to fetch: `pyarrow.ipc.open_stream(urlopen(url + '&format=arrow')).read_all()`.
 - **In your own app**: `import { serve } from 'vectrojs/serve'; await serve({ tables: { orders }, port: 8787 })`.
 - **Safety**: listens on 127.0.0.1 unless `--host` is given; `--token <secret>` requires `Authorization: Bearer <secret>` (or `&token=` for tools that can't send headers); SQL here only reads; files outside the folder are never read (links that lead out are skipped).

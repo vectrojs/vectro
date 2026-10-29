@@ -20,6 +20,7 @@ import { once } from 'node:events';
 import { timingSafeEqual } from 'node:crypto';
 import { sql } from '../node.mjs';
 import { openTables, LoadError } from './catalog.mjs';
+import { odata, ODataError } from './odata.mjs';
 import { FORMATS, columnsOf, encode } from './formats.mjs';
 
 const MAX_BODY = 1 << 20;
@@ -28,7 +29,7 @@ class HttpError extends Error { constructor(status, message) { super(message); t
 
 // catalog: tables opened with openTables (catalog.mjs), to share them with
 // the PostgreSQL server; else tables / root / engine open them here.
-export async function serve({ tables = {}, root = null, engine = null, catalog = null, port = 8787, host = '127.0.0.1', token = null, cors = false, log = () => {} } = {}) {
+export async function serve({ tables = {}, root = null, engine = null, catalog = null, port = 8787, host = '127.0.0.1', token = null, cors = false, odataPage = 50_000, log = () => {} } = {}) {
   const shared = !!catalog;
   catalog ??= await openTables({ tables, root, engine, log });
   const entries = catalog.entries, rootPath = catalog.root;
@@ -36,7 +37,9 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
 
   const allowed = (req, url) => {
     if (!token) return true;
-    const given = (req.headers.authorization ?? '').replace(/^Bearer\s+/i, '') || url.searchParams.get('token') || '';
+    const auth = req.headers.authorization ?? '';
+    const basic = /^Basic\s+(.+)$/i.exec(auth); // (Basic: any user name, the token as the password: Power BI's and Excel's OData credentials)
+    const given = basic ? Buffer.from(basic[1], 'base64').toString().replace(/^[^:]*:/, '') : auth.replace(/^Bearer\s+/i, '') || url.searchParams.get('token') || '';
     const a = Buffer.from(given), b = Buffer.from(token);
     return a.length === b.length && timingSafeEqual(a, b);
   };
@@ -102,9 +105,24 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
       res.setHeader('access-control-allow-headers', 'authorization, content-type');
       if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
     }
-    if (!allowed(req, url)) throw new HttpError(401, 'this server needs a token: send "Authorization: Bearer <token>" or add ?token=');
+    if (!allowed(req, url)) { res.setHeader('WWW-Authenticate', 'Basic realm="vectro"'); throw new HttpError(401, 'this server needs a token: send "Authorization: Bearer <token>", Basic with the token as the password, or add ?token='); }
     const path = url.pathname.replace(/\/+$/, '') || '/';
     const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
+    if (path === '/odata' || path.startsWith('/odata/')) {
+      if (req.method !== 'GET') throw new HttpError(405, 'OData here is read only: use GET');
+      const params = new URLSearchParams(url.search);
+      params.delete('token');
+      const host = req.headers['x-forwarded-host'] ?? req.headers.host ?? 'localhost';
+      let r;
+      try { r = await odata({ path, params, named: named(), base: `http://${host}/odata`, headers: req.headers, pageSize: odataPage }); } catch (err) {
+        if (err instanceof ODataError || /^vectro/.test(err.message)) { res.writeHead(err.status ?? 400, { 'content-type': 'application/json', 'OData-Version': '4.0' }); return res.end(JSON.stringify({ error: { code: String(err.status ?? 400), message: err.message.replace(/^vectro( SQL)?:\s*/, '') } })); }
+        throw err;
+      }
+      log(`odata ${decodeURIComponent(url.pathname + url.search).slice(0, 200)}`);
+      res.writeHead(r.status, r.headers);
+      for (const chunk of r.body) if (!res.write(chunk)) await once(res, 'drain');
+      return res.end();
+    }
     if (path === '/sql') {
       if (req.method !== 'GET' && req.method !== 'POST') throw new HttpError(405, 'use GET or POST');
       const text = await sqlOf(req, url), format = formatOf(url), limit = limitOf(url);
@@ -129,7 +147,7 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
     if (path === '/' && req.method === 'GET') {
       return json(res, 200, {
         server: 'vectro',
-        endpoints: { sql: '/sql?q=SELECT ...&format=json|csv|ndjson|arrow', tables: '/tables', table: '/tables/<name>', rows: '/tables/<name>/rows?format=csv' },
+        endpoints: { sql: '/sql?q=SELECT ...&format=json|csv|ndjson|arrow', tables: '/tables', table: '/tables/<name>', rows: '/tables/<name>/rows?format=csv', odata: '/odata (an OData v4 feed: Power BI, Excel, Tableau)' },
         tables: [...entries.keys()],
       });
     }
