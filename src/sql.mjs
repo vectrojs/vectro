@@ -71,7 +71,7 @@ function tokenize(src) {
     const id = /^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
     if (id) {
       const up = id[0].toUpperCase();
-      toks.push(KEYWORDS.has(up) ? { t: 'kw', v: up } : { t: 'id', v: id[0] });
+      toks.push(KEYWORDS.has(up) ? { t: 'kw', v: up, raw: id[0] } : { t: 'id', v: id[0] });
       i += id[0].length;
       continue;
     }
@@ -102,6 +102,8 @@ function parseStatement(src) {
   const needOp = (v) => { if (!eatOp(v)) fail(`expected "${v}" ${near()}`); };
   const near = () => (peek() ? `near "${peek().v}"` : 'at the end');
   const ident = () => { const t = peek(); if (t?.t !== 'id') fail(`expected a name ${near()}`); p++; return t.v; };
+  // after AS any word is a name (AS first, AS end)
+  const aliasName = () => { const t = peek(); if (t?.t === 'kw') { p++; return t.raw; } return ident(); };
   const startsQuery = (o = 0) => isKw('SELECT', o) || isKw('WITH', o);
   const aliasNext = () => peek()?.t === 'id' && !(SOFT.has(peek().v.toUpperCase()) && !peek().quoted && ['OVER', 'WITHIN', 'FETCH', 'FILTER'].includes(peek().v.toUpperCase()));
 
@@ -321,7 +323,7 @@ function parseStatement(src) {
     do {
       const e = expr();
       let alias = null;
-      if (eatKw('AS')) alias = ident();
+      if (eatKw('AS')) alias = aliasName();
       else if (aliasNext()) alias = ident();
       items.push({ e, alias });
     } while (eatOp(','));

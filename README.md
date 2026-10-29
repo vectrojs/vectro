@@ -339,6 +339,27 @@ best of two runs. Vectro is level or faster on 5 of the 8 queries; DuckDB is
 still faster at picking the top rows (3x) and at joins (2.5x) on data this
 big.
 
+## SQL over HTTP: Excel, Power BI, Google Sheets, pandas
+
+```sh
+npx vectro serve --root ~/data        # every CSV, TSV, JSON-lines, Arrow / Feather and .vectro file is a table
+curl 'http://127.0.0.1:8787/sql?q=SELECT region, COUNT(*) AS n FROM orders GROUP BY 1&format=csv'
+```
+
+| Endpoint | Gives |
+|---|---|
+| `GET /sql?q=...` or `POST /sql` (the SQL as the body, or JSON `{ "sql": ... }`) | the answer; `format=json` (default: `{ columns, rows }`), `csv`, `ndjson` or `arrow`; `limit=n` |
+| `GET /tables`, `GET /tables/<name>` | table names, rows, column types |
+| `GET /tables/<name>/rows?format=csv` | a whole table |
+| `POST /reload` | reads the data folder again (new files become tables) |
+
+- **Excel** (Windows and Mac): Data > Get Data > From Web, then the `/sql?...&format=csv` URL. **Power BI Desktop**: Get Data > Web, the same URL (Import mode; Refresh runs the query again). The Power BI Service and **Google Sheets** (`=IMPORTDATA("https://.../sql?q=...&format=csv&token=...")`) fetch from the cloud, so they need a public address or, for Power BI, a gateway.
+- **pandas / Polars**: `pd.read_csv(url)`, `pl.read_csv(url)`; Arrow is ten times faster to fetch: `pyarrow.ipc.open_stream(urlopen(url + '&format=arrow')).read_all()`.
+- **In your own app**: `import { serve } from 'vectrojs/serve'; await serve({ tables: { orders }, port: 8787 })`.
+- **Safety**: listens on 127.0.0.1 unless `--host` is given; `--token <secret>` requires `Authorization: Bearer <secret>` (or `&token=` for tools that can't send headers); SQL here only reads; files outside the folder are never read (links that lead out are skipped).
+
+On 10M orders: a group by region answers in 9 ms over HTTP; 1M rows export in 0.6 s as CSV (42 MB) or JSON, 0.07 s as Arrow (28 MB), and all 10M rows as Arrow in 0.45 s. Live connections (Power BI DirectQuery, Tableau, Metabase, Grafana) come with the Postgres protocol, next.
+
 ## For AI assistants (MCP server)
 
 `mcp/server.mjs` lets Claude, ChatGPT or any MCP client analyze your data
@@ -598,7 +619,9 @@ than memory, quoted-CSV loading.
 ## Layout
 
 ```
-src/         the engine (Node, browser and portable entry points)
+src/         the engine (Node, browser and portable entry points); src/serve: the HTTP SQL server
+bin/         the vectro command (vectro serve)
+mcp/         the MCP server for AI assistants
 dist/        vectro.wasm, the precompiled kernels for edge runtimes (npm run build)
 test/        correctness tests; VECTRO_MODE=single|interp|edge|browser-sim selects a mode
 bench/       Vectro-only benchmarks (threads, async, skewed filters, CSV)

@@ -8,15 +8,15 @@
 //
 // Safety: the assistant only reads files under --root, and its expressions
 // are Vectro's small math language (no code runs, no eval).
-import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { resolve, sep, extname, basename } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { resolve, extname, basename } from 'node:path';
 import { createInterface } from 'node:readline';
-import { Engine, VectorIndex, sql } from '../src/node.mjs';
-import { parseNDJSON } from '../src/ndjson.mjs';
+import { Engine, sql } from '../src/node.mjs';
+import { LoadError, safePath as safePathIn, loadFile, columnsOf, kindOf } from '../src/serve/catalog.mjs';
 
 const VERSION = '0.1.0';
 const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
-const MAX_ROWS = 500, DEFAULT_ROWS = 50, MAX_FILE_BYTES = 2 ** 31;
+const MAX_ROWS = 500, DEFAULT_ROWS = 50;
 
 const args = process.argv.slice(2);
 const rootArg = args.includes('--root') ? args[args.indexOf('--root') + 1] : process.cwd();
@@ -123,16 +123,7 @@ function release(name) {
   tables.delete(name);
 }
 
-function safePath(path) {
-  if (typeof path !== 'string' || !path) throw new ToolError('path is required');
-  let real;
-  try { real = realpathSync(resolve(ROOT, path)); } catch { throw new ToolError(`no such file: ${path}`); }
-  if (real !== ROOT && !real.startsWith(ROOT + sep)) throw new ToolError('that file is outside the data folder this server may read');
-  const st = statSync(real);
-  if (!st.isFile()) throw new ToolError(`not a file: ${path}`);
-  if (st.size > MAX_FILE_BYTES) throw new ToolError('file is larger than 2 GB');
-  return real;
-}
+const safePath = (path) => safePathIn(ROOT, path);
 
 function getTable(name) {
   const entry = tables.get(name);
@@ -140,58 +131,7 @@ function getTable(name) {
   return entry;
 }
 
-const kindOf = (c) => (c.strings ? 'text' : c.dict ? 'category' : c.date ? 'date' : 'number');
 const clean = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Date ? v.toISOString() : typeof v === 'number' && !Number.isFinite(v) ? null : v])));
-const columnsOf = (t) => Object.fromEntries([...t.cols].map(([n, c]) => [n, kindOf(c)]));
-
-// JSON lines with an array-of-numbers field: parse every line with JSON.parse
-// (slower, but the embedding is needed), build the table and a vector index.
-async function loadWithEmbeddings(bytes, field, dim, kinds) {
-  const names = [...kinds].filter(([k, v]) => v && k !== field).map(([k]) => k);
-  const cols = Object.fromEntries(names.map((n) => [n, []]));
-  const vectors = [];
-  let skipped = 0;
-  for (const line of new TextDecoder().decode(bytes).split('\n')) {
-    if (!line.trim()) continue;
-    let o;
-    try { o = JSON.parse(line); } catch { skipped++; continue; }
-    const v = o?.[field];
-    if (!o || typeof o !== 'object' || !Array.isArray(v) || v.length !== dim) { skipped++; continue; }
-    vectors.push(v);
-    for (const n of names) {
-      const x = o[n];
-      cols[n].push(kinds.get(n) === 'number' ? (typeof x === 'number' ? x : typeof x === 'boolean' ? +x : typeof x === 'string' && x.trim() ? Number(x) : NaN) : x == null || typeof x === 'object' ? '' : String(x));
-    }
-  }
-  const table = engine.table(cols);
-  const index = await VectorIndex.create(engine, { vectors, dim, metric: 'cosine', columns: cols });
-  return { table, index, skipped, embedding: { field, dim } };
-}
-
-function loadJSONLines(bytes, types) {
-  // column names and kinds from the first 1,000 lines
-  const kinds = new Map(), arrays = new Map();
-  const text = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 1 << 20)));
-  for (const line of text.split('\n').slice(0, 1000)) {
-    let o;
-    try { o = JSON.parse(line); } catch { continue; }
-    if (!o || typeof o !== 'object' || Array.isArray(o)) continue;
-    for (const [k, v] of Object.entries(o)) {
-      if (Array.isArray(v) && v.length && v.every((x) => typeof x === 'number')) { if (!arrays.has(k)) arrays.set(k, v.length); }
-      if (v === null || typeof v === 'object') { if (!kinds.has(k)) kinds.set(k, null); continue; }
-      const kind = typeof v === 'number' || typeof v === 'boolean' ? 'number' : 'category';
-      if (kinds.get(k) !== 'category') kinds.set(k, kind);
-    }
-  }
-  for (const [k, v] of Object.entries(types ?? {})) kinds.set(k, v === 'number' ? 'number' : 'category');
-  if (arrays.size) { const [field, dim] = arrays.entries().next().value; return loadWithEmbeddings(bytes, field, dim, kinds); }
-  const names = [...kinds].filter(([, v]) => v).map(([k]) => k);
-  if (!names.length) throw new ToolError('no JSON objects with plain values found in the first lines');
-  const r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)));
-  const cols = Object.fromEntries(names.map((n, k) => [n, r.dicts[k] ? Array.from(r.cols[k], (code) => r.dicts[k][code]) : r.cols[k]]));
-  return { table: engine.table(cols), skipped: r.bad };
-}
-
 const handlers = {
   sql({ query }) {
     const all = Object.fromEntries([...tables].map(([n, e]) => [n, e.table]));
@@ -203,20 +143,11 @@ const handlers = {
   },
   async load_file({ path, name, types }) {
     const real = safePath(path);
-    const ext = extname(real).toLowerCase();
     const tname = name || basename(real, extname(real)).replace(/[^A-Za-z0-9_]/g, '_');
-    const bytes = ext === '.vectro' ? null : new Uint8Array(readFileSync(real));
-    let table, skipped = 0, index = null, embedding = null;
-    if (ext === '.vectro') { // a dataset on disk: opened, not loaded
-      table = engine.openDataset(real);
-      release(tname);
-      tables.set(tname, { table, source: path, chain: [table], index: null });
-      return { table: tname, rows: table.length, on_disk: true, columns: columnsOf(table), sample: clean(table.toRows(5)) };
-    }
-    if (ext === '.jsonl' || ext === '.ndjson') ({ table, skipped, index = null, embedding = null } = await loadJSONLines(bytes, types));
-    else table = engine.parseCSV(bytes, { types: types ?? {}, delimiter: ext === '.tsv' ? '\t' : ',' });
+    const { table, skipped = 0, index = null, embedding = null, onDisk } = await loadFile(engine, real, { types });
     release(tname);
     tables.set(tname, { table, source: path, chain: [table], index });
+    if (onDisk) return { table: tname, rows: table.length, on_disk: true, columns: columnsOf(table), sample: clean(table.toRows(5)) };
     return { table: tname, rows: table.length, columns: columnsOf(table), sample: clean(table.toRows(5)), ...(embedding ? { embedding } : {}), ...(skipped ? { skipped_lines: skipped } : {}) };
   },
   list_tables() {
@@ -336,7 +267,7 @@ async function handle(msg) {
         return reply({ content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body, isError: false });
       } catch (err) {
         // tool errors go back to the model, so it can fix its call
-        return reply({ content: [{ type: 'text', text: err instanceof ToolError || /^vectro:/.test(err.message) ? err.message : `error: ${err.message}` }], isError: true });
+        return reply({ content: [{ type: 'text', text: err instanceof ToolError || err instanceof LoadError || /^vectro:/.test(err.message) ? err.message : `error: ${err.message}` }], isError: true });
       }
     }
     default:
