@@ -297,7 +297,7 @@ c.close();
   });
   if (!psql.error) {
     const want = sql('SELECT region, COUNT(*) AS n FROM orders GROUP BY 1 ORDER BY 1', tables).toRows().map((r) => `${r.region}|${r.n}`).join('\n');
-    check(psql.stdout.trim() === want, `psql: ${psql.stdout} ${psql.stderr}`);
+    check(psql.stdout.replace(/\r\n/g, '\n').trim() === want, `psql: ${psql.stdout} ${psql.stderr}`);
   }
   await s4.close();
 }

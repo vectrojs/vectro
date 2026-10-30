@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 
 let failures = 0, checks = 0;
@@ -31,7 +32,7 @@ const docs = Array.from({ length: 2000 }, (_, i) => ({ id: i, topic: ['ai', 'db'
 writeFileSync(join(dir, 'data', 'docs.jsonl'), docs.map((d) => JSON.stringify(d)).join('\n') + '\n');
 const cosine = (a, b) => { let d = 0, x = 0, y = 0; for (let j = 0; j < a.length; j++) { const p = Math.fround(a[j]), q = Math.fround(b[j]); d += p * q; x += p * p; y += q * q; } return d / Math.sqrt(x * y); };
 
-const server = spawn(process.execPath, [new URL('../mcp/server.mjs', import.meta.url).pathname, '--root', join(dir, 'data')], { stdio: ['pipe', 'pipe', 'pipe'] });
+const server = spawn(process.execPath, [fileURLToPath(new URL('../mcp/server.mjs', import.meta.url)), '--root', join(dir, 'data')], { stdio: ['pipe', 'pipe', 'pipe'] });
 const pending = new Map();
 createInterface({ input: server.stdout }).on('line', (line) => { const m = JSON.parse(line); pending.get(m.id)?.(m); pending.delete(m.id); });
 let nextId = 0;
