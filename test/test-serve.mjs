@@ -47,7 +47,8 @@ writeFileSync(join(dir, 'tiers.arrow'), customers.toArrow({ file: true }));
 engine.writeDataset(join(dir, 'big.vectro'), t, { rowsPerChunk: 7000 });
 const outside = mkdtempSync(join(tmpdir(), 'vectro-outside-'));
 writeFileSync(join(outside, 'secret.csv'), 'x\n42\n');
-symlinkSync(join(outside, 'secret.csv'), join(dir, 'secret.csv'));
+let linked = true; // (Windows makes links only with extra rights: then that check is skipped)
+try { symlinkSync(join(outside, 'secret.csv'), join(dir, 'secret.csv')); } catch { linked = false; }
 
 const s = await serve({ tables: { orders: t, customers }, root: dir, port: 0, engine });
 const get = (path, opts) => fetch(s.url + path, opts);
@@ -66,7 +67,7 @@ const QUERIES = [
 ];
 const tablesNow = { orders: t, customers, names: s.tables.get('names')?.table, big: s.tables.get('big')?.table, people: s.tables.get('people')?.table, events: s.tables.get('events')?.table, tiers: s.tables.get('tiers')?.table };
 check(s.tables.has('big') && s.tables.has('people') && s.tables.has('events') && s.tables.has('tiers'), `folder tables: ${[...s.tables.keys()]}`);
-check(!s.tables.has('secret'), 'a link to a file outside the folder is not served');
+if (linked) check(!s.tables.has('secret'), 'a link to a file outside the folder is not served');
 for (const text of QUERIES) {
   const want = sql(text, tablesNow).toRows();
   const wantPlain = plain(want);

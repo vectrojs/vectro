@@ -1,7 +1,8 @@
 name: test
 on: [push, pull_request]
 jobs:
-  test:
+  # every mode (threads, one thread, interpreter, edge, browser simulation, compressed)
+  full:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -12,3 +13,33 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm run test:all
+  # the main suite on other systems and the oldest Node supported
+  platforms:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, node: 20 }
+          - { os: macos-latest, node: 22 }
+          - { os: windows-latest, node: 22 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test
+  # the npm package, installed into an empty project as users get it
+  package:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm pack
+      - run: node scripts/smoke-install.mjs

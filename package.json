@@ -1,24 +1,38 @@
 {
   "name": "vectrojs",
   "version": "0.1.0",
-  "description": "Multi-core analytics engine for JavaScript: columnar tables and fused SIMD WebAssembly kernels for Node, browsers and edge runtimes, with no native code.",
+  "description": "Multi-core analytics engine for JavaScript: columnar tables, SQL and fused SIMD WebAssembly kernels for Node, browsers and edge runtimes, with no native code. Serves tables to Power BI, Tableau, Metabase, Grafana, pandas and Polars.",
   "type": "module",
   "license": "MIT",
+  "author": "Hamza Masood",
+  "homepage": "https://github.com/vectrojs/vectro#readme",
+  "bugs": {
+    "url": "https://github.com/vectrojs/vectro/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/vectrojs/vectro.git"
   },
   "keywords": [
     "analytics",
+    "sql",
     "dataframe",
     "columnar",
-    "simd",
+    "olap",
     "webassembly",
     "wasm",
+    "simd",
     "multithreading",
     "worker-threads",
     "csv",
-    "olap"
+    "arrow",
+    "flight-sql",
+    "postgres-wire-protocol",
+    "odata",
+    "power-bi",
+    "tableau",
+    "duckdb-alternative",
+    "browser"
   ],
   "engines": {
     "node": ">=20"
@@ -41,6 +55,7 @@
   ],
   "scripts": {
     "build": "node scripts/build-wasm.mjs",
+    "prepublishOnly": "npm run build && npm test",
     "test": "node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs && node test/test-async.mjs && node test/test-split.mjs && node test/test-balance.mjs && node test/test-stream.mjs && node test/test-ndjson.mjs && node test/test-window.mjs && node test/test-websocket.mjs && node test/test-frames.mjs && node test/test-emitter.mjs && node test/test-arrow.mjs && node test/test-groupby.mjs && node test/test-join.mjs && node test/test-distinct.mjs && node test/test-types.mjs && node test/test-plan.mjs && node test/test-sql.mjs && node test/test-pack.mjs && node test/test-dataset.mjs && node test/test-sort.mjs && node test/test-zones.mjs && node test/test-textfns.mjs && node test/test-vectors.mjs && node test/test-mcp.mjs && node test/test-serve.mjs && node test/test-pg.mjs && node test/test-odata.mjs && node test/test-flight.mjs && node test/test-connectors.mjs && node test/test-check-cases.mjs",
     "test:single": "VECTRO_MODE=single sh -c 'node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs'",
     "test:interp": "VECTRO_MODE=interp sh -c 'node test/test-ops.mjs && node test/test-fusion.mjs && node test/test-tables.mjs && node test/test-csv.mjs'",
