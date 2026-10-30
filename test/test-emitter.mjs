@@ -92,8 +92,8 @@ for (const workers of [1, 3]) {
   await feed.close();
 }
 
-// WebSocket: binary frames, one or more per message
-{
+// WebSocket: binary frames, one or more per message (Node 22+ has WebSocket)
+if (typeof WebSocket === 'function') {
   const server = createServer();
   server.on('upgrade', (req, socket) => {
     const ws = acceptWebSocket(req, socket);

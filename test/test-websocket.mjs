@@ -4,6 +4,8 @@ import { createServer } from 'node:http';
 import { SplitEngine } from '../src/node.mjs';
 import { acceptWebSocket } from '../examples/stream/ws-server.mjs';
 
+if (typeof WebSocket !== 'function') { console.log('WebSocket checks skipped: this Node has no WebSocket (Node 22+ does)'); process.exit(0); }
+
 let failures = 0, checks = 0;
 const fail = (msg) => { failures++; if (failures <= 15) console.log('FAIL', msg); };
 const close = (a, b) => JSON.stringify(a, (k, x) => (typeof x === 'number' ? Number(x.toPrecision(11)) : x)) === JSON.stringify(b, (k, x) => (typeof x === 'number' ? Number(x.toPrecision(11)) : x));
