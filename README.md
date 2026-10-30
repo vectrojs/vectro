@@ -5,7 +5,7 @@ and compiles each query, filter included, into one SIMD WebAssembly loop, then
 runs it on every CPU core. It runs in Node, in browsers (any page) and on
 Cloudflare Workers, with no native addon, compiler or server.
 
-> Status: prototype (0.1.0). Not published yet. Formerly "nodeplus". MIT license.
+> Version 0.1.0, the first release. Node 20+ and modern browsers. MIT license.
 
 ```js
 import { Engine } from 'vectrojs';
@@ -21,6 +21,41 @@ orders.filter("region == 'EU' && price > 100").agg({
 
 orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
 ```
+
+## Install and try it
+
+```sh
+npm install vectrojs
+```
+
+```js
+import { Engine, sql } from 'vectrojs';
+
+const engine = new Engine();
+const orders = engine.readCSV('orders.csv');
+sql('SELECT region, COUNT(*) AS n, SUM(price) AS revenue FROM orders GROUP BY region ORDER BY revenue DESC', { orders }).toRows();
+```
+
+Serve a folder of CSV / Arrow / `.vectro` files to BI tools, with no code:
+
+```sh
+npx vectro serve --root ./data --pg 5433      # HTTP on 8787, PostgreSQL on 5433
+psql -h 127.0.0.1 -p 5433 -U vectro vectro     # or Power BI, Tableau, Metabase, Grafana
+```
+
+## What's stable
+
+| Part | Status |
+|---|---|
+| Engine: tables, filters, group by, joins, sort, CSV / Arrow / JSON lines | Stable: answers checked against plain JavaScript and DuckDB |
+| SQL (`sql(...)`) | Stable for what's listed under **SQL** below; anything else gives a clear error |
+| Datasets bigger than memory (`.vectro` files) | Stable; the file format may still change before 1.0 |
+| `vectro serve`: HTTP, OData, PostgreSQL protocol, Arrow Flight SQL | Beta: checked with the drivers BI tools use, not yet with every application |
+| Power BI `.mez` and Tableau `.taco` connectors | Experimental: not signed, not yet tried in the applications |
+| Streams, vector search, MCP server | Experimental: the API may change |
+
+What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
+[issues](https://github.com/vectrojs/vectro/issues).
 
 ## What it does
 
@@ -692,7 +727,7 @@ const orders = await split.streamAsync({ format: 'arrow', columns: { ts: 'number
 | `vectrojs/browser` → `SplitEngine` | Any page | Each Web Worker owns a share of the rows; async API |
 | `vectrojs/portable` | Cloudflare Workers and other edge runtimes | One thread; a precompiled 11 KB module plus a vectorized interpreter |
 
-Tested in Node 25, Chrome, Safari 26.5, Firefox 158, Safari on iOS (real
+Tested in Node 20, 22, 24 and 25 (Linux, macOS, Windows), Chrome, Safari 26.5, Firefox 158, Safari on iOS (real
 iPhone) and Cloudflare Workers.
 
 ## Performance (10M rows, Apple M1 Pro, Node)
@@ -743,7 +778,7 @@ answers.
 written by one writer at a time; a join on text keys needs its
 other side to fit in memory, exact distinct counts of non-ID values don't
 spill, and `approxDistinct` on a dataset counts exactly. Joins are for normal
-tables (not split tables or streams yet), inner and left only. Split tables
+tables (not split tables or streams yet). Split tables
 have `topAsync` but no full sort.
 Binary streams have number and category columns only; Arrow ZSTD compression isn't supported.
 Streams take flat records only (no nested JSON fields), and windows group by
