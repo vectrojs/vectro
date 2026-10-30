@@ -51,7 +51,8 @@
     "dist",
     "mcp",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "node scripts/build-wasm.mjs",
