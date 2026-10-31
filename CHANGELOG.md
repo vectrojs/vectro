@@ -23,6 +23,9 @@ The first public release. Everything below is new.
 - `sql(text, tables)`: joins, subqueries (IN, EXISTS, correlated), CTEs,
   UNION / INTERSECT / EXCEPT, window functions, percentiles, text functions,
   dates and intervals. 40 queries checked against DuckDB give the same answers.
+- Shortcuts for common shapes: only the rows that can rank in the first k for
+  `ROW_NUMBER() / RANK() ... <= k`; distinct counts of IDs with a byte map;
+  medians from bucket counts; CASE with quoted labels as label codes.
 
 **Serving** (beta)
 - `vectro serve`: SQL over HTTP (JSON, CSV, Arrow) and an OData v4 feed;
@@ -36,8 +39,10 @@ The first public release. Everything below is new.
   Not signed, not yet tried in the applications.
 
 **Known gaps**
-- Slower than DuckDB on: top rows and joins over billion-row datasets, outer
-  joins, ROW_NUMBER over all rows, MEDIAN per group (see the README's numbers).
+- Slower than DuckDB on: group-by with millions of distinct keys (about 2x),
+  FULL OUTER JOIN counts, distinct counts of a million values spread over a
+  wide range, top rows and joins over billion-row datasets (see the README's
+  numbers). Faster on the other SQL queries measured (19 of 20).
 - Free-text columns (text that rarely repeats) can be shown but not grouped
   or filtered, except when served (`vectro serve` loads them as categories).
 - Window functions and percentiles keep the rows they read in memory.

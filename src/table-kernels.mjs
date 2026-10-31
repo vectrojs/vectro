@@ -62,12 +62,12 @@ export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, 
   f.emit(get(n), i32c(keyEnc ? PACKED_BYTES[keyEnc.kind] : ty.bytes), [0x6c], get(key), i32add, set(stop));
 
   f.emit(block, loop, get(key), get(stop), i32geu, brIf(1));
-  loadRow(f, ty, env);
   // slot = key * C + copy
   if (keyEnc) packedScalar(f, t, keyEnc, key, env.raw, env.tmp); else f.emit(get(key), ty.load);
   f.emit(TRUNC_SAT_U[t], i32c(log2C), I32_SHL, get(copy), i32add, set(idx));
   f.emit(block);
-  if (ranged) f.emit(get(idx), get(lo), [0x6b], get(hi), get(lo), [0x6b], i32geu, brIf(0)); // (idx - lo) >= (hi - lo), unsigned: not ours
+  if (ranged) f.emit(get(idx), get(lo), [0x6b], get(hi), get(lo), [0x6b], i32geu, brIf(0)); // (idx - lo) >= (hi - lo), unsigned: not ours (its values aren't even read)
+  loadRow(f, ty, env);
   if (pred) { em.scaMask(pred); f.emit(I32_EQZ, brIf(0)); }
   items.forEach((it, j) => {
     const op = it.reduce === 'min' ? 'min' : it.reduce === 'max' ? 'max' : 'add';
@@ -272,5 +272,21 @@ export function generateMarkPairs(t, shared = true) {
   f.emit(end);
   f.emit(get(vp), i32c(ty.bytes), i32add, set(vp), get(gp), i32c(ty.bytes), i32add, set(gp), br(0), end, end);
   f.emit([0x44, 0, 0, 0, 0, 0, 0, 0, 0]);
+  return buildModule([f], shared);
+}
+
+// Keys stored side by side by the hash table (src[g * nk + k], float64) out
+// to one column: dst[i] = src[keep[i] * nk + k] for the rows of a unit
+// (OP.UNITS). Signature: (start, stop, unit, src, keep (uint32), dst, nk, k).
+export function generateStridedKeys(shared = true) {
+  const f = new Fn('k', [I32, I32, I32, I32, I32, I32, I32, I32], []);
+  const [start, stop, , src, keep, dst, nk, k] = [0, 1, 2, 3, 4, 5, 6, 7];
+  const i = f.local(I32);
+  f.emit(get(start), set(i));
+  f.emit(block, loop, get(i), get(stop), i32geu, brIf(1));
+  f.emit(get(i), i32c(3), I32_SHL, get(dst), i32add);
+  f.emit(get(i), i32c(2), I32_SHL, get(keep), i32add, [0x28, 2, 0], get(nk), i32mul, get(k), i32add, i32c(3), I32_SHL, get(src), i32add, F64_LOAD);
+  f.emit(F64_STORE);
+  f.emit(get(i), i32c(1), i32add, set(i), br(0), end, end);
   return buildModule([f], shared);
 }

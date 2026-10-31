@@ -75,13 +75,14 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
 
   | Keys | Vectro | DuckDB |
   |---|---|---|
-  | region + day (2,920 pairs) | 7 ms | 35 ms |
-  | price (100K amounts) | 35 ms | 59 ms |
-  | account (1M big IDs) | 140 ms | 60 ms |
-  | account + region (5.7M pairs) | 526 ms | 114 ms |
+  | region + day (2,920 pairs) | 8 ms | 36 ms |
+  | price (100K amounts) | 33 ms | 44 ms |
+  | account (1M big IDs) | 124 ms | 69 ms |
+  | account + region (5.7M pairs) | 278 ms | 120 ms |
 
-  With millions of groups, about half of Vectro's time is sorting the groups
-  by key (DuckDB returns them unsorted) on one thread.
+  With millions of groups DuckDB is still faster: Vectro also sorts the groups
+  by key (on every thread; DuckDB returns them unsorted), and its shared hash
+  table misses the cache more than DuckDB's partitioned one.
 - **Missing values** are NaN and follow SQL's rules: `sum`, `mean`, `min`
   and `max` skip them (`mean` divides by the values present; `min`/`max` of
   nothing is NaN), `count(x)` counts the values present and `count(x > 5)`
@@ -107,9 +108,11 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   sketches (4 KB, within ~1.6%): each worker keeps one per time slice and
   group, and sketches merge, so "distinct customers in the last 5 minutes" is
   a cheap read. `DistinctSketch` (exported) builds, merges and ships sketches
-  yourself. On 10M rows vs DuckDB (`compare/bench-distinct.mjs`): 365 days
-  4 ms vs 5; regions per day 9 ms vs 34; 1M accounts 81 ms vs 48; accounts per
-  region (5.7M pairs) 214 ms vs 100.
+  yourself. Whole numbers in a small range (IDs, codes) are counted with one
+  byte per (group, value), marked on every thread; other values are numbered
+  by the hash table first. On 10M rows vs DuckDB (`compare/bench-distinct.mjs`):
+  365 days 3 ms vs 5; regions per day 8 ms vs 32; 1M accounts 59 ms vs 47;
+  accounts per region (5.7M pairs) 80 ms vs 90.
 - **Compressed columns:** `table.compress()` (or `engine.table(cols, { compress:
   true })`, `parseCSV(text, { compress: true })`) stores each number and
   category column in 1, 2 or 4 bytes per row when every value comes back
@@ -181,16 +184,18 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   dates, and comparing text with `<` / `>`. Each function runs once per
   distinct value, not per row (a category column has few labels), and the
   answer is a category column again, so it groups, sorts and joins like any
-  other: `GROUP BY UPPER(region)` on 10M rows 31 ms (DuckDB 50), `region ||
-  '-' || qty` as a key 84 ms (93), `STRFTIME(ts, '%Y-%m')` 48 ms (62; times
-  are rounded to the month first), ILIKE on a column 29 ms (48). Missing text
+  other: `GROUP BY UPPER(region)` on 10M rows 30 ms (DuckDB 42), `region ||
+  '-' || qty` as a key 85 ms (92), `STRFTIME(ts, '%Y-%m')` 48 ms (61; times
+  are rounded to the month first), ILIKE on a column 29 ms (46). A CASE whose
+  results are all quoted labels is worked out as label codes in the fused
+  pass (CASE text + group 5.7 ms vs 21). Missing text
   is `''`, as everywhere in Vectro, and positions count characters from 1 as
   in DuckDB.
 
   **Outer joins:** RIGHT and FULL JOIN (with ON or USING) are the matching
   rows (FULL: plus the left rows without a match) followed by the right rows
-  whose keys no left row has; slower than DuckDB for now (RIGHT JOIN + group
-  89 vs 56 ms, FULL JOIN + count 58 vs 26 ms).
+  whose keys no left row has (RIGHT JOIN + group 39 vs 56 ms; FULL JOIN +
+  count 36 vs 27 ms, still slower).
 
   `compare/check-sql.mjs` runs 40 such queries (CTEs, set operations,
   correlated subqueries, windows, percentiles, text functions on awkward
@@ -199,14 +204,18 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   correlation on anything but equalities, MIN / MAX of text, and STRING_AGG.
   The MCP server has
   a `sql` tool. The same SQL text vs DuckDB on 10M orders + 100K customers
-  (`compare/bench-sql.mjs`, answers checked, one run): filtered totals 3.0 vs
-  10.7 ms, group by region 9.6 vs 37.6 ms, join + filter + group 29.0 vs 38.0 ms,
-  top 10 customers 14.6 vs 56.1 ms, top 20 rows 9.1 vs 24.5 ms, CASE inside SUM
-  9.2 vs 36.7 ms, correlated subquery 17.3 vs 52.2 ms. Slower: distinct
-  customers per month 144 vs 75 ms, IN (subquery) 30.8 vs 26.8 ms, top 3 per
-  region with RANK 158 vs 123 ms, running total by day 16.2 vs 14.7 ms, MEDIAN
-  per region 125 vs 83 ms and ROW_NUMBER over all 10M rows 375 vs 182 ms (a
-  full sort, on one thread). Window functions and
+  (`compare/bench-sql.mjs`, answers checked, one run): Vectro is faster on 19
+  of the 20 queries: filtered totals 3.8 vs 9.6 ms, group by region 9.5 vs
+  32.4 ms, join + filter + group 18.0 vs 31.0 ms, top 10 customers 13.5 vs
+  46.5 ms, distinct customers per month 31.5 vs 74.9 ms, top 20 rows 8.7 vs
+  23.5 ms, CASE inside SUM 7.9 vs 36.1 ms, IN (subquery) 21.1 vs 26.8 ms,
+  correlated subquery 16.3 vs 53.1 ms, top 3 per region with RANK 75 vs
+  125 ms, ROW_NUMBER per customer (first 3 kept) 117 vs 195 ms, running total
+  by day 9.1 vs 15.6 ms, MEDIAN per region 35.7 vs 78.5 ms; slower: FULL JOIN
+  + count 36 vs 27 ms. A filter like `rn <= 3` on ROW_NUMBER or RANK keeps
+  only the rows that can rank that high before sorting (picked on every
+  thread); percentiles of a few partitions count values in buckets on every
+  thread and select only within the wanted buckets. Window functions and
   percentiles gather all their rows, so on a dataset they need its rows (the
   columns used) to fit in memory.
 - **Lazy queries (a planner):** `t.lazy()` records a chain (`filter`, `derive`,
@@ -233,10 +242,10 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
 
   | Join | Vectro | DuckDB |
   |---|---|---|
-  | × 100K customers | 64 ms | 176 ms |
-  | × 1M accounts | 118 ms | 210 ms |
-  | left join, half the keys match | 74 ms | 176 ms |
-  | two keys: region + day (2,920 rows) | 59 ms | 158 ms |
+  | × 100K customers | 65 ms | 222 ms |
+  | × 1M accounts | 135 ms | 255 ms |
+  | left join, half the keys match | 76 ms | 191 ms |
+  | two keys: region + day (2,920 rows) | 64 ms | 167 ms |
 - **Text functions** on category columns: `startsWith(col, 'x')`,
   `endsWith`, `contains`, `in(col, 'a', 'b')` and `like(col, 'EU-%')`. They run
   once per distinct label (not per row) and become a few range checks on the
@@ -734,12 +743,12 @@ iPhone) and Cloudflare Workers.
 
 | Query | Vectro | DuckDB 2.0 | SQLite* | Arquero |
 |---|---|---|---|---|
-| Filtered revenue | 3.6 ms | 9.1 ms | 757 ms | 79 ms |
-| Dashboard, 4 aggregates | 3.7 ms | 20.6 ms | 345 ms | 170 ms |
-| Group by region (8 groups) | 8.4 ms | 31.3 ms | 2.75 s | 1.02 s |
-| Group by customer (100K groups) | 11.5 ms | 10.9 ms | 4.32 s | 732 ms |
-| Filter into a new table | 5.3 ms | 49.4 ms | | 123 ms |
-| New column | 3.3 ms | 25.4 ms | 1.75 s | 119 ms |
+| Filtered revenue | 3.3 ms | 9.9 ms | 757 ms | 65 ms |
+| Dashboard, 4 aggregates | 3.6 ms | 22.8 ms | 345 ms | 169 ms |
+| Group by region (8 groups) | 7.7 ms | 35.1 ms | 2.75 s | 1.02 s |
+| Group by customer (100K groups) | 11.0 ms | 11.7 ms | 4.32 s | 723 ms |
+| Filter into a new table | 5.4 ms | 59.6 ms | | 123 ms |
+| New column | 3.3 ms | 25.6 ms | 1.75 s | 114 ms |
 
 Best of 5, each system using all 8 cores (Arquero is single-threaded), the
 same answers from every system. \*SQLite from an earlier run
@@ -748,10 +757,11 @@ same answers from every system. \*SQLite from an earlier run
 Run them yourself: `cd compare && npm install && npm run bench`. Timings vary
 with the machine's state (battery, background load), so compare systems in the
 same run. More comparisons in `compare/`: SQL (`bench-sql.mjs`: Vectro faster
-on 11 of 20 queries), joins (`bench-join.mjs`: faster on all 4), group-by
-(`bench-groupby.mjs`). DuckDB is still faster at grouping by millions of
-distinct keys (2.3–4.6x), window functions over all rows, medians, outer joins,
-counting distinct values, and on billion-row files for top rows and joins.
+on 19 of 20 queries), joins (`bench-join.mjs`: faster on all 4), group-by
+(`bench-groupby.mjs`), distinct counts (`bench-distinct.mjs`). DuckDB is still
+faster at grouping by millions of distinct keys (1.8–2.3x), FULL OUTER JOIN
+counts, counting a million distinct values spread over a wide range, and on
+billion-row files for top rows and joins.
 
 ## Layout
 

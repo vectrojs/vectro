@@ -8,7 +8,7 @@
 import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
 import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
 import { parse, toSource, walk, analyze, isMask } from './fuse.mjs';
-import { generateGroupBy, generateCompact, generateHashGroups, generateMarkPairs } from './table-kernels.mjs';
+import { generateGroupBy, generateCompact, generateHashGroups, generateMarkPairs, generateStridedKeys } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
 import { topModule, markModule } from './rank-kernels.mjs';
@@ -608,7 +608,15 @@ export class Table {
         continue;
       }
       const keyColumn = (k, keep) => stridedKeys(engine.live(keyBits), keep, nk, k); // key k of each kept group (codes for text)
-      return { K, data, keyColumn, owned: true, sorted: false, extra: [keyBits] };
+      const keyArrayG = function* (k, keep, m) { // the same into a new engine array, on every thread (keep: an engine Uint32Array)
+        engine._tableKernels ??= new Map();
+        let s = engine._tableKernels.get('stridedkeys');
+        if (!s) { s = engine._register(generateStridedKeys(engine.isShared)); engine._tableKernels.set('stridedkeys', s); }
+        const dst = engine.alloc(Float64Array, m);
+        if (m) yield* engine._unitsG(s, m, [engine.live(keyBits).byteOffset, engine.live(keep).byteOffset, engine.live(dst).byteOffset, nk, k]);
+        return dst;
+      };
+      return { K, data, keyColumn, keyArrayG, owned: true, sorted: false, extra: [keyBits] };
     }
   }
 
@@ -677,10 +685,12 @@ export class Table {
     const toEngine = (a, Type = Float64Array) => { const x = engine.alloc(Type, a.length); engine.live(x).set(a); made.push(x); return x; };
     const owned = (x) => { made.splice(made.indexOf(x), 1); return x; };
     try {
-      const keyArrs = keys.map((_, k) => toEngine(groups.keyColumn(k, keep)));
+      const keepE = toEngine(keep, Uint32Array), keyArrs = [];
+      for (let k = 0; k < keys.length; k++) {
+        if (groups.keyArrayG) { const a = yield* groups.keyArrayG(k, keepE, m); made.push(a); keyArrs.push(a); } else keyArrs.push(toEngine(groups.keyColumn(k, keep)));
+      }
       const order = groups.sorted ? null : yield* groupPermG(engine, keyArrs, m); // (row r of the result: kept group order[r])
       if (order) made.push(order);
-      const keepE = toEngine(keep, Uint32Array);
       const at = order ? yield* gatherG(engine, keepE, order, m, 'f32') : keepE; // (group numbers in result order; 4-byte copies)
       if (order) made.push(at);
       const cols = new Map();
@@ -872,7 +882,10 @@ export class Table {
     if (!plain) { own = engine.alloc(this.type, n); yield* engine.evalG(arg, this.#vars(merged), own); }
     if (engine.jit) { // whole numbers in a small range: a byte per (group, value) instead of the hash table
       let dense = null;
-      try { dense = yield* this.#denseDistinctG(plain ? plain.data : own, groupData, K); } catch (err) { if (own) engine.free(own); throw err; }
+      try {
+        dense = yield* this.#denseDistinctG(plain ? plain.data : own, groupData, K);
+        if (!dense && n >= 4096) dense = yield* this.#numberedDistinctG(plain ? plain.data : own, groupData, K);
+      } catch (err) { if (own) engine.free(own); throw err; }
       if (dense) { if (own) engine.free(own); return dense; }
     }
     const cols = new Map();
@@ -920,6 +933,23 @@ export class Table {
       return countMarks(engine.live(map), K, width);
     } finally {
       engine.free(map);
+    }
+  }
+
+  // Distinct counts of any values: each distinct value numbered by the hash
+  // table (every thread; missing values left out), then the numbers counted
+  // as in #denseDistinctG. Null when that byte map would be too big.
+  *#numberedDistinctG(values, groupData, K) {
+    const { engine, n } = this;
+    const one = new Table(engine, new Map([['v', { data: values, dict: null, codes: null }]]), n, { zones: false });
+    const ids = yield* one.#hashGroupsParallelG(['v']);
+    for (const x of ids.extra ?? []) engine.free(x);
+    try {
+      if (K * Math.ceil(ids.K / 8) * 8 > Math.min(2 ** 26, Math.max(2 ** 20, 16 * n))) return null;
+      yield* engine.evalG('v == v ? id : 0 / 0', { v: values, id: ids.data }, ids.data); // (missing values: no number)
+      return yield* this.#denseDistinctG(ids.data, groupData, K);
+    } finally {
+      engine.free(ids.data);
     }
   }
 
