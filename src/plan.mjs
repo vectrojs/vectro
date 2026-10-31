@@ -89,8 +89,9 @@ export class Query {
   }
   // (SQL) a column computed by a JavaScript function of whole values, once
   // per distinct combination (text functions): see Table._textmap. The spec's
-  // state keeps the labels, so it is made here once for this step.
-  textmap(name, spec) { return new Query({ op: 'textmap', input: this.node, name, inputs: spec.inputs ?? [], fn: spec.fn, text: spec.text ?? true, date: spec.date ?? false, label: spec.label ?? 'fn', state: spec.state ?? { dict: [], codes: new Map() } }); }
+  // state keeps the labels, so it is made here once for this step. labels:
+  // the one input holds codes 0..L-1 of these labels already (no fn).
+  textmap(name, spec) { return new Query({ op: 'textmap', input: this.node, name, inputs: spec.inputs ?? [], fn: spec.fn, text: spec.text ?? true, date: spec.date ?? false, label: spec.label ?? 'fn', labels: spec.labels ?? null, state: spec.state ?? (spec.labels ? { dict: spec.labels.slice(), codes: new Map(spec.labels.map((l, i) => [l, i])) } : { dict: [], codes: new Map() }) }); }
   // (SQL) window functions: see Table._window for the spec
   window(spec) { return new Query({ op: 'window', input: this.node, partition: spec.partition ?? [], order: spec.order ?? [], items: spec.items }); }
   // (SQL) the rows of several queries one after another, columns by position
@@ -182,9 +183,12 @@ function pushFilter(node, cond) {
     case 'textmap':
       if (!used.has(node.name)) return { ...node, input: pushFilter(node.input, cond) };
       break;
-    case 'window': // (only a filter on the partition keys keeps every window the same)
+    case 'window': { // (only a filter on the partition keys keeps every window the same)
       if (node.partition.length && [...used].every((n) => node.partition.includes(n))) return { ...node, input: pushFilter(node.input, cond) };
+      const k = firstRanks(cond, node);
+      if (k !== null) return { op: 'filter', input: { ...node, firstRanks: Math.min(k, node.firstRanks ?? Infinity) }, ast: cond };
       break;
+    }
     case 'join': {
       const { left, fromRight } = joinNames(node);
       if ([...used].every((n) => left.has(n))) return { ...node, left: pushFilter(node.left, cond) };
@@ -195,6 +199,22 @@ function pushFilter(node, cond) {
   return { op: 'filter', input: node, ast: cond };
 }
 const isDateExpr = (node) => node.ast.t === 'call' && DATE_RESULT.has(node.ast.fn);
+
+// A filter keeping only the first k rows (rank) of each partition, as
+// `rn <= k`, `rn < k + 1`, `rn = k` or `k >= rn` on a ROW_NUMBER or RANK of
+// this window: k, else null. The window then only needs the rows that can
+// rank that high (see Table._window); every function of the node must give
+// the same values on those rows (it reads only rows ordered before each row).
+const PREFIX_FNS = new Set(['row_number', 'rank', 'dense_rank', 'lag']);
+function firstRanks(cond, node) {
+  if (cond.t !== 'bin' || !node.order.length || !node.items.every((it) => PREFIX_FNS.has(it.fn))) return null;
+  const flip = { '>=': '<=', '>': '<', '==': '==' };
+  const [v, op, lim] = cond.l.t === 'var' && cond.r.t === 'num' ? [cond.l, cond.op, cond.r.v] : cond.r.t === 'var' && cond.l.t === 'num' ? [cond.r, flip[cond.op], cond.l.v] : [];
+  const item = v && node.items.find((it) => it.name === v.name);
+  if (!item || (item.fn !== 'row_number' && item.fn !== 'rank')) return null;
+  const k = op === '<=' || op === '==' ? Math.floor(lim) : op === '<' ? Math.ceil(lim) - 1 : NaN;
+  return k >= 1 && k <= 10_000 ? k : null;
+}
 
 export function optimize(node) {
   switch (node.op) {
@@ -272,7 +292,7 @@ function* execG(node, needed, temps) {
       const s = yield* execG(node.input, needed ? new Set([...[...needed].filter((n) => !made.has(n)), ...inputs]) : null, temps);
       const keep = needed ? s.visible.filter((n) => needed.has(n) || inputs.includes(n)) : s.visible;
       const t = yield* materializeG(s, new Set([...keep, ...inputs]), temps, [], true);
-      const w = yield { table: t.select(...new Set([...keep, ...inputs])), method: '_window', args: [{ partition: node.partition, order: node.order, items: node.items }] };
+      const w = yield { table: t.select(...new Set([...keep, ...inputs])), method: '_window', args: [{ partition: node.partition, order: node.order, items: node.items, firstRanks: node.firstRanks }] };
       return { table: w, derived: new Map(), visible: [...keep, ...node.items.map((it) => it.name)] };
     }
     case 'textmap': {
@@ -464,7 +484,7 @@ function describe(node, depth = 0) {
     case 'join': return `${pad}join ${JSON.stringify(node.opts.on)} ${node.opts.how ?? 'inner'}\n${pad}  left:\n${describe(node.left, depth + 2)}\n${pad}  right:\n${describe(node.right, depth + 2)}`;
     case 'output': return describe(node.input, depth);
     case 'textmap': return `${describe(node.input, depth)}\n${pad}${node.text ? 'text' : 'value'} ${node.name} = ${node.label}(${node.inputs.join(', ')}) (once per distinct value)`;
-    case 'window': return `${describe(node.input, depth)}\n${pad}window ${node.items.map((it) => `${it.name} = ${it.fn}(${it.arg ?? ''})`).join(', ')}${node.partition.length ? ` partition by ${node.partition.join(', ')}` : ''}${node.order.length ? ` order by ${node.order.map((o) => (o.desc ? `-${o.name}` : o.name)).join(', ')}` : ''}`;
+    case 'window': return `${describe(node.input, depth)}\n${pad}window ${node.items.map((it) => `${it.name} = ${it.fn}(${it.arg ?? ''})`).join(', ')}${node.partition.length ? ` partition by ${node.partition.join(', ')}` : ''}${node.order.length ? ` order by ${node.order.map((o) => (o.desc ? `-${o.name}` : o.name)).join(', ')}` : ''}${node.firstRanks ? ` (rows that can rank in the first ${node.firstRanks} only)` : ''}`;
     case 'union': return `${pad}union all\n${node.inputs.map((i) => describe(i, depth + 1)).join(`\n${pad}  and\n`)}`;
     case 'total': return `${describe(node.input, depth)}\n${pad}totals: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}`;
   }

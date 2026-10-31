@@ -8,13 +8,14 @@
 import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
 import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
 import { parse, toSource, walk, analyze, isMask } from './fuse.mjs';
-import { generateGroupBy, generateCompact, generateHashGroups } from './table-kernels.mjs';
+import { generateGroupBy, generateCompact, generateHashGroups, generateMarkPairs } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
+import { topModule, markModule } from './rank-kernels.mjs';
 import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { joinTablesG, joinViewG } from './join.mjs';
 import { Query } from './plan.mjs';
-import { bounds, windowValues } from './window.mjs';
+import { bounds, windowValues, readsPeers } from './window.mjs';
 import { copyRows } from './rows.mjs';
 import { textmapRows } from './textmap.mjs';
 import { writeArrow } from './arrow.mjs';
@@ -28,6 +29,7 @@ const DISTINCT = new Set(['countDistinct', 'approxDistinct']); // exact on a tab
 const IDENTITY = { sum: 0, count: 0, mean: 0, min: Infinity, max: -Infinity };
 const MAX_GROUP_SLOTS = 2 ** 28; // threads * aggregations * groups (2GB of float64)
 const PARALLEL_SORT_ROWS = 50_000; // smaller tables sort on the calling thread
+const TIME_STEPS = [86_400_000, 3_600_000, 60_000, 1_000]; // a day, an hour, a minute, a second (ms): see #directGroups
 
 export class Table {
   // cols: Map name -> { data, dict, codes, strings }
@@ -471,29 +473,37 @@ export class Table {
   // the accumulators stay small (or no larger than the rows). Else null.
   *#directGroups(keys, J) {
     const { engine } = this;
-    const sizes = [], offsets = [];
+    const sizes = [], offsets = [], steps = [];
     for (const key of keys) {
       const c = this.cols.get(key);
-      if (c.dict) { sizes.push(c.dict.length); offsets.push(0); continue; }
-      if (!this.n) { sizes.push(0); offsets.push(0); continue; }
+      if (c.dict) { sizes.push(c.dict.length); offsets.push(0); steps.push(1); continue; }
+      if (!this.n) { sizes.push(0); offsets.push(0); steps.push(1); continue; }
       // whole numbers in a range under 2^24 (from their minimum: 202301..202412, IDs from 1e9, negatives)
       const k = c.enc ? { data: c.data, enc: c.enc, n: this.n, type: this.type === Float32Array ? 'f32' : 'f64' } : c.data;
       const [lo, hi, frac] = yield* engine.evalG(['min(k)', 'max(k)', 'count(k != floor(k))'], { k });
-      if (frac > 0 || !(hi - lo < 2 ** 24) || !Number.isFinite(lo)) return null;
-      sizes.push(hi - lo + 1);
+      if (frac > 0 || !Number.isFinite(lo) || !Number.isFinite(hi)) return null;
+      // or times a whole number of days (hours, minutes, seconds) apart: numbered by that unit
+      let step = 1;
+      if (!(hi - lo < 2 ** 24)) {
+        const units = TIME_STEPS.filter((s) => (hi - lo) / s < 2 ** 24);
+        const off = units.length ? yield* engine.evalG(units.map((s) => `count((k - lo) / ${s} != floor((k - lo) / ${s}))`), { k, lo }) : [];
+        step = units.find((_, j) => [off].flat()[j] === 0);
+        if (!step) return null;
+      }
+      sizes.push((hi - lo) / step + 1);
       offsets.push(lo);
+      steps.push(step);
     }
     const K = sizes.reduce((a, b) => a * b, 1);
     const C = engine.jit && K <= 1024 ? 4 : 1;
-    if (K > 2 ** 24 || engine.T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (K > 65_536 && K > 2 * this.n)) return null;
+    if (K > 2 ** 24 || engine.T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (K > 65_536 && K > 8 * this.n)) return null;
     const below = sizes.map((_, k) => sizes.slice(k + 1).reduce((a, b) => a * b, 1));
-    const keyColumn = (k, keep) => { // key k of each kept group (codes for text)
-      const out = new Float64Array(keep.length), d = below[k], size = sizes[k], o = offsets[k];
-      for (let r = 0; r < keep.length; r++) out[r] = (Math.floor(keep[r] / d) % size) + o;
-      return out;
+    const keyColumn = (k, keep) => directKeys(keep, below[k], sizes[k], steps[k], offsets[k]); // key k of each kept group (codes for text)
+    if (keys.length === 1 && offsets[0] === 0 && steps[0] === 1) return { K, data: this.cols.get(keys[0]).data, enc: this.cols.get(keys[0]).enc ?? null, keyColumn, owned: false, sorted: true };
+    const term = (k) => {
+      const t = offsets[k] ? `(${keys[k]} - ${offsets[k] < 0 ? `(${offsets[k]})` : offsets[k]})` : keys[k];
+      return steps[k] === 1 ? t : `(${t} / ${steps[k]})`;
     };
-    if (keys.length === 1 && offsets[0] === 0) return { K, data: this.cols.get(keys[0]).data, enc: this.cols.get(keys[0]).enc ?? null, keyColumn, owned: false, sorted: true };
-    const term = (k) => (offsets[k] ? `(${keys[k]} - ${offsets[k] < 0 ? `(${offsets[k]})` : offsets[k]})` : keys[k]);
     let expr = term(0);
     for (let k = 1; k < keys.length; k++) expr = `(${expr}) * ${sizes[k]} + ${term(k)}`;
     const data = engine.alloc(this.type, this.n);
@@ -557,11 +567,7 @@ export class Table {
       }
       ids[i] = g;
     }
-    const keyColumn = (k, keep) => { // key k of each kept group (codes for text)
-      const out = new Float64Array(keep.length);
-      for (let r = 0; r < keep.length; r++) out[r] = kv[keep[r] * nk + k];
-      return out;
-    };
+    const keyColumn = (k, keep) => stridedKeys(kv, keep, nk, k); // key k of each kept group (codes for text)
     return { K, data, keyColumn, owned: true, sorted: false };
   }
 
@@ -601,11 +607,7 @@ export class Table {
         limit = Math.min(n, limit * 4);
         continue;
       }
-      const keyColumn = (k, keep) => { // key k of each kept group (codes for text)
-        const kv = engine.live(keyBits), out = new Float64Array(keep.length);
-        for (let r = 0; r < keep.length; r++) out[r] = kv[keep[r] * nk + k];
-        return out;
-      };
+      const keyColumn = (k, keep) => stridedKeys(engine.live(keyBits), keep, nk, k); // key k of each kept group (codes for text)
       return { K, data, keyColumn, owned: true, sorted: false, extra: [keyBits] };
     }
   }
@@ -615,12 +617,7 @@ export class Table {
   #estimateGroups(cols) {
     const live = cols.map((c) => this.engine.live(c));
     const m = Math.min(this.n, 65_536), step = this.n / m;
-    const counts = new Map();
-    for (let j = 0; j < m; j++) {
-      const i = Math.floor(j * step);
-      const key = live.length === 1 ? live[0][i] : live.map((c) => c[i]).join(',');
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
+    const counts = sampleCounts(live, this.type === Float32Array, m, step);
     let once = 0, twice = 0;
     for (const c of counts.values()) { if (c === 1) once++; else if (c === 2) twice++; }
     const est = counts.size + (twice ? (once * once) / (2 * twice) : once * (this.n / m));
@@ -638,34 +635,8 @@ export class Table {
     const presentOf = (it) => totals[1 + kernelItems.findIndex((k) => k.of === it)];
     // Keep groups that have rows, sorted by key (codes for text keys, so
     // dictionary order; NaN last), and build whole columns.
-    const counts = totals[0];
-    let m = 0;
-    for (let g = 0; g < K; g++) if (counts[g] > 0) m++;
-    let keep = new Float64Array(m);
-    for (let g = 0, r = 0; g < K; g++) if (counts[g] > 0) keep[r++] = g;
-    let codes = keys.map((_, k) => groups.keyColumn(k, keep));
-    if (!groups.sorted) {
-      let idx;
-      if (engine.jit && m >= PARALLEL_SORT_ROWS) { // many groups: sort them on every thread
-        const arrays = codes.map((a) => { const x = engine.alloc(Float64Array, m); engine.live(x).set(a); return x; });
-        try {
-          const perm = yield* sortPermG(engine, arrays, m, 'f64');
-          idx = engine.live(perm).slice();
-          engine.free(perm);
-        } finally {
-          for (const x of arrays) engine.free(x);
-        }
-      } else idx = sortIndex(codes, m);
-      const order = new Float64Array(m);
-      for (let r = 0; r < m; r++) order[r] = keep[idx[r]];
-      keep = order;
-      codes = codes.map((a) => { const out = new Float64Array(m); for (let r = 0; r < m; r++) out[r] = a[idx[r]]; return out; });
-    }
-    const columns = {};
-    keys.forEach((key, k) => {
-      const dict = this.cols.get(key).dict;
-      columns[key] = dict ? { codes: new Uint32Array(codes[k]), labels: dict } : codes[k];
-    });
+    let keep = keptGroups(totals[0], K);
+    const m = keep.length;
     for (const it of allItems) { // distinct counts per group: from (group, value) pairs
       if (!DISTINCT.has(it.fn)) continue;
       let gData = groups.data;
@@ -675,15 +646,55 @@ export class Table {
       }
       try { it.perGroup = yield* this.#distinctCountsG(it.arg, merged, gData, K); } finally { if (gData !== groups.data) engine.free(gData); }
     }
-    allItems.forEach((it) => {
-      const i = items.indexOf(it);
-      const v = i >= 0 ? totals[i + 1] : it.perGroup, out = new Float64Array(m);
-      if (it.fn === 'mean') { const p = presentOf(it); for (let r = 0; r < m; r++) out[r] = v[keep[r]] / p[keep[r]]; }
-      else if (it.fn === 'min' || it.fn === 'max') { const p = presentOf(it); for (let r = 0; r < m; r++) out[r] = p[keep[r]] ? v[keep[r]] : NaN; }
-      else for (let r = 0; r < m; r++) out[r] = v[keep[r]];
-      columns[it.out] = out;
+    // each item's value for every group number
+    const perGroup = allItems.map((it) => {
+      const i = items.indexOf(it), v = i >= 0 ? totals[i + 1] : it.perGroup;
+      return it.fn === 'mean' ? ratioOf(v, presentOf(it)) : it.fn === 'min' || it.fn === 'max' ? presentOnly(v, presentOf(it)) : v;
     });
+    if (engine.jit && m >= PARALLEL_SORT_ROWS) return yield* this.#groupTableG(keys, groups, allItems, perGroup, keep);
+    let codes = keys.map((_, k) => groups.keyColumn(k, keep));
+    if (!groups.sorted) {
+      const idx = sortIndex(codes, m);
+      keep = gatherU32(keep, idx);
+      codes = codes.map((a) => gatherF64(a, idx));
+    }
+    const columns = {};
+    keys.forEach((key, k) => {
+      const dict = this.cols.get(key).dict;
+      columns[key] = dict ? { codes: new Uint32Array(codes[k]), labels: dict } : codes[k];
+    });
+    allItems.forEach((it, j) => { columns[it.out] = gatherF64(perGroup[j], keep); });
     return Table.fromColumns(engine, columns, { type: Float64Array, dates: keys.filter((k) => this.cols.get(k).date) });
+  }
+
+  // (see #runGroupsG) Many groups: the result columns made in engine memory
+  // on every thread. keep: the group numbers kept, ascending; their keys are
+  // sorted (unless they are in order already), then every column gathered
+  // in that order.
+  *#groupTableG(keys, groups, allItems, perGroup, keep) {
+    const { engine } = this;
+    const m = keep.length, made = [];
+    const toEngine = (a, Type = Float64Array) => { const x = engine.alloc(Type, a.length); engine.live(x).set(a); made.push(x); return x; };
+    const owned = (x) => { made.splice(made.indexOf(x), 1); return x; };
+    try {
+      const keyArrs = keys.map((_, k) => toEngine(groups.keyColumn(k, keep)));
+      const order = groups.sorted ? null : yield* groupPermG(engine, keyArrs, m); // (row r of the result: kept group order[r])
+      if (order) made.push(order);
+      const keepE = toEngine(keep, Uint32Array);
+      const at = order ? yield* gatherG(engine, keepE, order, m, 'f32') : keepE; // (group numbers in result order; 4-byte copies)
+      if (order) made.push(at);
+      const cols = new Map();
+      keys.forEach((key, k) => {
+        const src = this.cols.get(key);
+        cols.set(key, { data: null, dict: src.dict ?? null, codes: src.dict ? src.codes : null, date: src.date || undefined, k });
+      });
+      for (const c of cols.values()) { c.data = order ? yield* gatherG(engine, keyArrs[c.k], order, m, 'f64') : owned(keyArrs[c.k]); delete c.k; }
+      for (const [j, it] of allItems.entries()) cols.set(it.out, { data: yield* gatherG(engine, toEngine(perGroup[j]), at, m, 'f64'), dict: null, codes: null });
+      for (const c of cols.values()) c.data = engine.live(c.data);
+      return new Table(engine, cols, m, { owned: [...cols.keys()] });
+    } finally {
+      for (const x of made) engine.free(x);
+    }
   }
 
   // (datasets, see dataset.mjs) Add the rows that match this table's filter
@@ -859,6 +870,11 @@ export class Table {
     const plain = /^[A-Za-z_]\w*$/.test(arg.trim()) ? this.cols.get(arg.trim()) : null;
     let own = null;
     if (!plain) { own = engine.alloc(this.type, n); yield* engine.evalG(arg, this.#vars(merged), own); }
+    if (engine.jit) { // whole numbers in a small range: a byte per (group, value) instead of the hash table
+      let dense = null;
+      try { dense = yield* this.#denseDistinctG(plain ? plain.data : own, groupData, K); } catch (err) { if (own) engine.free(own); throw err; }
+      if (dense) { if (own) engine.free(own); return dense; }
+    }
     const cols = new Map();
     if (groupData) cols.set('g', { data: groupData, dict: null, codes: null });
     cols.set('v', { data: plain ? plain.data : own, dict: null, codes: null });
@@ -880,6 +896,30 @@ export class Table {
       if (pairs?.owned) engine.free(pairs.data);
       for (const x of pairs?.extra ?? []) engine.free(x);
       if (own) engine.free(own);
+    }
+  }
+
+  // Distinct counts per group (see #distinctCountsG) when the values are whole
+  // numbers spanning a range small enough for one byte per (group, value):
+  // every thread marks its rows' pairs in one byte map (generateMarkPairs),
+  // then each group's marks are counted. Else null.
+  *#denseDistinctG(values, groupData, K) {
+    const { engine, n } = this;
+    const [lo, hi, frac] = yield* engine.evalG(['min(v == v ? v : 1 / 0)', 'max(v == v ? v : -1 / 0)', 'count(v == v && v != floor(v))'], { v: values }); // (missing values skipped)
+    if (!(hi >= lo) || frac > 0) return hi >= lo ? null : new Float64Array(K); // (no values: no distinct ones)
+    const width = Math.ceil((hi - lo + 1) / 8) * 8; // (each group's bytes start on an 8-byte boundary)
+    if (!(width * K <= Math.min(2 ** 26, Math.max(2 ** 20, 16 * n)))) return null;
+    const t = this.type === Float32Array ? 'f32' : 'f64';
+    engine._tableKernels ??= new Map();
+    let v = engine._tableKernels.get(`markpairs|${t}`);
+    if (!v) { v = engine._register(generateMarkPairs(t, engine.isShared)); engine._tableKernels.set(`markpairs|${t}`, v); }
+    const map = engine.alloc(Uint8Array, width * K);
+    try {
+      engine.live(map).fill(0);
+      yield* engine._fusedG(v, n, [groupData ?? values, values], [engine.live(map).byteOffset, width, lo, groupData ? 1 : 0], 1);
+      return countMarks(engine.live(map), K, width);
+    } finally {
+      engine.free(map);
     }
   }
 
@@ -1004,12 +1044,22 @@ export class Table {
   _textmap(name, spec) { return this.engine._drive(this.#textmapG(name, spec)); }
   _textmapAsync(name, spec) { return this.engine._driveAsync(this.#textmapG(name, spec)); }
 
-  *#textmapG(name, { inputs = [], fn, text = true, date = false, state = { dict: [], codes: new Map() } }) {
+  *#textmapG(name, { inputs = [], fn, text = true, date = false, labels = null, state = { dict: [], codes: new Map() } }) {
     checkName(name);
     const { engine } = this;
     const t = this.pred ? yield* this.#collectG() : this;
     if (t.cols.has(name)) throw new Error(`vectro: column "${name}" already exists`);
     const ins = inputs.map((k) => t.cols.get(k) ?? (() => { throw new Error(`vectro: no column "${k}"`); })());
+    if (labels) { // codes already: copied (on every thread), with the labels
+      const data = engine.alloc(t.type, t.n);
+      if (t.n) yield* engine.evalG('x', { x: ins[0].enc ? { data: ins[0].data, enc: ins[0].enc, n: t.n, type: t.type === Float32Array ? 'f32' : 'f64' } : ins[0].data }, data);
+      const cols = new Map(t.cols), owned = t === this ? [] : [...t.owned];
+      if (t !== this) t.owned = [];
+      cols.set(name, { data, dict: state.dict, codes: state.codes });
+      owned.push(name);
+      for (const c of cols.values()) c.data = engine.live(c.data);
+      return new Table(engine, cols, t.n, { owned, ownedBuffers: t === this ? [] : t.ownedBuffers.splice(0), zones: false });
+    }
     const ranges = [], made = []; // number columns' [min, max, values not whole] (every thread)
     for (let k = 0; k < ins.length; k++) {
       const c = ins[k];
@@ -1038,9 +1088,13 @@ export class Table {
   _window(spec) { return this.engine._drive(this.#windowG(spec)); }
   _windowAsync(spec) { return this.engine._driveAsync(this.#windowG(spec)); }
 
-  *#windowG({ partition = [], order = [], items }) {
+  *#windowG({ partition = [], order = [], items, firstRanks = null }) {
     const { engine } = this;
     if (items.length && order.length === 1 && !order[0].desc && items.every((it) => (it.fn === 'percentile_cont' || it.fn === 'percentile_disc') && it.arg === order[0].name) && !this.cols.get(order[0].name)?.dict) return yield* this.#percentilesG(partition, items); // (text: by its sorted labels, below)
+    if (firstRanks && order.length) { // only rows that can rank in the first k (see plan.mjs firstRanks)
+      const few = yield* this.#firstRowsG(partition, order[0], firstRanks);
+      if (few) { try { return yield* few.#windowG({ partition, order, items }); } finally { few.dispose(); } }
+    }
     const by = [...partition, ...order.map((o) => `${o.desc ? '-' : ''}${o.name}`)];
     const t = by.length ? yield* this.#sortG(by) : yield* this.#collectG();
     const n = t.n, f32 = t.type === Float32Array;
@@ -1052,7 +1106,7 @@ export class Table {
       if (c.enc) for (let i = 0; i < n; i++) out[i] = decodeOne(c.enc, d[i], f32); else out.set(d.subarray(0, n));
       return out;
     };
-    const b = bounds(n, partition.map(values), order.map((o) => values(o.name)));
+    const b = bounds(n, partition.map(values), order.map((o) => values(o.name)), readsPeers(items));
     const orderKey = order.length === 1 ? values(order[0].name) : null;
     const cols = new Map(t.cols), owned = t === this ? [] : [...t.owned];
     if (t !== this) t.owned = [];
@@ -1070,6 +1124,49 @@ export class Table {
     return new Table(engine, cols, n, { owned, zones: false });
   }
 
+  // The rows that can be among the first k of their partition in the window's
+  // order: those whose first order key is at most the partition's k-th
+  // smallest (all its ties too), as a new table; null when that isn't fewer
+  // rows. Every row ordered before a kept row is kept, so row numbers and
+  // ranks computed on these rows alone are the same.
+  *#firstRowsG(partition, first, k) {
+    const { engine } = this;
+    const t = yield* this.#collectG();
+    const made = []; // engine arrays to free
+    try {
+      const n = t.n, f32 = t.type === Float32Array, c = t.cols.get(first.name);
+      if (n < 4096 || !c || c.strings || partition.some((p) => !t.cols.has(p))) return null;
+      const parallel = engine.jit && !f32;
+      // each row's partition number 0..K-1 (as float64 for the kernels)
+      let K = 1, g = null;
+      if (partition.length) {
+        const ids = (yield* t.#directGroups(partition, 1)) ?? (engine.jit ? yield* t.#hashGroupsParallelG(partition) : t.#hashGroups(partition));
+        for (const x of ids.extra ?? []) engine.free(x);
+        K = ids.K;
+        if (ids.owned) made.push(ids.data);
+        if (ids.enc || !parallel) {
+          const d = engine.live(ids.data), plain = parallel ? engine.alloc(Float64Array, n) : null, out = plain ? engine.live(plain) : new Int32Array(n);
+          if (ids.enc) for (let i = 0; i < n; i++) out[i] = decodeOne(ids.enc, d[i], f32); else for (let i = 0; i < n; i++) out[i] = d[i];
+          g = plain ?? out;
+          if (plain) made.push(plain);
+        } else g = ids.data;
+      }
+      if (K * k > 2 ** 24 || K * k * 2 > n) return null;
+      let keep;
+      if (parallel) {
+        if (!g) { g = engine.alloc(Float64Array, n); engine.live(g).fill(0); made.push(g); }
+        const plainKey = !c.dict && !c.enc;
+        const key = plainKey ? c.data : engine.alloc(Float64Array, n);
+        if (!plainKey) { engine.live(key).set(firstKey(engine, c, first.desc, n, false)); made.push(key); }
+        keep = yield* firstRowsParallelG(engine, key, plainKey && first.desc, g, n, K, k);
+      } else keep = firstRows(firstKey(engine, c, first.desc, n, f32), g, n, K, k);
+      return keep.length * 2 > n ? null : t.#gather(keep, keep.length);
+    } finally {
+      for (const x of made) engine.free(x);
+      if (t !== this) t.dispose();
+    }
+  }
+
   // Percentiles of each partition, for every row, without sorting the table:
   // rows numbered by partition (as for groupBy), each partition's values
   // gathered (a counting sort by partition number), the ranks needed picked
@@ -1079,14 +1176,32 @@ export class Table {
     const t = yield* this.#collectG();
     const n = t.n, f32 = t.type === Float32Array;
     const plainOf = (c, data = c.data) => { const d = engine.live(data), out = new Float64Array(n); if (c.enc) for (let i = 0; i < n; i++) out[i] = decodeOne(c.enc, d[i], f32); else out.set(d.subarray(0, n)); return out; };
-    let K = 1, g = null;
+    let K = 1, g = null, gData = null; // each row's partition: JS int32, and in engine memory while needed
+    const made = [];
     if (partition.length && n) {
       for (const k of partition) if (!t.cols.has(k)) throw new Error(`vectro: no column "${k}"`);
       const ids = (yield* t.#directGroups(partition, 1)) ?? (engine.jit && n >= 4096 ? yield* t.#hashGroupsParallelG(partition) : t.#hashGroups(partition));
-      try { K = ids.K; g = ids.enc ? Int32Array.from(plainOf({ enc: ids.enc }, ids.data)) : toInt32(engine.live(ids.data), n); } finally { if (ids.owned) engine.free(ids.data); for (const x of ids.extra ?? []) engine.free(x); }
+      for (const x of ids.extra ?? []) engine.free(x);
+      if (ids.owned) made.push(ids.data);
+      K = ids.K;
+      g = ids.enc ? Int32Array.from(plainOf({ enc: ids.enc }, ids.data)) : toInt32(engine.live(ids.data), n);
+      if (!ids.enc && !f32) gData = ids.data;
     }
-    const cols = new Map(t.cols), owned = t === this ? [] : [...t.owned];
-    if (t !== this) t.owned = [];
+    try {
+      return yield* t.#percentileColumnsG(items, K, g, gData, t !== this);
+    } finally {
+      for (const x of made) engine.free(x);
+    }
+  }
+
+  // (see #percentilesG) The new columns: each item's value for its row's
+  // partition. temp: this table is a copy, its columns can move to the result.
+  *#percentileColumnsG(items, K, g, gData, temp) {
+    const { engine } = this;
+    const t = this, n = t.n, f32 = t.type === Float32Array;
+    const plainOf = (c, data = c.data) => { const d = engine.live(data), out = new Float64Array(n); if (c.enc) for (let i = 0; i < n; i++) out[i] = decodeOne(c.enc, d[i], f32); else out.set(d.subarray(0, n)); return out; };
+    const cols = new Map(t.cols), owned = temp ? [...t.owned] : [];
+    if (temp) t.owned = [];
     const valuesOf = (arg) => {
       const c = t.cols.get(arg);
       if (!c) throw new Error(`vectro: no column "${arg}"`);
@@ -1102,7 +1217,10 @@ export class Table {
     }
     const per = new Map();
     for (const [arg, its] of byArg) {
-      const got = percentiles(valuesOf(arg), g, K, its);
+      const c = t.cols.get(arg);
+      let got = null;
+      if (engine.jit && !f32 && n >= 65_536 && K <= 64 && c && !c.enc && !c.strings && (gData || K === 1)) got = yield* t.#percentilesParallelG(c.data, gData, K, its);
+      got ??= percentiles(valuesOf(arg), g, K, its);
       its.forEach((it, j) => per.set(it, got[j]));
     }
     for (const it of items) {
@@ -1115,6 +1233,54 @@ export class Table {
     }
     for (const c of cols.values()) c.data = engine.live(c.data);
     return new Table(engine, cols, n, { owned, zones: false });
+  }
+
+  // percentiles (below) for few partitions on every thread: each value's
+  // bucket (4096 per partition, evenly over the values' range; missing
+  // values in one more) is counted with the group kernel, the buckets
+  // holding the wanted ranks found from the counts, and only their values
+  // collected and selected among. values, gData: float64 engine arrays (gData
+  // null: one partition). null when the values aren't all finite.
+  *#percentilesParallelG(values, gData, K, items) {
+    const { engine, n } = this;
+    const [lo, hi] = yield* engine.evalG(['min(v == v ? v : 1 / 0)', 'max(v == v ? v : -1 / 0)'], { v: values });
+    if (!(hi >= lo)) return items.map(() => new Float64Array(K).fill(NaN));
+    if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;
+    const B = 4096, W = B + 1, vars = { v: values, lo, sc: hi > lo ? B / (hi - lo) : 0 };
+    if (gData) vars.g = gData;
+    const bucket = `(v == v ? (floor((v - lo) * sc) >= ${B} ? ${B - 1} : floor((v - lo) * sc)) : ${B})`;
+    const keys = engine.alloc(Float64Array, n);
+    try {
+      yield* engine.evalG(gData ? `g * ${W} + ${bucket}` : bucket, vars, keys);
+      const [counts] = yield* this.#groupTotalsG({ K: K * W, data: keys }, [], {});
+      const sizes = new Int32Array(K);
+      for (let k = 0; k < K; k++) { let m = 0; for (let b = k * W, e = b + B; b < e; b++) m += counts[b]; sizes[k] = m; }
+      const { plan, wants } = percentileRanks(sizes, items);
+      // each wanted rank's bucket and its rank there
+      const chosen = new Map(), place = wants.map(([k, r]) => {
+        let b = k * W, below = 0;
+        while (below + counts[b] <= r) below += counts[b++];
+        if (!chosen.has(b)) chosen.set(b, chosen.size);
+        return [chosen.get(b), r - below];
+      });
+      const got = new Float64Array(wants.length);
+      if (wants.length) {
+        const cols = new Map([['k', { data: keys, dict: null, codes: null }], ['v', { data: values, dict: null, codes: null }]]);
+        const pred = [...chosen.keys()].map((b) => `k == ${b}`).join(' || ');
+        const few = yield* new Table(engine, cols, n, { pred, zones: false }).#collectG();
+        try {
+          const fk = engine.live(few.cols.get('k').data), fv = engine.live(few.cols.get('v').data);
+          const bufs = [...chosen.keys()].map((b) => new Float64Array(counts[b])), fill = new Int32Array(bufs.length);
+          for (let i = 0; i < few.n; i++) { const j = chosen.get(fk[i]); bufs[j][fill[j]++] = fv[i]; }
+          place.forEach(([j, r], w) => { got[w] = select(bufs[j], 0, bufs[j].length, r); });
+        } finally {
+          few.dispose();
+        }
+      }
+      return percentileValues(plan, got);
+    } finally {
+      engine.free(keys);
+    }
   }
 
   // (SQL UNION ALL) this table's rows, then each other's, as a new table;
@@ -1133,7 +1299,10 @@ export class Table {
       const v = new Table(t.engine, cols, t.n, { pred: t.pred, params: t.params });
       return v.pred ? v.collect() : v;
     });
-    try { return copyRows(this.engine, parts.map((t) => [t, 0, t.n])); } finally { for (const p of parts) if (p.owned.length) p.dispose(); }
+    // rows in one part only (an outer join's unmatched rows are often none): that part as it is
+    const full = parts.filter((p) => p.n > 0);
+    const keep = full.length === 1 ? full[0] : null;
+    try { return keep ?? copyRows(this.engine, parts.map((t) => [t, 0, t.n])); } finally { for (const p of parts) if (p !== keep && p.owned.length) p.dispose(); }
   }
   async _concatAsync(others) { return this._concat(others); }
 
@@ -1573,16 +1742,7 @@ function percentiles(x, g, K, items) {
     else for (let i = 0; i < n; i++) { const v = x[i]; if (v === v) { const h = hi[2 * i + 1]; hist[h < 0 ? ~h >>> 16 : (h >>> 16) | 0x8000]++; } }
     for (let k = 0; k < K; k++) { let m = 0; for (let b = k * B, e = b + B; b < e; b++) m += hist[b]; sizes[k] = m; }
   } else if (g) { for (let i = 0; i < n; i++) if (x[i] === x[i]) sizes[g[i]]++; } else for (let i = 0; i < n; i++) if (x[i] === x[i]) sizes[0]++;
-  // the ranks wanted (0 = the smallest value present)
-  const wants = [];
-  const plan = items.map((it) => Array.from(sizes, (m, k) => {
-    if (!m) return null;
-    if (it.fn === 'percentile_disc') { wants.push([k, Math.max(0, Math.ceil(it.p * m) - 1)]); return { at: wants.length - 1 }; }
-    const r = it.p * (m - 1), lo = Math.floor(r);
-    wants.push([k, lo]);
-    if (lo + 1 < m && r > lo) { wants.push([k, lo + 1]); return { at: wants.length - 2, frac: r - lo }; }
-    return { at: wants.length - 1 };
-  }));
+  const { plan, wants } = percentileRanks(sizes, items);
   const got = new Float64Array(wants.length);
   if (!radix) {
     const start = new Int32Array(K + 1);
@@ -1610,7 +1770,162 @@ function percentiles(x, g, K, items) {
     }
     place.forEach(([j, r], w) => { got[w] = select(bufs[j], 0, bufs[j].length, r); });
   }
+  return percentileValues(plan, got);
+}
+
+// The ranks each item needs in each partition of sizes[k] values present
+// (0 = the smallest): wants = [[partition, rank]...], plan[item][partition] =
+// { at (index into wants), frac (between it and the next) } or null.
+function percentileRanks(sizes, items) {
+  const wants = [];
+  const plan = items.map((it) => Array.from(sizes, (m, k) => {
+    if (!m) return null;
+    if (it.fn === 'percentile_disc') { wants.push([k, Math.max(0, Math.ceil(it.p * m) - 1)]); return { at: wants.length - 1 }; }
+    const r = it.p * (m - 1), lo = Math.floor(r);
+    wants.push([k, lo]);
+    if (lo + 1 < m && r > lo) { wants.push([k, lo + 1]); return { at: wants.length - 2, frac: r - lo }; }
+    return { at: wants.length - 1 };
+  }));
+  return { plan, wants };
+}
+// Each item's value per partition, from the values found for the wanted ranks.
+function percentileValues(plan, got) {
   return plan.map((ws) => Float64Array.from(ws, (w) => (!w ? NaN : w.frac ? got[w.at] + w.frac * (got[w.at + 1] - got[w.at]) : got[w.at])));
+}
+// Key k of each kept group: from keys stored side by side (kv[g * nk + k]),
+// or from a direct group number (g / below % size steps from the offset).
+function stridedKeys(kv, keep, nk, k) { const n = keep.length, out = new Float64Array(n); for (let r = 0; r < n; r++) out[r] = kv[keep[r] * nk + k]; return out; }
+function directKeys(keep, below, size, step, offset) { const n = keep.length, out = new Float64Array(n); for (let r = 0; r < n; r++) out[r] = (Math.floor(keep[r] / below) % size) * step + offset; return out; }
+// Group numbers 0..K-1 with rows (counts[g] > 0), in order.
+function keptGroups(counts, K) {
+  let m = 0;
+  for (let g = 0; g < K; g++) if (counts[g] > 0) m++;
+  const keep = new Uint32Array(m);
+  for (let g = 0, r = 0; g < K; g++) if (counts[g] > 0) keep[r++] = g;
+  return keep;
+}
+function gatherF64(src, idx) { const n = idx.length, out = new Float64Array(n); for (let r = 0; r < n; r++) out[r] = src[idx[r]]; return out; }
+function gatherU32(src, idx) { const n = idx.length, out = new Uint32Array(n); for (let r = 0; r < n; r++) out[r] = src[idx[r]]; return out; }
+
+// The order of m groups by their keys (engine arrays, one per key, first
+// most important; NaN last) on every thread, as an engine Uint32Array:
+// whole-number keys (codes, IDs) combined into one key when their ranges
+// allow (fewer passes).
+function* groupPermG(engine, keyArrs, m) {
+  let sortKeys = keyArrs, one = null;
+  if (keyArrs.length > 1) {
+    const vars = Object.fromEntries(keyArrs.map((a, k) => [`k${k}`, a]));
+    let span = 1, expr = null;
+    for (let k = 0; k < keyArrs.length && span <= 2 ** 53; k++) {
+      const [lo, hi, frac] = yield* engine.evalG(['min(k)', 'max(k)', 'count(k != floor(k))'], { k: keyArrs[k] });
+      if (frac > 0 || !Number.isFinite(lo) || !Number.isFinite(hi)) { span = Infinity; break; }
+      vars[`lo${k}`] = lo;
+      span *= hi - lo + 1;
+      expr = expr === null ? `(k${k} - lo${k})` : `(${expr}) * ${hi - lo + 1} + (k${k} - lo${k})`;
+    }
+    if (span <= 2 ** 53) { // (exact: every combination below 2^53)
+      one = engine.alloc(Float64Array, m);
+      yield* engine.evalG(expr, vars, one);
+      sortKeys = [one];
+    }
+  }
+  try { return yield* sortPermG(engine, sortKeys, m, 'f64'); } finally { if (one) engine.free(one); }
+}
+function ratioOf(v, p) { const n = v.length, out = new Float64Array(n); for (let g = 0; g < n; g++) out[g] = v[g] / p[g]; return out; } // (means)
+function presentOnly(v, p) { const n = v.length, out = new Float64Array(n); for (let g = 0; g < n; g++) out[g] = p[g] ? v[g] : NaN; return out; } // (mins, maxes: NaN where no value)
+
+// How often each key (tuple) shows up among m rows taken every `step` rows:
+// keys as one 32-bit hash of their bits (-0 as 0); for an estimate only.
+function sampleCounts(cols, f32, m, step) {
+  const W = f32 ? 1 : 2, words = cols.map((c) => new Int32Array(c.buffer, c.byteOffset, c.length * W)), counts = new Map();
+  for (let j = 0; j < m; j++) {
+    const i = Math.floor(j * step);
+    let h = 0x811c9dc5;
+    for (let k = 0; k < cols.length; k++) {
+      if (cols[k][i] === 0) { h = Math.imul(h, 0x01000193); continue; }
+      h = Math.imul(h ^ words[k][i * W], 0x01000193);
+      if (W === 2) h = Math.imul(h ^ words[k][i * W + 1], 0x01000193);
+    }
+    counts.set(h, (counts.get(h) ?? 0) + 1);
+  }
+  return counts;
+}
+
+// The marks (0 or 1 bytes) in each group's `width` bytes, 4 at a time.
+function countMarks(map, K, width) {
+  const w = new Uint32Array(map.buffer, map.byteOffset, (K * width) >> 2), per = width >> 2, out = new Float64Array(K);
+  for (let g = 0, i = 0; g < K; g++) {
+    let c = 0;
+    for (const e = i + per; i < e; i++) c += Math.imul(w[i], 0x01010101) >>> 24;
+    out[g] = c;
+  }
+  return out;
+}
+
+// A column's values as numbers sorting ascending in its order (NaN last):
+// text by its labels' order, descending keys negated.
+function firstKey(engine, c, desc, n, f32) {
+  const d = engine.live(c.data), key = new Float64Array(n);
+  if (c.dict) { const rank = labelRanks(c.dict, desc); for (let i = 0; i < n; i++) key[i] = rank[c.enc ? decodeOne(c.enc, d[i]) : d[i]]; }
+  else if (c.enc) for (let i = 0; i < n; i++) key[i] = (desc ? -1 : 1) * decodeOne(c.enc, d[i], f32);
+  else if (desc) for (let i = 0; i < n; i++) key[i] = -d[i]; else key.set(d.subarray(0, n));
+  return key;
+}
+
+// firstRows (below) on every thread (see rank-kernels.mjs): key and g are
+// float64 engine arrays; neg: keys are negated as read.
+function* firstRowsParallelG(engine, key, neg, g, n, K, k) {
+  engine._tableKernels ??= new Map();
+  const kernel = (name, make) => {
+    let v = engine._tableKernels.get(name);
+    if (!v) { v = engine._register(make(engine.isShared)); engine._tableKernels.set(name, v); }
+    return v;
+  };
+  const top = kernel('firstrows-top', topModule), mark = kernel('firstrows-mark', markModule);
+  const slots = engine.alloc(Float64Array, K * (k + 1)), mask = engine.alloc(Uint8Array, n);
+  try {
+    engine.live(slots).fill(0);
+    yield* engine._groupRangeG(top, n, [key, g], [k, neg ? 1 : 0], engine.live(slots).byteOffset, K);
+    yield* engine._groupRangeG(mark, n, [key, g, mask], [k, neg ? 1 : 0], engine.live(slots).byteOffset, K);
+    return maskedRows(engine.live(mask), n);
+  } finally {
+    engine.free(slots);
+    engine.free(mask);
+  }
+}
+function maskedRows(m, n) {
+  let c = 0;
+  for (let i = 0; i < n; i++) c += m[i];
+  const out = new Uint32Array(c);
+  for (let i = 0, j = 0; i < n; i++) if (m[i]) out[j++] = i;
+  return out;
+}
+
+// Row numbers (in order) whose key is at most the k-th smallest key of their
+// partition g[i] (0..K-1; g null: one partition), NaN sorting last; every row
+// of a partition with fewer than k rows. Each partition keeps its k smallest
+// keys seen so far, sorted, so most rows cost one comparison.
+function firstRows(key, g, n, K, k) {
+  const top = new Float64Array(K * k), cnt = new Int32Array(K);
+  for (let i = 0; i < n; i++) {
+    const v = key[i], p = g === null ? 0 : g[i], c = cnt[p], base = p * k;
+    let j;
+    if (c < k) { j = base + c; cnt[p] = c + 1; } else {
+      const last = top[base + k - 1];
+      if (last !== last ? v !== v : v !== v || v >= last) continue; // not smaller than the k-th
+      j = base + k - 1;
+    }
+    for (; j > base; j--) { const a = top[j - 1]; if (a !== a ? v !== v : v !== v || v >= a) break; top[j] = a; } // insert, keeping order
+    top[j] = v;
+  }
+  let m = 0;
+  for (let pass = 0, out = null; pass < 2; pass++) {
+    for (let i = 0; i < n; i++) {
+      const v = key[i], p = g === null ? 0 : g[i], last = top[p * k + k - 1];
+      if (cnt[p] < k || last !== last || (v === v && v <= last)) { if (out) out[m] = i; m++; }
+    }
+    if (!pass) { out = new Uint32Array(m); m = 0; } else return out;
+  }
 }
 function toInt32(a, n) { const out = new Int32Array(n); for (let i = 0; i < n; i++) out[i] = a[i]; return out; }
 function spread(d, per, g, n) { for (let i = 0; i < n; i++) d[i] = per[g[i]]; }

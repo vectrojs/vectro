@@ -832,7 +832,7 @@ function compileSelect(ast, env, outer, tail) {
     for (const L of leftNames) lone = kinds.get(L) === 'text' ? lone.textmap(L, { fn: () => '', label: 'null' }) : lone.derive(L, 'NaN');
     rightOut.forEach((o, k) => { lone = lone.derive(o, tmp[k]); });
     const order = [...leftNames, ...rightOut];
-    const joined = leftQ.join(rq, { on: on.left.every((x, k) => x === on.right[k]) ? on.left : on, how: how === 'full' ? 'left' : 'inner' });
+    const joined = leftQ.join(rq, { on: on.left.every((x, k) => x === on.right[k]) ? on.left : on, how: how === 'full' ? 'left' : 'inner', view: true }); // (unique right keys: right columns looked up)
     return Query.union([joined.select(...order), lone.select(...order)]);
   }
 
@@ -1154,6 +1154,16 @@ function compileSelect(ast, env, outer, tail) {
       case 'case': {
         if (kindOf(e, ctx) === 'text') { // which branch (a number), then that branch's value as text
           const branches = [...e.whens.map((w) => w.v), e.otherwise];
+          if (branches.every((b) => b.k === 'str' || b.k === 'null')) { // labels in quotes only: each row's label code, on every thread
+            const labels = [...new Set(branches.map((b) => (b.k === 'str' ? b.v : '')))], codeOf = (b) => num(labels.indexOf(b.k === 'str' ? b.v : ''));
+            let code = codeOf(e.otherwise);
+            for (let i = e.whens.length - 1; i >= 0; i--) code = cond(e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : T(e.whens[i].c), codeOf(e.whens[i].v), code);
+            if (code.t !== 'num') {
+              const col = materialize(code, ctx), name = `__t${n.hidden++}`;
+              ctx.step({ name, inputs: [col], run: () => { q = q.textmap(name, { inputs: [col], labels, label: 'case' }); } });
+              return v(name);
+            }
+          }
           let which = num(branches.length - 1);
           for (let i = e.whens.length - 1; i >= 0; i--) which = cond(e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : T(e.whens[i].c), num(i), which);
           const args = [which.t === 'num' ? { value: which.v, kind: 'number' } : { col: materialize(which, ctx), kind: 'number' }, ...branches.map((b) => argOf(b, ctx))];

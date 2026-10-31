@@ -249,3 +249,28 @@ export function generateHashProbe(t, nk, shared = true) {
   f.emit(get(out), i32c(4), i32add, set(out), br(0), end, end);
   return buildModule([f], shared);
 }
+
+// Distinct values per group, for whole numbers in a small range: byte
+// map[g * width + (v - lo)] = 1 for each row's group g and value v (missing
+// values skipped). Every thread writes into the one map; writing 1 where it
+// may already be 1 is safe, and a byte already set is only read.
+// Signature: (g ptr, v ptr, n, map, width, lo, hasG) -> 0 (hasG 0: one group, g unread).
+export function generateMarkPairs(t, shared = true) {
+  const ty = TY[t];
+  const f = new Fn('k', [I32, I32, I32, F64, F64, F64, F64], [F64]);
+  const [gp, vp, n, mapP, widthP, lo, hasG] = [0, 1, 2, 3, 4, 5, 6];
+  const map = f.local(I32), width = f.local(I32), stop = f.local(I32), addr = f.local(I32), v = f.local(F64);
+  const IF = [0x04, 0x40], LOAD8_U = [0x2d, 0, 0], STORE8 = [0x3a, 0, 0];
+  f.emit(get(mapP), TRUNC_SAT_U.f64, set(map), get(widthP), TRUNC_SAT_U.f64, set(width));
+  f.emit(get(n), i32c(ty.bytes), i32mul, get(vp), i32add, set(stop));
+  f.emit(block, loop, get(vp), get(stop), i32geu, brIf(1));
+  f.emit(get(vp), ty.load, ty.toF64, set(v));
+  f.emit(get(v), get(v), [0x61], IF); // present (not NaN)
+  f.emit(get(v), get(lo), [0xa1], TRUNC_SAT_U.f64, get(map), i32add, set(addr)); // map + (v - lo)
+  f.emit(get(hasG), [0x44, 0, 0, 0, 0, 0, 0, 0, 0], [0x62], IF, get(gp), ty.load, ty.toF64, TRUNC_SAT_U.f64, get(width), i32mul, get(addr), i32add, set(addr), end);
+  f.emit(get(addr), LOAD8_U, I32_EQZ, IF, get(addr), i32c(1), STORE8, end);
+  f.emit(end);
+  f.emit(get(vp), i32c(ty.bytes), i32add, set(vp), get(gp), i32c(ty.bytes), i32add, set(gp), br(0), end, end);
+  f.emit([0x44, 0, 0, 0, 0, 0, 0, 0, 0]);
+  return buildModule([f], shared);
+}

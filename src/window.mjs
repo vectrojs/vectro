@@ -14,28 +14,41 @@
 //       (null: SQL's default: with ORDER BY, RANGE from the partition start to
 //       the current row and its ties; without, the whole partition)
 
-const same = (a, b) => a === b || (a !== a && b !== b); // (NaN equals NaN here, as in GROUP BY)
-
 // Partition starts: part[i] = first row of row i's partition; peers likewise
-// for rows with equal order keys inside a partition.
-export function bounds(n, partKeys, orderKeys) {
-  const partStart = new Int32Array(n), partEnd = new Int32Array(n), peerStart = new Int32Array(n), peerEnd = new Int32Array(n);
-  let p = 0;
-  while (p < n) {
-    let q = p + 1;
-    while (q < n && partKeys.every((k) => same(k[q], k[p]))) q++;
-    for (let i = p; i < q; i++) { partStart[i] = p; partEnd[i] = q; }
-    let a = p;
-    while (a < q) {
-      let b = a + 1;
-      while (b < q && orderKeys.every((k) => same(k[b], k[a]))) b++;
-      for (let i = a; i < b; i++) { peerStart[i] = a; peerEnd[i] = b; }
-      a = b;
-    }
-    p = q;
-  }
+// for rows with equal order keys inside a partition (peers: false skips them,
+// for functions that don't look at ties).
+export function bounds(n, partKeys, orderKeys, peers = true) {
+  const newPart = new Uint8Array(n), partStart = new Int32Array(n), partEnd = new Int32Array(n);
+  if (n) newPart[0] = 1;
+  for (const k of partKeys) markChanges(k, newPart, n);
+  spans(newPart, partStart, partEnd, n);
+  if (!peers) return { partStart, partEnd, peerStart: partStart, peerEnd: partEnd };
+  const newPeer = newPart.slice(), peerStart = new Int32Array(n), peerEnd = new Int32Array(n);
+  for (const k of orderKeys) markChanges(k, newPeer, n);
+  spans(newPeer, peerStart, peerEnd, n);
   return { partStart, partEnd, peerStart, peerEnd };
 }
+
+// mark[i] = 1 where k[i] differs from k[i - 1] (NaN equals NaN here)
+function markChanges(k, mark, n) {
+  for (let i = 1; i < n; i++) { const a = k[i], b = k[i - 1]; if (a !== b && (a === a || b === b)) mark[i] = 1; }
+}
+
+// Each row's run [start, end) from the marks of where runs begin.
+function spans(mark, start, end, n) {
+  let s = 0;
+  for (let i = 1; i <= n; i++) {
+    if (i === n || mark[i]) {
+      for (let j = s; j < i; j++) { start[j] = s; end[j] = i; }
+      s = i;
+    }
+  }
+}
+
+// Whether some item reads peers (rows with equal order keys): ranks, and
+// frames by RANGE (the default with ORDER BY counts the current row's ties).
+const NO_PEERS = new Set(['row_number', 'ntile', 'lag', 'lead', 'percentile_cont', 'percentile_disc']);
+export const readsPeers = (items) => items.some((it) => !NO_PEERS.has(it.fn) && it.frame?.unit !== 'rows');
 
 // Each row's frame [lo[i], hi[i]) (row indexes, within its partition).
 // orderKey: the single ORDER BY key, for RANGE with distances (desc: it falls).
