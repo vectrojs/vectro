@@ -159,7 +159,8 @@ export class Engine {
         // Plain memory moves when it grows (old views go stale), so grow in
         // big steps to make that rare.
         if (!this.isShared) pages = Math.max(pages, Math.min(MAX_PAGES - havePages, Math.max(256, havePages >> 1)));
-        if (havePages + pages > MAX_PAGES) throw new RangeError('vectro: out of memory (4GB limit)');
+        // (nothing may end at the 4GB address itself: kernels' end pointers would wrap to 0)
+        if (havePages + pages > MAX_PAGES || top > MAX_PAGES * PAGE - 64) throw new RangeError('vectro: out of memory (4GB limit)');
         this.memory.grow(pages);
       }
       this.heapTop = top;
@@ -631,6 +632,19 @@ export class Engine {
   *_unitsG(v, n, scalars) {
     yield {
       op: OP.UNITS, n, arrays: [], F: v.fn,
+      setup: () => {
+        for (let j = 0; j < scalars.length; j++) this.sc[j] = scalars[j];
+        this.ctrl[C.KERNEL] = v.id;
+        this.ctrl[C.NSCAL] = scalars.length;
+      },
+    };
+  }
+
+  // A kernel run once per task, n tasks claimed one at a time on every
+  // thread (see runTask): (task, thread index, scalars...).
+  *_tasksG(v, n, scalars) {
+    yield {
+      op: OP.TASKS, n, arrays: [], F: v.fn,
       setup: () => {
         for (let j = 0; j < scalars.length; j++) this.sc[j] = scalars[j];
         this.ctrl[C.KERNEL] = v.id;

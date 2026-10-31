@@ -67,22 +67,24 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
 - **Group by any keys:** `groupBy('region')`, `groupBy(['region', 'day'])`,
   `groupBy('account_id')`. Keys are category columns or any numbers (big IDs,
   amounts, negatives; NaN is its own group, -0 groups with 0). Groups come
-  back sorted by key. Small keys (a category, or whole numbers below 16.7M,
-  alone or combined) are group numbers as they are. Other keys are numbered
-  by every thread at once in one shared hash table (compare-and-swap inserts),
-  and with many groups each thread adds up its own range of groups. On 10M
-  rows vs DuckDB (`compare/bench-groupby.mjs`, answers checked):
+  back sorted by key. Small keys (a category, or whole numbers in a narrow
+  range, alone or combined) are group numbers as they are. With many groups
+  on a big table, every thread splits the rows into partitions by key range;
+  each partition is added up in a small hash table of its own (in the CPU's
+  cache) and its groups sorted, so the groups come out in key order with no
+  sort of the whole result, and sums are added in row order (the same answer
+  on any number of threads). Fewer groups are numbered by every thread at
+  once in one shared hash table. On 10M rows vs DuckDB
+  (`compare/bench-groupby.mjs`, answers checked):
 
   | Keys | Vectro | DuckDB |
   |---|---|---|
   | region + day (2,920 pairs) | 8 ms | 36 ms |
-  | price (100K amounts) | 33 ms | 44 ms |
-  | account (1M big IDs) | 124 ms | 69 ms |
-  | account + region (5.7M pairs) | 278 ms | 120 ms |
+  | price (100K amounts) | 24 ms | 45 ms |
+  | account (1M big IDs) | 29 ms | 63 ms |
+  | account + region (5.7M pairs) | 45 ms | 119 ms |
 
-  With millions of groups DuckDB is still faster: Vectro also sorts the groups
-  by key (on every thread; DuckDB returns them unsorted), and its shared hash
-  table misses the cache more than DuckDB's partitioned one.
+  Vectro's groups also come back sorted by key; DuckDB's come back unsorted.
 - **Missing values** are NaN and follow SQL's rules: `sum`, `mean`, `min`
   and `max` skip them (`mean` divides by the values present; `min`/`max` of
   nothing is NaN), `count(x)` counts the values present and `count(x > 5)`
@@ -758,10 +760,10 @@ Run them yourself: `cd compare && npm install && npm run bench`. Timings vary
 with the machine's state (battery, background load), so compare systems in the
 same run. More comparisons in `compare/`: SQL (`bench-sql.mjs`: Vectro faster
 on 19 of 20 queries), joins (`bench-join.mjs`: faster on all 4), group-by
-(`bench-groupby.mjs`), distinct counts (`bench-distinct.mjs`). DuckDB is still
-faster at grouping by millions of distinct keys (1.8–2.3x), FULL OUTER JOIN
-counts, counting a million distinct values spread over a wide range, and on
-billion-row files for top rows and joins.
+(`bench-groupby.mjs`: faster on all 4, 2.2–2.7x with millions of groups),
+distinct counts (`bench-distinct.mjs`). DuckDB is still faster at FULL OUTER
+JOIN counts, counting a million distinct values spread over a wide range, and
+on billion-row files for top rows and joins.
 
 ## Layout
 

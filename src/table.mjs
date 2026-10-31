@@ -13,6 +13,7 @@ import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
 import { topModule, markModule } from './rank-kernels.mjs';
 import { sortPermG, gatherG } from './parallel-sort.mjs';
+import { partitionedGroupsG, estimateGroups, PARTITION_ROWS, PARTITION_GROUPS, DIRECT_SLOTS } from './partition.mjs';
 import { joinTablesG, joinViewG } from './join.mjs';
 import { Query } from './plan.mjs';
 import { bounds, windowValues, readsPeers } from './window.mjs';
@@ -436,8 +437,8 @@ export class Table {
       for (const src of [...Object.values(spec), this.pred ?? '1']) walk(parse(src), (m) => { if (m.t === 'var' && this.cols.has(m.name)) used.add(m.name); });
       if (!this.engine.jit) { // the interpreter reads plain numbers
         if ([...used].some((n) => this.cols.get(n).enc)) return yield* this.#viaPlainG((t) => t.#groupAggG(keys, spec, params), used);
-      } else if (keys.some((k) => this.cols.get(k).enc)) { // the group kernel reads packed columns; the hash path needs plain keys
-        const direct = yield* this.#directGroups(keys, Object.keys(spec).length + 1);
+      } else if (keys.some((k) => this.cols.get(k).enc)) { // the group kernel reads packed columns; the other paths need plain keys
+        const direct = yield* this.#directGroups(keys, Object.keys(spec).length + 1, this.#directMax(1 + 2 * Object.keys(spec).length)); // (at most as many as below)
         if (direct?.owned) this.engine.free(direct.data);
         if (!direct) return yield* this.#viaPlainG((t) => t.#groupAggG(keys, spec, params), new Set(keys.filter((k) => this.cols.get(k).enc)));
       }
@@ -451,27 +452,95 @@ export class Table {
       const t = yield* this.#collectG();
       try { return yield* t.#groupAggG(keys, spec, params); } finally { t.dispose(); }
     }
-    const direct = yield* this.#directGroups(keys, items.length + 1);
+    const { engine } = this;
+    const totals = 1 + items.length + items.filter((it) => it.present).length, capped = {};
+    const direct = yield* this.#directGroups(keys, items.length + 1, items.some((it) => DISTINCT.has(it.fn)) ? 2 ** 24 : this.#directMax(totals), capped);
     if (direct) {
       try { return yield* this.#runGroupsG(keys, direct, items, merged); } finally { if (direct.owned) this.engine.free(direct.data); }
     }
-    // Hash path: keep the matching rows, number their distinct keys 0..K-1
-    // (in order of first appearance), then group by that number.
+    // Otherwise keep the matching rows. Big tables: partitioned by key range
+    // (see partition.mjs). Else (and for distinct counts, which need each
+    // row's group) the hash path: number the distinct keys 0..K-1 (in order
+    // of first appearance), then group by that number.
     const t = yield* this.#collectG();
-    const ids = this.engine.jit && t.n >= 4096 ? yield* t.#hashGroupsParallelG(keys) : t.#hashGroups(keys);
+    let ids = null;
     try {
+      let est; // (groups expected)
+      if (engine.jit && t.n >= (engine._partitionRows ?? PARTITION_ROWS) && !items.some((it) => DISTINCT.has(it.fn))) {
+        est = estimateGroups(t, keys);
+        const out = est >= (engine._partitionGroups ?? PARTITION_GROUPS) ? yield* t.#partitionedGroupsG(keys, items, merged, est) : null;
+        if (out) return out;
+        // not partitioned after all: keys the direct path turned down only to leave them to it,
+        // numbered directly when most of their range is in use (else the hash path is faster)
+        if (capped.K && est * 8 >= capped.K) {
+          ids = yield* t.#directGroups(keys, items.length + 1);
+          if (ids) return yield* t.#runGroupsG(keys, ids, items, merged);
+        }
+      }
+      ids = engine.jit && t.n >= 4096 ? yield* t.#hashGroupsParallelG(keys, est) : t.#hashGroups(keys);
       return yield* t.#runGroupsG(keys, ids, items, merged);
     } finally {
-      this.engine.free(ids.data);
-      for (const x of ids.extra ?? []) this.engine.free(x);
+      if (ids && ids.owned !== false) { // (direct numbers can be a key column itself)
+        this.engine.free(ids.data);
+        for (const x of ids.extra ?? []) this.engine.free(x);
+      }
       if (t !== this) t.dispose();
     }
+  }
+
+  // The result table from the partitioned path (see partition.mjs), or null
+  // when it doesn't suit these keys and aggregations. Totals as #runGroupsG
+  // has them: the row count first, then the items, then each mean's, min's
+  // and max's count of values present.
+  *#partitionedGroupsG(keys, items, merged, est) {
+    const { engine } = this;
+    const kernelItems = [...items, ...items.filter((it) => it.present).map((it) => ({ fn: 'count', arg: it.present, of: it }))];
+    const sources = ['count(1)', ...kernelItems.map((it) => `${it.fn === 'mean' ? 'sum' : it.fn}(${it.arg ?? 1})`)];
+    const r = yield* partitionedGroupsG(this, keys, sources, merged, est);
+    if (!r) return null;
+    const { G, keyCols, accCols, map } = r;
+    const pending = new Set([...keyCols, ...accCols]); // freed unless they become result columns
+    try {
+      const cols = new Map(), used = new Set();
+      keys.forEach((key, k) => {
+        const src = this.cols.get(key);
+        cols.set(key, { data: keyCols[k], dict: src.dict ?? null, codes: src.dict ? src.codes : null, date: src.date || undefined });
+      });
+      for (const [i, it] of items.entries()) {
+        let data = accCols[map[1 + i]];
+        if (it.present || used.has(data)) {
+          const out = engine.alloc(Float64Array, G);
+          pending.add(out);
+          if (!it.present) engine.live(out).set(engine.live(data)); // (a total two items share)
+          else if (G) { // mean: over the values present; min, max: NaN where there is none
+            const p = accCols[map[1 + kernelItems.findIndex((k) => k.of === it)]];
+            yield* engine.evalG(it.fn === 'mean' ? 'v / p' : '(p != 0) ? v : NaN', { v: data, p }, out);
+          }
+          data = out;
+        }
+        used.add(data);
+        cols.set(it.out, { data, dict: null, codes: null });
+      }
+      for (const c of cols.values()) { pending.delete(c.data); c.data = engine.live(c.data); }
+      return new Table(engine, cols, G, { owned: [...cols.keys()] });
+    } finally {
+      for (const x of pending) engine.free(x);
+    }
+  }
+
+  // The most groups to number directly with `totals` totals per group: past
+  // threads x totals x groups = DIRECT_SLOTS, the partitioned path is faster
+  // (on tables it takes).
+  #directMax(totals) {
+    const { engine } = this;
+    if (!engine.jit || this.n < (engine._partitionRows ?? PARTITION_ROWS)) return 2 ** 24;
+    return Math.floor((engine._directSlots ?? DIRECT_SLOTS) / (engine.T * totals));
   }
 
   // Keys small enough to be group numbers as they are: a text column's codes
   // or whole numbers 0..2^24, several combined as k1 * size2 + k2..., while
   // the accumulators stay small (or no larger than the rows). Else null.
-  *#directGroups(keys, J) {
+  *#directGroups(keys, J, maxK = 2 ** 24, info = null) { // (info.K: the groups when only maxK stood in the way)
     const { engine } = this;
     const sizes = [], offsets = [], steps = [];
     for (const key of keys) {
@@ -497,6 +566,7 @@ export class Table {
     const K = sizes.reduce((a, b) => a * b, 1);
     const C = engine.jit && K <= 1024 ? 4 : 1;
     if (K > 2 ** 24 || engine.T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (K > 65_536 && K > 8 * this.n)) return null;
+    if (K > maxK) { if (info) info.K = K; return null; }
     const below = sizes.map((_, k) => sizes.slice(k + 1).reduce((a, b) => a * b, 1));
     const keyColumn = (k, keep) => directKeys(keep, below[k], sizes[k], steps[k], offsets[k]); // key k of each kept group (codes for text)
     if (keys.length === 1 && offsets[0] === 0 && steps[0] === 1) return { K, data: this.cols.get(keys[0]).data, enc: this.cols.get(keys[0]).enc ?? null, keyColumn, owned: false, sorted: true };
@@ -576,11 +646,11 @@ export class Table {
   // sample of rows); if more groups turn up, again with a bigger table.
   // Group numbers follow first arrival, not row order (any order is fine:
   // the groups are sorted by key afterwards).
-  *#hashGroupsParallelG(keys) {
+  *#hashGroupsParallelG(keys, est) { // (est: groups expected, if known)
     const { engine, n } = this;
     const nk = keys.length, t = this.type === Float32Array ? 'f32' : 'f64';
     const cols = keys.map((k) => this.cols.get(k).data);
-    let limit = Math.min(n, engine._hashLimit ?? this.#estimateGroups(cols)); // (_hashLimit: tests)
+    let limit = Math.min(n, engine._hashLimit ?? (est === undefined ? this.#estimateGroups(cols) : Math.ceil(est * 1.5) + 1024)); // (_hashLimit: tests)
     if (t === 'f32') limit = Math.min(limit, 2 ** 24);
     const cacheKey = `hashgroups|${t}|${nk}`;
     engine._tableKernels ??= new Map();
@@ -666,13 +736,21 @@ export class Table {
       keep = gatherU32(keep, idx);
       codes = codes.map((a) => gatherF64(a, idx));
     }
-    const columns = {};
-    keys.forEach((key, k) => {
-      const dict = this.cols.get(key).dict;
-      columns[key] = dict ? { codes: new Uint32Array(codes[k]), labels: dict } : codes[k];
-    });
-    allItems.forEach((it, j) => { columns[it.out] = gatherF64(perGroup[j], keep); });
-    return Table.fromColumns(engine, columns, { type: Float64Array, dates: keys.filter((k) => this.cols.get(k).date) });
+    // (text keys keep their codes as numbers: a code with no label, NaN, stays NaN)
+    const cols = new Map(), made = [];
+    const toEngine = (a) => { const x = engine.alloc(Float64Array, m); engine.live(x).set(a); made.push(x); return x; };
+    try {
+      keys.forEach((key, k) => {
+        const src = this.cols.get(key);
+        cols.set(key, { data: toEngine(codes[k]), dict: src.dict ?? null, codes: src.dict ? src.codes : null, date: src.date || undefined });
+      });
+      allItems.forEach((it, j) => cols.set(it.out, { data: toEngine(gatherF64(perGroup[j], keep)), dict: null, codes: null }));
+      for (const c of cols.values()) c.data = engine.live(c.data);
+      made.length = 0;
+      return new Table(engine, cols, m, { owned: [...cols.keys()] });
+    } finally {
+      for (const x of made) engine.free(x);
+    }
   }
 
   // (see #runGroupsG) Many groups: the result columns made in engine memory

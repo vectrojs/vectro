@@ -9,7 +9,8 @@ The first public release. Everything below is new.
   WebAssembly loops and run on every CPU core (Node worker threads, Web
   Workers on cross-origin-isolated pages), one thread elsewhere, and a
   vectorized interpreter where code generation isn't allowed (Cloudflare Workers).
-- Filters, computed columns, aggregates, group by any keys, exact and
+- Filters, computed columns, aggregates, group by any keys (millions of
+  groups: partitioned by key range on every thread, sorted by key), exact and
   approximate distinct counts, joins (inner, left, right, full), sort and
   top-k, zone maps, compressed columns.
 - A query planner: `table.lazy()` chains are optimized as a whole.
@@ -39,10 +40,11 @@ The first public release. Everything below is new.
   Not signed, not yet tried in the applications.
 
 **Known gaps**
-- Slower than DuckDB on: group-by with millions of distinct keys (about 2x),
-  FULL OUTER JOIN counts, distinct counts of a million values spread over a
-  wide range, top rows and joins over billion-row datasets (see the README's
-  numbers). Faster on the other SQL queries measured (19 of 20).
+- Slower than DuckDB on: FULL OUTER JOIN counts, distinct counts of a million
+  values spread over a wide range, top rows and joins over billion-row
+  datasets (see the README's numbers). Faster on the other SQL queries
+  measured (19 of 20) and on every group-by measured (2.2-2.7x with millions
+  of groups).
 - Free-text columns (text that rarely repeats) can be shown but not grouped
   or filtered, except when served (`vectro serve` loads them as categories).
 - Window functions and percentiles keep the rows they read in memory.

@@ -6,7 +6,7 @@ import { countPattern } from './bytes.mjs';
 
 export const OP = {
   EXIT: 0, SUM: 1, MIN: 2, MAX: 3, ADD: 4, SCALE: 5, DOT: 6, HEAVY: 7,
-  COUNT_GT: 8, SORT_CHUNK: 9, MERGE: 10, COUNT_BYTES: 11, COPY: 12, FUSED: 13, GROUP: 14, COMPACT: 15, CSV_SCAN: 16, CSV_PARSE: 17, GROUP_RANGE: 18, UNITS: 19, READ: 20,
+  COUNT_GT: 8, SORT_CHUNK: 9, MERGE: 10, COUNT_BYTES: 11, COPY: 12, FUSED: 13, GROUP: 14, COMPACT: 15, CSV_SCAN: 16, CSV_PARSE: 17, GROUP_RANGE: 18, UNITS: 19, READ: 20, TASKS: 21,
 };
 
 // Layout of the shared control block (Int32 slots).
@@ -55,6 +55,7 @@ export function unitCount(op, T, n, sc) {
   if (op === OP.CSV_SCAN || op === OP.CSV_PARSE || op === OP.READ) return n; // n = number of chunks (READ: of file reads)
   if (op === OP.SORT_CHUNK) return sc[1];
   if (op === OP.GROUP_RANGE) return T; // a range of groups per thread
+  if (op === OP.TASKS) return n; // n tasks (e.g. one per partition)
   if (op === OP.MERGE) return Math.ceil(sc[1] / (2 * sc[0]));
   return blockCount(n, T);
 }
@@ -102,6 +103,8 @@ function runUnit(op, u, units, T, n, A, sc, ctrl, W, res, F, self) {
       runGroupRange(F, u, units, n, A, sc, ctrl);
     } else if (op === OP.UNITS) {
       runIndexed(F, u, units, n, sc, ctrl);
+    } else if (op === OP.TASKS) {
+      runTask(F, u, sc, ctrl, self);
     } else if (op === OP.COMPACT) {
       runCompact(F, u, units, n, A, sc, ctrl);
     } else if (op === OP.CSV_SCAN) {
@@ -164,6 +167,14 @@ function runGroupRange(F, u, units, n, A, sc, ctrl) {
 // Pointers travel as scalars; the unit number lets it use its own slots.
 function runIndexed(F, u, units, n, sc, ctrl) {
   const args = [chunkStart(u, units, n), chunkStart(u + 1, units, n), u];
+  for (let j = 0, ns = ctrl[C.NSCAL]; j < ns; j++) args.push(sc[j]);
+  F(...args);
+}
+
+// A kernel run once per task: (task, thread, scalars...). The thread index
+// (0 = calling thread) lets a task use that thread's own scratch memory.
+function runTask(F, u, sc, ctrl, self) {
+  const args = [u, self];
   for (let j = 0, ns = ctrl[C.NSCAL]; j < ns; j++) args.push(sc[j]);
   F(...args);
 }

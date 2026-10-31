@@ -36,7 +36,7 @@ export async function workerLoop({ ctrlBuf, scalarBuf, resultBuf, spin, module, 
     else buffers.set(msg.id, msg.buffer);
   };
 
-  const usesKernel = (op) => op === OP.FUSED || op === OP.GROUP || op === OP.GROUP_RANGE || op === OP.UNITS || op === OP.COMPACT;
+  const usesKernel = (op) => op === OP.FUSED || op === OP.GROUP || op === OP.GROUP_RANGE || op === OP.UNITS || op === OP.TASKS || op === OP.COMPACT;
 
   // Does the current task need a kernel or array we haven't received yet?
   function missing(op) {

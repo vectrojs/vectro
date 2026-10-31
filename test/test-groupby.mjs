@@ -84,25 +84,28 @@ const engines = [
 for (const [label, make] of engines) {
   const e = make();
   const t = e.tableAsync ? await e.tableAsync(cols) : e.table(cols);
-  for (const forceScatter of label.startsWith('split') ? [false] : [false, true]) {
+  for (const [forceScatter, partitioned] of label.startsWith('split') ? [[false, false]] : [[false, false], [true, false], [false, true]]) {
     if (forceScatter) e._maxGroupSlots = 64; // too few accumulator slots: the one-thread fallback
+    if (partitioned) e._partitionRows = e._partitionGroups = 0; // the partitioned path on these small tables too (see partition.mjs)
     for (const [keys, filter, keep] of CASES) {
       const want = reference(keys, keep, JS);
       const v = filter ? t.filter(filter) : t;
       let got;
       try { got = (await v.groupBy(keys.length === 1 ? keys[0] : keys).aggAsync(SPEC)).toRows(); } catch (err) { fail(`${label} ${keys} ${filter}: ${err.message}`); continue; }
       checks++;
-      if (got.length !== want.length) { fail(`${label}${forceScatter ? ' (fallback)' : ''} ${keys} ${filter}: ${got.length} groups, want ${want.length}`); continue; }
+      const how = forceScatter ? ' (fallback)' : partitioned ? ' (partitioned)' : '';
+      if (got.length !== want.length) { fail(`${label}${how} ${keys} ${filter}: ${got.length} groups, want ${want.length}`); continue; }
       const bad = want.findIndex((w, i) => Object.keys(w).some((k) => !close(got[i][k], w[k])));
-      if (bad >= 0) fail(`${label}${forceScatter ? ' (fallback)' : ''} ${keys} ${filter} group ${bad}: ${JSON.stringify(got[bad])} vs ${JSON.stringify(want[bad])}`);
+      if (bad >= 0) fail(`${label}${how} ${keys} ${filter} group ${bad}: ${JSON.stringify(got[bad])} vs ${JSON.stringify(want[bad])}`);
     }
-    e._maxGroupSlots = undefined;
+    e._maxGroupSlots = e._partitionRows = e._partitionGroups = undefined;
   }
   await t.dispose?.();
   await e.close();
 }
-// Big tables: every thread inserts into one shared hash table at once.
-// Few keys (threads race for the same slots), many keys, a table that starts
+// Big tables: partitioned by key range (see partition.mjs), and on the hash
+// path, where every thread inserts into one shared hash table at once. Few
+// keys (threads race for the same slots), many keys, a table that starts
 // too small (grows and runs again), two keys, float32.
 {
   const M = 400_000;
@@ -126,7 +129,9 @@ for (const [label, make] of engines) {
     const e = make();
     const f32 = label.includes('float32');
     const t = e.table({ few, many: f32 ? many.map((x) => (x - 1e12) * 2) : many, other, val }, f32 ? { type: Float32Array } : {});
-    for (const ranged of [false, true]) {
+    for (const [ranged, hash] of [[false, false], [false, true], [true, true]]) {
+      e._partitionRows = hash ? Infinity : undefined;
+      e._partitionGroups = hash ? undefined : 0; // (the few-keys case too)
       e._bigGroupSlots = ranged ? 1 : undefined; // ranged: each thread adds up its own range of groups
       for (const [name, keys, keyOf, rowKey, start] of cases) {
         const want = ref(f32 && keys.includes('many') ? (i) => keyOf(i).replace(String(many[i]), String((many[i] - 1e12) * 2)) : keyOf);
@@ -135,7 +140,7 @@ for (const [label, make] of engines) {
         e._hashLimit = undefined;
         checks++;
         const bad = g.length !== want.size ? `${g.length} groups, want ${want.size}` : g.find((r) => { const w = want.get(rowKey(r)); return !w || w[0] !== r.n || w[1] !== r.s; });
-        if (bad) fail(`${label}${ranged ? ' (ranged)' : ''} ${name}: ${typeof bad === 'string' ? bad : JSON.stringify(bad)}`);
+        if (bad) fail(`${label}${ranged ? ' (ranged)' : hash ? ' (hash)' : ''} ${name}: ${typeof bad === 'string' ? bad : JSON.stringify(bad)}`);
       }
       // a filter on the direct path with many groups, ranged too
       const g = t.filter('val > 0').groupBy('other').agg({ n: 'count()' }).toRows();
@@ -143,7 +148,7 @@ for (const [label, make] of engines) {
       for (let i = 0; i < M; i++) if (val[i] > 0) want++;
       checks++; if (g.reduce((a, r) => a + r.n, 0) !== want) fail(`${label}${ranged ? ' (ranged)' : ''} filtered direct groups`);
     }
-    e._bigGroupSlots = undefined;
+    e._bigGroupSlots = e._partitionRows = e._partitionGroups = undefined;
     await e.close();
   }
 }
