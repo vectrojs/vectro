@@ -7,7 +7,8 @@
   "author": "Hamza Masood",
   "homepage": "https://github.com/vectrojs/vectro#readme",
   "bugs": {
-    "url": "https://github.com/vectrojs/vectro/issues"
+    "url": "https://github.com/vectrojs/vectro/issues",
+    "email": "support@vectrojs.dev"
   },
   "repository": {
     "type": "git",

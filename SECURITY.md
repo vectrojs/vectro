@@ -1,7 +1,8 @@
 # Security
 
-Please report security problems privately through GitHub: the repository's
-**Security** tab > **Report a vulnerability**. Don't open a public issue for them.
+Please report security problems privately: email **security@vectrojs.dev**,
+or use the repository's **Security** tab > **Report a vulnerability** on
+GitHub. Don't open a public issue for them.
 
 What counts: anything that lets a client of `vectro serve` (HTTP, PostgreSQL,
 Flight SQL) or `vectro-mcp` read files outside the served folder, write

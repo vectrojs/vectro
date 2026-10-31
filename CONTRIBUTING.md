@@ -36,3 +36,5 @@ cases reported too.
 Open an issue with your Vectro, Node (or browser) version and the smallest
 code or SQL that shows it. For a BI tool that can't connect, run
 `vectro serve` with `--log-queries` and include the statement it printed.
+
+Questions that aren't bugs: **hello@vectrojs.dev**.
