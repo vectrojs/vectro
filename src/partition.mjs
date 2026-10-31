@@ -53,7 +53,7 @@ const view = (engine, a) => { const b = engine.live(a); return new DataView(b.bu
 // by key; keyCols: each key's values (codes for text), accCols: each
 // accumulator's totals (engine Float64Arrays, the caller's to free); source
 // i's totals are accCols[map[i]] (identical sources share one).
-export function* partitionedGroupsG(t, keys, sources, params, est) {
+export function* partitionedGroupsG(t, keys, sources, params, est, { countOnly = false } = {}) { // countOnly: just { G }
   const { engine, n } = t;
   if (!n) return null;
   const T = engine.T, shared = engine.isShared, tf = t.type === Float32Array ? 'f32' : 'f64';
@@ -83,7 +83,7 @@ export function* partitionedGroupsG(t, keys, sources, params, est) {
   const P = engine._partitionP ?? partitionsFor(n);
   const plan = planPartitions(sampleWord0(t, fields, Math.min(n, SAMPLE)), P);
   const branchFree = est > 0.2 * n; // many rows start a group: no branch on which
-  const agg = kernel(engine, `aggregate|${branchFree}|${W}|${RB}|${accShape}`, () => aggregateModule({ W, RB, accs: accs.map((a) => ({ op: a.op, stored: !!a.ast })) }, branchFree, shared));
+  const agg = kernel(engine, `aggregate|${branchFree}|${W}|${RB}|${accShape}|${countOnly}`, () => aggregateModule({ W, RB, accs: accs.map((a) => ({ op: a.op, stored: !!a.ast })) }, branchFree, shared, countOnly));
   const splitCount = kernel(engine, `split|count|${RB}`, () => splitModule(RB, 'count', shared));
   const splitCopy = kernel(engine, `split|copy|${RB}`, () => splitModule(RB, 'copy', shared));
   const at = (x) => engine.live(x).byteOffset;
@@ -162,6 +162,7 @@ export function* partitionedGroupsG(t, keys, sources, params, est) {
             const st = engine.live(starts2), g = yield* split(dst, src, st[q], st[q + 1], depth + 1, w);
             engine.live(groups2)[q] = g;
           }
+          if (countOnly) { let o = 0; const g = engine.live(groups2); for (let q = 0; q < P2; q++) o += g[q]; return o; }
           const from = engine.live(dst.arr), to = engine.live(src.arr), st = engine.live(starts2), g = engine.live(groups2);
           let o = s;
           for (let q = 0; q < P2; q++) { to.set(from.subarray((st[q] - dst.base) * RB, (st[q] + g[q] - dst.base) * RB), (o - src.base) * RB); o += g[q]; }
@@ -183,6 +184,7 @@ export function* partitionedGroupsG(t, keys, sources, params, est) {
       }
     }
 
+    if (countOnly) { let G = 0; const g = engine.live(groups); for (let p = 0; p < P; p++) G += g[p]; return { G }; }
     // every partition's groups into the result columns at its offset
     const outOff = A(Uint32Array, P);
     let G = 0;
@@ -275,13 +277,18 @@ function lookupParams(dv, lut, cnt, recs, P, plan) {
 // The number of groups, estimated from how often each key (tuple) shows up
 // among rows spread over the table (Chao1: seen + once^2 / (2 twice); with
 // no key seen twice, the keys seen once scaled up to the whole table); keys
-// as 53-bit hashes of their bits, -0 as 0, every NaN alike.
+// as 53-bit hashes of their bits, -0 as 0, every NaN alike. Each row is at a
+// random place in its stretch of the table: at evenly spaced rows, a table
+// of sorted runs of the same keys (partial groups put together) would show
+// every key once per run.
 export function estimateGroups(t, keys) {
   const { engine, n } = t, m = Math.min(n, SAMPLE), f32 = t.type === Float32Array, step = n / m;
   const cols = keys.map((k) => { const c = t.cols.get(k); return { d: engine.live(c.data), enc: c.enc ?? null }; });
   const hashes = new Float64Array(m), f = new Float64Array(1), u = new Uint32Array(f.buffer);
+  let x = 0x9e3779b9;
   for (let j = 0; j < m; j++) {
-    const i = Math.floor(j * step);
+    x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+    const i = Math.min(n - 1, Math.floor((j + (x >>> 0) / 2 ** 32) * step));
     let h1 = 0x811c9dc5, h2 = 0x2545f491;
     for (const { d, enc } of cols) {
       const v = enc ? decodeOne(enc, d[i], f32) : d[i];

@@ -221,5 +221,60 @@ for (const [label, make] of [['threads', () => new Engine()], ['single thread', 
   }
   await e.close();
 }
+// FULL / RIGHT JOIN rows with no match (marked by the join itself) against
+// plain JavaScript: missing and repeated keys, empty sides, two-column keys,
+// and the same query run several times at once
+{
+  const fullJoin = (L, R, eq) => {
+    const hit = new Set(), out = [];
+    for (const l of L) { const ms = R.filter((r) => eq(l, r)); for (const r of ms) hit.add(r); if (!ms.length) out.push([l, null]); for (const r of ms) out.push([l, r]); }
+    for (const r of R) if (!hit.has(r)) out.push([null, r]);
+    return out;
+  };
+  const counts = (rows) => ({ n: rows.length, a: rows.filter(([l]) => l && present(l.k)).length, b: rows.filter(([, r]) => r && present(r.k)).length, s: rows.some(([, r]) => r) ? sum(rows.filter(([, r]) => r).map(([, r]) => r.v)) : NaN }); // (SUM of nothing: NULL)
+  const mk = (n, keyOf) => Array.from({ length: n }, (_, i) => ({ k: keyOf(i), k2: i % 3, v: i % 7 }));
+  const cases = [
+    ['missing right keys', mk(5000, (i) => i % 900), mk(1200, (i) => (i % 50 === 0 ? NaN : i))],
+    ['missing left keys', mk(5000, (i) => (i % 13 === 0 ? NaN : i % 700)), mk(1000, (i) => i)],
+    ['repeated right keys', mk(4000, (i) => i % 300), mk(900, (i) => i % 450)],
+    ['sparse keys', mk(3000, (i) => 1e9 + (i % 400) * 7919), mk(800, (i) => 1e9 + i * 7919)],
+    ['empty left', [], mk(100, (i) => i)],
+    ['empty right', mk(100, (i) => i), []],
+  ];
+  for (const engine of [new Engine(), new Engine({ jit: false }), new Engine({ threads: 1 })]) {
+    for (const [name, L, R] of cases) {
+      const tl = engine.table({ k: Float64Array.from(L, (r) => r.k), k2: Float64Array.from(L, (r) => r.k2), v: Float64Array.from(L, (r) => r.v) });
+      const tr = engine.table({ k: Float64Array.from(R, (r) => r.k), k2: Float64Array.from(R, (r) => r.k2), v: Float64Array.from(R, (r) => r.v) });
+      for (const [how, eq, on] of [
+        ['FULL', (l, r) => l.k === r.k, 'a.k = b.k'],
+        ['FULL', (l, r) => l.k === r.k && l.k2 === r.k2, 'a.k = b.k AND a.k2 = b.k2'],
+        ['RIGHT', (l, r) => l.k === r.k, 'a.k = b.k'],
+        ['LEFT', (l, r) => l.k === r.k, 'a.k = b.k'], // (b.v: a right column named like a left one, the left one not used)
+        ['INNER', (l, r) => l.k === r.k, 'a.k = b.k'],
+      ]) {
+        const all = fullJoin(L, R, eq);
+        const rows = how === 'FULL' ? all : how === 'RIGHT' ? all.filter(([, r]) => r) : how === 'LEFT' ? all.filter(([l]) => l) : all.filter(([l, r]) => l && r);
+        const want = counts(rows);
+        const q = `SELECT COUNT(*) AS n, COUNT(a.k) AS a, COUNT(b.k) AS b, SUM(b.v) AS s FROM l a ${how} JOIN r b ON ${on}`;
+        const query = sql(q, { l: tl, r: tr });
+        const runs = [query.toRows(), ...(await Promise.all([query.toRowsAsync(), query.toRowsAsync(), query.toRowsAsync()]))];
+        for (const [j, got] of runs.entries()) {
+          checks++;
+          const g = got[0];
+          if (!g || g.n !== want.n || g.a !== want.a || g.b !== want.b || !Object.is(g.s, want.s)) fail(`${how} JOIN (${name}, ${on}, run ${j}, jit ${engine.jit}): ${JSON.stringify(g)}, want ${JSON.stringify(want)}`);
+        }
+        // the unmatched right rows in right-table order, with every column
+        if (how === 'FULL' && on === 'a.k = b.k') {
+          const got = sql(`SELECT b.k AS k, b.v AS v FROM l a FULL JOIN r b ON ${on} WHERE a.k IS NULL AND b.k IS NOT NULL`, { l: tl, r: tr }).toRows();
+          const exp = rows.filter(([l, r]) => !l && r && present(r.k)).map(([, r]) => ({ k: r.k, v: r.v }));
+          checks++;
+          if (JSON.stringify(got) !== JSON.stringify(exp)) fail(`FULL JOIN unmatched rows (${name}): ${JSON.stringify(got).slice(0, 200)}, want ${JSON.stringify(exp).slice(0, 200)}`);
+        }
+      }
+      tl.dispose(); tr.dispose();
+    }
+    await engine.close();
+  }
+}
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} SQL checks passed`);
 process.exit(failures ? 1 : 0);

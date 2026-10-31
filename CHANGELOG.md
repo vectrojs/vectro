@@ -12,7 +12,8 @@ The first public release. Everything below is new.
 - Filters, computed columns, aggregates, group by any keys (millions of
   groups: partitioned by key range on every thread, sorted by key), exact and
   approximate distinct counts, joins (inner, left, right, full), sort and
-  top-k, zone maps, compressed columns.
+  top-k, zone maps, compressed columns. Top-k over a file reads only the
+  blocks that can still hold a winning row.
 - A query planner: `table.lazy()` chains are optimized as a whole.
 - CSV (parallel parser), JSON lines, Apache Arrow (read and write).
 - Datasets bigger than memory (`.vectro` files): chunked, bit-packed, read in
@@ -39,12 +40,16 @@ The first public release. Everything below is new.
 - `connectors/dist/Vectro.mez` for Power BI and `vectro.taco` for Tableau.
   Not signed, not yet tried in the applications.
 
+**Testing**
+- `VECTRO_POISON=1` overwrites memory as it is freed, so code that reads an
+  array after freeing it gives wrong answers in tests (part of `test:all`).
+
 **Known gaps**
-- Slower than DuckDB on: FULL OUTER JOIN counts, distinct counts of a million
-  values spread over a wide range, top rows and joins over billion-row
-  datasets (see the README's numbers). Faster on the other SQL queries
-  measured (19 of 20) and on every group-by measured (2.2-2.7x with millions
-  of groups).
+- Slower than DuckDB on one shape measured: a join over a file on disk with
+  a GROUP BY on the joined table's columns (1.2-1.3x at 100M and 1B rows).
+  Faster on all 20 SQL queries measured, on every group-by, join and
+  distinct count measured in memory, and on 7 of 8 queries over a billion
+  rows on disk (see the README's numbers).
 - Free-text columns (text that rarely repeats) can be shown but not grouped
   or filtered, except when served (`vectro serve` loads them as categories).
 - Window functions and percentiles keep the rows they read in memory.

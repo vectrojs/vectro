@@ -10,6 +10,7 @@ import { Table } from './table.mjs';
 import { decodeOne } from './pack.mjs';
 
 const COMPRESS_ALL = !!globalThis.process?.env?.VECTRO_COMPRESS; // tests: pack every table
+const POISON = !!globalThis.process?.env?.VECTRO_POISON; // tests: freed memory overwritten (a read after free gives wrong answers)
 import { parseCSV, parseCSVAsync } from './csv.mjs';
 import { readArrow } from './arrow.mjs';
 import { encode } from './bytes.mjs';
@@ -201,6 +202,7 @@ export class Engine {
     const size = this.sizes.get(ptr);
     if (size === undefined || !this.memBuffers.has(ta.buffer)) throw new Error('vectro: free() of an array not allocated by this engine');
     this.sizes.delete(ptr);
+    if (POISON) new Uint8Array(this.memory.buffer, ptr, size).fill(0xff);
     let i = 0;
     while (i < this.freeList.length && this.freeList[i].ptr < ptr) i++;
     this.freeList.splice(i, 0, { ptr, size });

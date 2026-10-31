@@ -14,7 +14,7 @@ import { maxUnits } from './kernels.mjs';
 import { topModule, markModule } from './rank-kernels.mjs';
 import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { partitionedGroupsG, estimateGroups, PARTITION_ROWS, PARTITION_GROUPS, DIRECT_SLOTS } from './partition.mjs';
-import { joinTablesG, joinViewG } from './join.mjs';
+import { joinTablesG, joinViewG, lookupGroupsG } from './join.mjs';
 import { Query } from './plan.mjs';
 import { bounds, windowValues, readsPeers } from './window.mjs';
 import { copyRows } from './rows.mjs';
@@ -431,6 +431,33 @@ export class Table {
     };
   }
 
+  // (plan.mjs) GROUP BY right-table columns of an inner join on unique right
+  // keys, aggregating this (left) table's columns: each matching row's join
+  // key is looked up straight to its group number inside the group kernel
+  // (filter, lookup and sums in one pass over the left rows, packed columns
+  // read as they are), so no joined rows are made. Null when it doesn't
+  // apply (the plan then joins as usual). on: { left, right } key names;
+  // rightKeys[k]: the right column behind output key keys[k].
+  _lookupGroupAgg(R, on, keys, rightKeys, spec) { return this.engine._drive(this.#lookupGroupAggG(R, on, keys, rightKeys, spec)); }
+  _lookupGroupAggAsync(R, on, keys, rightKeys, spec) { return this.engine._driveAsync(this.#lookupGroupAggG(R, on, keys, rightKeys, spec)); }
+
+  *#lookupGroupAggG(R, on, keys, rightKeys, spec) {
+    const { engine } = this;
+    if (!engine.jit || !(R instanceof Table) || R.engine !== engine || R.pred || R.#hasPacked() || R.type !== this.type) return null;
+    const c = this.cols.get(on.left);
+    if (!c || c.strings) return null;
+    const merged = this.#mergeParams({});
+    const items = Object.entries(spec).map(([out, src]) => ({ out, ...this.#aggItem(src, merged) }));
+    if (items.some((it) => DISTINCT.has(it.fn) || keys.includes(it.out))) return null;
+    const look = yield* lookupGroupsG(this, R, on, rightKeys);
+    if (!look) return null;
+    const groups = {
+      K: look.G, data: c.data, enc: c.enc ?? null, lookup: look, sorted: true, owned: false, keyMeta: look.meta,
+      keyColumn: (k, keep) => { const v = look.values[k], out = new Float64Array(keep.length); for (let i = 0; i < keep.length; i++) out[i] = v[keep[i]]; return out; },
+    };
+    return yield* this.#runGroupsG(keys, groups, items, merged);
+  }
+
   *#groupAggG(keys, spec, params) {
     if (this.#hasPacked()) {
       const used = new Set(keys);
@@ -438,7 +465,7 @@ export class Table {
       if (!this.engine.jit) { // the interpreter reads plain numbers
         if ([...used].some((n) => this.cols.get(n).enc)) return yield* this.#viaPlainG((t) => t.#groupAggG(keys, spec, params), used);
       } else if (keys.some((k) => this.cols.get(k).enc)) { // the group kernel reads packed columns; the other paths need plain keys
-        const direct = yield* this.#directGroups(keys, Object.keys(spec).length + 1, this.#directMax(1 + 2 * Object.keys(spec).length)); // (at most as many as below)
+        const direct = yield* this.#directGroups(keys, Object.keys(spec).length + 1);
         if (direct?.owned) this.engine.free(direct.data);
         if (!direct) return yield* this.#viaPlainG((t) => t.#groupAggG(keys, spec, params), new Set(keys.filter((k) => this.cols.get(k).enc)));
       }
@@ -454,7 +481,9 @@ export class Table {
     }
     const { engine } = this;
     const totals = 1 + items.length + items.filter((it) => it.present).length, capped = {};
-    const direct = yield* this.#directGroups(keys, items.length + 1, items.some((it) => DISTINCT.has(it.fn)) ? 2 ** 24 : this.#directMax(totals), capped);
+    // (packed keys: numbered as they are read, no copy to make; the other paths would decode them first)
+    const packedKey = keys.some((k) => this.cols.get(k).enc);
+    const direct = yield* this.#directGroups(keys, items.length + 1, packedKey || items.some((it) => DISTINCT.has(it.fn)) ? 2 ** 24 : this.#directMax(totals), capped);
     if (direct) {
       try { return yield* this.#runGroupsG(keys, direct, items, merged); } finally { if (direct.owned) this.engine.free(direct.data); }
     }
@@ -710,6 +739,7 @@ export class Table {
     // means need the count of values present: one more kernel item each
     const kernelItems = [...items, ...items.filter((it) => it.present).map((it) => ({ fn: 'count', arg: it.present, of: it }))]; // means, mins, maxes
     const totals = yield* this.#groupTotalsG(groups, kernelItems, merged);
+    if (!totals) return null; // (lookup groups the kernels can't take)
     const presentOf = (it) => totals[1 + kernelItems.findIndex((k) => k.of === it)];
     // Keep groups that have rows, sorted by key (codes for text keys, so
     // dictionary order; NaN last), and build whole columns.
@@ -741,7 +771,7 @@ export class Table {
     const toEngine = (a) => { const x = engine.alloc(Float64Array, m); engine.live(x).set(a); made.push(x); return x; };
     try {
       keys.forEach((key, k) => {
-        const src = this.cols.get(key);
+        const src = groups.keyMeta?.[k] ?? this.cols.get(key);
         cols.set(key, { data: toEngine(codes[k]), dict: src.dict ?? null, codes: src.dict ? src.codes : null, date: src.date || undefined });
       });
       allItems.forEach((it, j) => cols.set(it.out, { data: toEngine(gatherF64(perGroup[j], keep)), dict: null, codes: null }));
@@ -773,7 +803,7 @@ export class Table {
       if (order) made.push(at);
       const cols = new Map();
       keys.forEach((key, k) => {
-        const src = this.cols.get(key);
+        const src = groups.keyMeta?.[k] ?? this.cols.get(key);
         cols.set(key, { data: null, dict: src.dict ?? null, codes: src.dict ? src.codes : null, date: src.date || undefined, k });
       });
       for (const c of cols.values()) { c.data = order ? yield* gatherG(engine, keyArrs[c.k], order, m, 'f64') : owned(keyArrs[c.k]); delete c.k; }
@@ -837,6 +867,7 @@ export class Table {
       const totals = [];
       for (let i = 0; i < items.length; i += 7) {
         const part = yield* this.#groupTotalsG(groups, items.slice(i, i + 7), merged);
+        if (!part) return null;
         totals.push(...(i ? part.slice(1) : part));
       }
       return totals;
@@ -865,7 +896,10 @@ export class Table {
     const big = T > 1 && slotsNeeded > (engine._bigGroupSlots ?? 2 ** 23);
     // packed columns (and a packed key) are decoded by the kernel as it reads them
     const encs = arrayNames.map((nm) => this.cols.get(nm).enc ?? null), keyEnc = groups.enc ?? null;
-    const encKey = JSON.stringify([encs, keyEnc]);
+    const look = groups.lookup ?? null; // (join keys looked up as group numbers, see _lookupGroupAgg)
+    if (look && big) return null; // (many groups: every thread would scan every row; the usual join path)
+    const encKey = JSON.stringify([encs, keyEnc, !!look]);
+    const lookArgs = look ? [engine.live(look.lut).byteOffset, look.min, look.size] : [];
     if (big && engine.jit && J * K <= (engine._maxGroupSlots ?? MAX_GROUP_SLOTS)) {
       // many groups: each thread adds up its own range of groups, all rows
       const acc = engine.alloc(Float64Array, J * K);
@@ -874,15 +908,16 @@ export class Table {
       engine._tableKernels ??= new Map();
       let v = engine._tableKernels.get(cacheKey);
       if (!v) {
-        v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, 1, engine.isShared, true, encs, keyEnc));
+        v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, 1, engine.isShared, true, encs, keyEnc, !!look));
         engine._tableKernels.set(cacheKey, v);
       }
       const arrays = [...arrayNames.map((nm) => this.cols.get(nm).data), groups.data];
-      yield* engine._groupRangeG(v, this.n, arrays, scalarNames.map((nm) => merged[nm]), engine.live(acc).byteOffset, K);
+      yield* engine._groupRangeG(v, this.n, arrays, [...scalarNames.map((nm) => merged[nm]), ...lookArgs], engine.live(acc).byteOffset, K);
       const a = engine.live(acc);
       totals = analysis.items.map((_, j) => a.slice(j * K, (j + 1) * K));
       engine.free(acc);
     } else if (slotsNeeded > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (!this.pred && big)) {
+      if (look) return null; // (the scatter reads group numbers: the caller joins the usual way)
       let keyData = groups.data;
       if (keyEnc) { // (the scatter reads group numbers as plain numbers)
         keyData = engine.alloc(this.type, this.n);
@@ -904,12 +939,13 @@ export class Table {
         engine._tableKernels ??= new Map();
         let v = engine._tableKernels.get(cacheKey);
         if (!v) {
-          v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, C, engine.isShared, false, encs, keyEnc));
+          v = engine._register(generateGroupBy(analysis.items, predAst, t, arrayNames, scalarNames, C, engine.isShared, false, encs, keyEnc, !!look));
           engine._tableKernels.set(cacheKey, v);
         }
         const arrays = [...arrayNames.map((nm) => this.cols.get(nm).data), groups.data];
-        yield* engine._groupG(v, this.n, arrays, scalarNames.map((nm) => merged[nm]), acc.byteOffset, block * 8, K);
+        yield* engine._groupG(v, this.n, arrays, [...scalarNames.map((nm) => merged[nm]), ...lookArgs], acc.byteOffset, block * 8, K);
       } else {
+        if (look) { engine.free(acc); return null; } // (the interpreter has no lookup)
         // the calling thread fills thread 0's block
         const cols = Object.fromEntries(arrayNames.map((nm) => [nm, this.cols.get(nm).data]));
         interpretGroup(engine, t, analysis.items, predAst, cols, merged, groups.data, acc, K, this.n);
@@ -962,6 +998,7 @@ export class Table {
       let dense = null;
       try {
         dense = yield* this.#denseDistinctG(plain ? plain.data : own, groupData, K);
+        if (!dense && n >= (engine._partitionRows ?? PARTITION_ROWS) && !engine._noPartitionedDistinct) dense = yield* this.#partitionedDistinctG(plain ? plain.data : own, groupData, K);
         if (!dense && n >= 4096) dense = yield* this.#numberedDistinctG(plain ? plain.data : own, groupData, K);
       } catch (err) { if (own) engine.free(own); throw err; }
       if (dense) { if (own) engine.free(own); return dense; }
@@ -998,19 +1035,73 @@ export class Table {
     const { engine, n } = this;
     const [lo, hi, frac] = yield* engine.evalG(['min(v == v ? v : 1 / 0)', 'max(v == v ? v : -1 / 0)', 'count(v == v && v != floor(v))'], { v: values }); // (missing values skipped)
     if (!(hi >= lo) || frac > 0) return hi >= lo ? null : new Float64Array(K); // (no values: no distinct ones)
-    const width = Math.ceil((hi - lo + 1) / 8) * 8; // (each group's bytes start on an 8-byte boundary)
+    const fits = (span) => Math.ceil((span + 1) / 8) * 8 * K <= Math.min(2 ** 26, Math.max(2 ** 20, 16 * n));
+    // too wide, but maybe every value is lo plus a multiple of one step (IDs 1000, 1010, 1020...):
+    // the step from a sample (it divides the real one), checked on every row
+    let step = 1;
+    if (!fits(hi - lo) && hi - lo < 2 ** 53 && !engine._noStride) {
+      step = sampleStep(engine.live(values), n, lo);
+      if (!(step > 1 && fits((hi - lo) / step))) return null;
+    }
+    const width = Math.ceil(((hi - lo) / step + 1) / 8) * 8; // (each group's bytes start on an 8-byte boundary)
     if (!(width * K <= Math.min(2 ** 26, Math.max(2 ** 20, 16 * n)))) return null;
     const t = this.type === Float32Array ? 'f32' : 'f64';
     engine._tableKernels ??= new Map();
-    let v = engine._tableKernels.get(`markpairs|${t}`);
-    if (!v) { v = engine._register(generateMarkPairs(t, engine.isShared)); engine._tableKernels.set(`markpairs|${t}`, v); }
+    const name = `markpairs|${t}|${step > 1}`;
+    let v = engine._tableKernels.get(name);
+    if (!v) { v = engine._register(generateMarkPairs(t, engine.isShared, step > 1)); engine._tableKernels.set(name, v); }
     const map = engine.alloc(Uint8Array, width * K);
     try {
       engine.live(map).fill(0);
-      yield* engine._fusedG(v, n, [groupData ?? values, values], [engine.live(map).byteOffset, width, lo, groupData ? 1 : 0], 1);
+      const { parts } = yield* engine._fusedG(v, n, [groupData ?? values, values], [engine.live(map).byteOffset, width, lo, groupData ? 1 : 0, step], 1);
+      if (step > 1 && parts.some((x) => x > 0)) return null; // (some value off the step: checked in f64 as it marks, so float32 tables too)
       return countMarks(engine.live(map), K, width);
     } finally {
       engine.free(map);
+    }
+  }
+
+  // Distinct counts of any values with many of them (see partition.mjs): the
+  // distinct (group, value) pairs are the groups of a partitioned group-by
+  // with nothing to add up. One group: only how many there are (no sort, no
+  // result columns). Missing values make one pair per group, taken off.
+  // Null when few distinct pairs are expected (the hash path is cheaper) or
+  // the partitioned path turns them down.
+  *#partitionedDistinctG(values, groupData, K) {
+    const { engine, n } = this;
+    const cols = new Map();
+    if (groupData) cols.set('g', { data: groupData, dict: null, codes: null });
+    cols.set('v', { data: values, dict: null, codes: null });
+    const tmp = new Table(engine, cols, n, { zones: false });
+    const keys = groupData ? ['g', 'v'] : ['v'];
+    const est = estimateGroups(tmp, keys);
+    if (est < (engine._partitionGroups ?? PARTITION_GROUPS)) return null;
+    if (!groupData) {
+      const r = yield* partitionedGroupsG(tmp, keys, [], {}, est, { countOnly: true });
+      if (!r) return null;
+      const [missing] = yield* engine.evalG(['count(v != v)'], { v: values });
+      return Float64Array.of(r.G - (missing > 0 ? 1 : 0));
+    }
+    const r = yield* partitionedGroupsG(tmp, keys, [], {}, est);
+    if (!r) return null;
+    try { // the pairs come sorted by group, then value (NaN last): each group's run, found by binary search
+      const counts = new Float64Array(K), gs = engine.live(r.keyCols[0]), vs = engine.live(r.keyCols[1]);
+      // galloping from the last run's end: O(K log(G / K)), not O(K log G) (1M groups: 90 ms -> 16 ms)
+      const after = (g, s) => {
+        let a = s, b = s, step = 1;
+        while (b < r.G && gs[b] <= g) { a = b + 1; b = s + step; step *= 2; }
+        if (b > r.G) b = r.G;
+        while (a < b) { const m = (a + b) >>> 1; if (gs[m] <= g) a = m + 1; else b = m; }
+        return a;
+      };
+      for (let g = 0, s = 0; g < K; g++) {
+        const e = after(g, s);
+        counts[g] = e - s - (e > s && vs[e - 1] !== vs[e - 1] ? 1 : 0);
+        s = e;
+      }
+      return counts;
+    } finally {
+      for (const x of [...r.keyCols, ...r.accCols]) engine.free(x);
     }
   }
 
@@ -1177,9 +1268,9 @@ export class Table {
       // others: numbered by the hash group kernel (every thread), each number's value once
       const one = new Table(engine, new Map([['v', c]]), t.n, { zones: false });
       const ids = engine.jit && t.n >= 4096 ? yield* one.#hashGroupsParallelG(['v']) : one.#hashGroups(['v']);
-      for (const x of ids.extra ?? []) engine.free(x);
       made.push(ids.data);
       const vals = ids.keyColumn(0, Array.from({ length: ids.K }, (_, g) => g));
+      for (const x of ids.extra ?? []) engine.free(x); // (the key values: read just above)
       ins[k] = { data: ids.data, dict: null, numbered: (g) => vals[g] };
       ranges.push([0, Math.max(0, ids.K - 1), 0]);
     }
@@ -1639,8 +1730,24 @@ export class Table {
   // the one hashed). Rows come in left-table order, each with its matches in
   // right-table order; right columns named like a left column get `suffix`
   // (default '_right'). See join.mjs.
-  join(other, opts) { return this.engine._drive(this.#joinG(other, opts)); }
-  joinAsync(other, opts) { return this.engine._driveAsync(this.#joinG(other, opts)); }
+  join(other, opts) { return this.engine._drive(this.#joinOuterG(other, opts)); }
+  joinAsync(other, opts) { return this.engine._driveAsync(this.#joinOuterG(other, opts)); }
+
+  // (SQL RIGHT / FULL JOIN) opts.unmatched: an object the join puts the right
+  // rows no left row matched in, as a table (unmatched.table), from the
+  // probe's own matches.
+  *#joinOuterG(other, opts) {
+    const u = opts?.unmatched;
+    if (u) u.result = null;
+    const out = yield* this.#joinG(other, opts);
+    if (u) {
+      if (!u.result) { out?.dispose?.(); throw new Error('vectro: join: no unmatched rows were made'); }
+      const { cols, n } = u.result;
+      u.result = null;
+      u.table = new Table(this.engine, cols, n, { owned: [...cols.keys()] });
+    }
+    return out;
+  }
 
   *#joinG(other, opts) {
     if (opts?.view && other instanceof Table && !other.pred && !other.#hasPacked()) { // (datasets: unique right keys as a view, see joinViewG)
@@ -1657,7 +1764,17 @@ export class Table {
       }
       if (view) return view;
     }
-    if (this.#hasPacked()) return yield* this.#viaPlainG((t) => t.#joinG(other, opts));
+    if (this.#hasPacked()) { // (decoded first; a view join keeps the decoded columns it shows)
+      const t = yield* this.#decodedG();
+      let out;
+      try {
+        out = yield* t.#joinG(other, opts);
+        const at = (c) => c?.data && this.engine.live(c.data).byteOffset;
+        const kept = t.owned.filter((nm) => at(out.cols.get(nm)) === at(t.cols.get(nm)));
+        if (kept.length) { out.owned.push(...kept); t.owned = t.owned.filter((nm) => !kept.includes(nm)); }
+        return out;
+      } finally { if (out !== t) t.dispose(); }
+    }
     if (other instanceof Table && other.#hasPacked()) { const o = yield* other.#decodedG(); try { return yield* this.#joinG(o, opts); } finally { o.dispose(); } }
     if (!(other instanceof Table)) throw new TypeError('vectro: join needs another table of the same engine');
     const l = yield* this.#collectG(), r = yield* other.#collectG();
@@ -1957,6 +2074,21 @@ function sampleCounts(cols, f32, m, step) {
     counts.set(h, (counts.get(h) ?? 0) + 1);
   }
   return counts;
+}
+
+// The greatest common divisor of (v - lo) over up to 4096 values spread
+// over the column (NaN skipped): the real step divides it. 1: no step.
+function sampleStep(d, n, lo) {
+  const m = Math.min(n, 4096), at = n / m;
+  let g = 0;
+  for (let j = 0; j < m && g !== 1; j++) {
+    const v = d[Math.floor(j * at)];
+    if (v !== v) continue;
+    let a = v - lo, b = g;
+    while (b) { const r = a % b; a = b; b = r; }
+    g = a;
+  }
+  return g > 1 ? g : 1;
 }
 
 // The marks (0 or 1 bytes) in each group's `width` bytes, 4 at a time.

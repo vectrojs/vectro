@@ -462,6 +462,35 @@ for (const [label, make] of engines) {
     same(got, want, `dataset SQL: ${q}`);
     same(gotAsync, want, `dataset SQL async: ${q}`);
   }
+  // a GROUP BY whose result columns are renamed above it (as SQL does) still
+  // adds the rows straight into the groups (the names made above it aren't
+  // the dataset's columns made over)
+  {
+    const { Table } = await import('../src/node.mjs');
+    const saved = tuning.denseMin, into = Table.prototype._groupInto;
+    let calls = 0;
+    Table.prototype._groupInto = function (...a) { calls++; return into.apply(this, a); };
+    tuning.denseMin = 1;
+    try {
+      const q = 'SELECT cust, ROUND(SUM(price * qty), 2) AS spend FROM orders GROUP BY cust ORDER BY spend DESC, cust LIMIT 7';
+      same(sql(q, { orders: ds }).toRows(), sql(q, { orders: t }).toRows(), 'renamed dense group-by');
+      check(calls > 0, `renamed dense group-by: added into the groups (${calls} chunks)`);
+    } finally { tuning.denseMin = saved; Table.prototype._groupInto = into; }
+  }
+  // an in-memory FULL / RIGHT JOIN (its unmatched rows made by its own join)
+  // inside a query over a dataset
+  {
+    const c2 = e.table({ cust: Float64Array.from({ length: 900 }, (_, i) => 2000 + i * 2), w: Float64Array.from({ length: 900 }, (_, i) => i % 4) });
+    for (const how of ['FULL', 'RIGHT', 'LEFT']) {
+      const q = `SELECT COUNT(*) AS n, SUM(f.w) AS w FROM (SELECT COALESCE(c.cust, d.cust) AS kk, d.w AS w FROM customers c ${how} JOIN c2 d ON c.cust = d.cust) f JOIN orders o ON f.kk = o.cust`;
+      const want = sql(q, { orders: t, customers: cs, c2 }).toRows();
+      let got, gotAsync;
+      try { got = sql(q, { orders: ds, customers: cs, c2 }).toRows(); gotAsync = await sql(q, { orders: ds, customers: cs, c2 }).toRowsAsync(); } catch (err) { check(false, `${how} JOIN under a dataset: ${err.message}`); continue; }
+      same(got, want, `${how} JOIN under a dataset`);
+      same(gotAsync, want, `${how} JOIN under a dataset (async)`);
+    }
+    c2.dispose();
+  }
   await ds.close();
   await e.close();
 }

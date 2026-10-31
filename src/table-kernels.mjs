@@ -41,14 +41,20 @@ function advance(f, ty, ptrs, encs = []) {
 // Signature: (array ptrs..., key ptr, n, accBase, K, scalars...)
 // ranged: two more params (lo, hi) after K; only rows whose group is in
 // [lo, hi) are added (see runGroupRange). encs[i] / keyEnc: packed columns.
-export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, shared = true, ranged = false, encs = [], keyEnc = null) {
+export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, shared = true, ranged = false, encs = [], keyEnc = null, lookup = false) {
+  // lookup: the key column holds join keys, not group numbers. Three more
+  // f64 params after the scalars (lutPtr, lutMin, lutSize): a row that passes
+  // `pred` takes group lut[key - lutMin] (an int32 array) when key - lutMin
+  // is a whole number in [0, lutSize) and that entry is >= 0; else it is
+  // skipped (no match: an inner join drops it). See join.mjs lookupGroupsG.
   const log2C = Math.log2(C);
   if (!Number.isInteger(log2C)) throw new Error('copies must be a power of two');
   const ty = TY[t];
   const A = arrayNames.length;
   const [key, n, accBase, K, lo, hi] = [A, A + 1, A + 2, A + 3, A + 4, A + 5];
   const extra = ranged ? 2 : 0;
-  const f = new Fn('k', [...Array(A).fill(I32), I32, I32, I32, I32, ...Array(extra).fill(I32), ...Array(scalarNames.length).fill(F64)], []);
+  const S = scalarNames.length;
+  const f = new Fn('k', [...Array(A).fill(I32), I32, I32, I32, I32, ...Array(extra).fill(I32), ...Array(S + (lookup ? 3 : 0)).fill(F64)], []);
   const env = bindValues(f, t, arrayNames, A + 4 + extra, scalarNames);
   arrayNames.forEach((name, i) => { env.arrays.get(name).enc = encs[i] ?? null; });
   env.t = t; env.raw = f.local(ty.val); env.tmp = f.local(ty.val);
@@ -56,19 +62,38 @@ export function generateGroupBy(items, pred, t, arrayNames, scalarNames, C = 1, 
   em.prepare([...items.map((it) => it.ast), pred]); // (the loop body is emitted once: no reset needed)
   const stop = f.local(I32), idx = f.local(I32), addr = f.local(I32), copy = f.local(I32);
   const bases = items.map(() => f.local(I32));
+  const lut = lookup ? f.local(I32) : -1, size = lookup ? f.local(I32) : -1, kv = lookup ? f.local(F64) : -1, gi = lookup ? f.local(I32) : -1;
+  if (lookup) {
+    const at = A + 4 + extra + S;
+    f.emit(get(at), [0xfc, 0x03], set(lut), get(at + 2), [0xfc, 0x03], set(size)); // (f64 -> u32)
+  }
 
   // base_j = accBase + j * K * C * 8
   items.forEach((_, j) => f.emit(get(K), i32c(j * C * 8), [0x6c], get(accBase), i32add, set(bases[j])));
   f.emit(get(n), i32c(keyEnc ? PACKED_BYTES[keyEnc.kind] : ty.bytes), [0x6c], get(key), i32add, set(stop));
 
   f.emit(block, loop, get(key), get(stop), i32geu, brIf(1));
-  // slot = key * C + copy
   if (keyEnc) packedScalar(f, t, keyEnc, key, env.raw, env.tmp); else f.emit(get(key), ty.load);
-  f.emit(TRUNC_SAT_U[t], i32c(log2C), I32_SHL, get(copy), i32add, set(idx));
-  f.emit(block);
-  if (ranged) f.emit(get(idx), get(lo), [0x6b], get(hi), get(lo), [0x6b], i32geu, brIf(0)); // (idx - lo) >= (hi - lo), unsigned: not ours (its values aren't even read)
-  loadRow(f, ty, env);
-  if (pred) { em.scaMask(pred); f.emit(I32_EQZ, brIf(0)); }
+  if (lookup) {
+    if (t === 'f32') f.emit(F64_PROMOTE_F32);
+    f.emit(get(A + 4 + extra + S + 1), [0xa1], set(kv)); // kv = key - lutMin
+    f.emit(block);
+    loadRow(f, ty, env);
+    if (pred) { em.scaMask(pred); f.emit(I32_EQZ, brIf(0)); }
+    f.emit(get(kv), [0xfc, 0x02], set(gi)); // gi = trunc_sat_s(kv)
+    f.emit(get(gi), get(size), [0x49], get(gi), [0xb7], get(kv), [0x61], [0x71], I32_EQZ, brIf(0)); // in range and whole (NaN: never)
+    f.emit(get(gi), i32c(2), I32_SHL, get(lut), i32add, [0x28, 2, 0], set(gi)); // gi = lut[gi]
+    f.emit(get(gi), i32c(0), [0x48], brIf(0)); // -1: the right table lacks this key
+    f.emit(get(gi), i32c(log2C), I32_SHL, get(copy), i32add, set(idx));
+    if (ranged) f.emit(get(idx), get(lo), [0x6b], get(hi), get(lo), [0x6b], i32geu, brIf(0));
+  } else {
+    // slot = key * C + copy
+    f.emit(TRUNC_SAT_U[t], i32c(log2C), I32_SHL, get(copy), i32add, set(idx));
+    f.emit(block);
+    if (ranged) f.emit(get(idx), get(lo), [0x6b], get(hi), get(lo), [0x6b], i32geu, brIf(0)); // (idx - lo) >= (hi - lo), unsigned: not ours (its values aren't even read)
+    loadRow(f, ty, env);
+    if (pred) { em.scaMask(pred); f.emit(I32_EQZ, brIf(0)); }
+  }
   items.forEach((it, j) => {
     const op = it.reduce === 'min' ? 'min' : it.reduce === 'max' ? 'max' : 'add';
     f.emit(get(bases[j]), get(idx), i32c(3), I32_SHL, i32add, set(addr));
@@ -254,24 +279,30 @@ export function generateHashProbe(t, nk, shared = true) {
 // map[g * width + (v - lo)] = 1 for each row's group g and value v (missing
 // values skipped). Every thread writes into the one map; writing 1 where it
 // may already be 1 is safe, and a byte already set is only read.
-// Signature: (g ptr, v ptr, n, map, width, lo, hasG) -> 0 (hasG 0: one group, g unread).
-export function generateMarkPairs(t, shared = true) {
+// Signature: (g ptr, v ptr, n, map, width, lo, hasG, step) -> values off the step (hasG 0: one group, g unread;
+// step: read only by the stepped kernel, which marks (v - lo) / step and counts the values it doesn't divide).
+export function generateMarkPairs(t, shared = true, stepped = false) { // stepped: (v - lo) / step
   const ty = TY[t];
-  const f = new Fn('k', [I32, I32, I32, F64, F64, F64, F64], [F64]);
-  const [gp, vp, n, mapP, widthP, lo, hasG] = [0, 1, 2, 3, 4, 5, 6];
-  const map = f.local(I32), width = f.local(I32), stop = f.local(I32), addr = f.local(I32), v = f.local(F64);
+  const f = new Fn('k', [I32, I32, I32, F64, F64, F64, F64, F64], [F64]);
+  const [gp, vp, n, mapP, widthP, lo, hasG, step] = [0, 1, 2, 3, 4, 5, 6, 7];
+  const map = f.local(I32), width = f.local(I32), stop = f.local(I32), addr = f.local(I32), v = f.local(F64), d = f.local(F64), q = f.local(F64), bad = f.local(F64);
   const IF = [0x04, 0x40], LOAD8_U = [0x2d, 0, 0], STORE8 = [0x3a, 0, 0];
   f.emit(get(mapP), TRUNC_SAT_U.f64, set(map), get(widthP), TRUNC_SAT_U.f64, set(width));
   f.emit(get(n), i32c(ty.bytes), i32mul, get(vp), i32add, set(stop));
   f.emit(block, loop, get(vp), get(stop), i32geu, brIf(1));
   f.emit(get(vp), ty.load, ty.toF64, set(v));
   f.emit(get(v), get(v), [0x61], IF); // present (not NaN)
-  f.emit(get(v), get(lo), [0xa1], TRUNC_SAT_U.f64, get(map), i32add, set(addr)); // map + (v - lo)
+  if (!stepped) f.emit(get(v), get(lo), [0xa1], TRUNC_SAT_U.f64, get(map), i32add, set(addr)); // map + (v - lo)
+  else { // q = trunc((v - lo) / step) (in f64, exact below 2^53); a value off the step: bad + 1
+    f.emit(get(v), get(lo), [0xa1], set(d), get(d), get(step), [0xa3], [0x9d], set(q));
+    f.emit(get(q), get(step), [0xa2], get(d), [0x62], IF, get(bad), [0x44, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f], [0xa0], set(bad), end);
+    f.emit(get(q), TRUNC_SAT_U.f64, get(map), i32add, set(addr));
+  }
   f.emit(get(hasG), [0x44, 0, 0, 0, 0, 0, 0, 0, 0], [0x62], IF, get(gp), ty.load, ty.toF64, TRUNC_SAT_U.f64, get(width), i32mul, get(addr), i32add, set(addr), end);
   f.emit(get(addr), LOAD8_U, I32_EQZ, IF, get(addr), i32c(1), STORE8, end);
   f.emit(end);
   f.emit(get(vp), i32c(ty.bytes), i32add, set(vp), get(gp), i32c(ty.bytes), i32add, set(gp), br(0), end, end);
-  f.emit([0x44, 0, 0, 0, 0, 0, 0, 0, 0]);
+  f.emit(get(bad)); // (0 unless stepped)
   return buildModule([f], shared);
 }
 

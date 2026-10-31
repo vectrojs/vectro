@@ -30,7 +30,7 @@
 // WHERE b.k = a.k), a single-value subquery joins its one row (correlated
 // ones: grouped by the correlation keys).
 
-import { Query, namesOf } from './plan.mjs';
+import { Query, namesOf, findDataset } from './plan.mjs';
 import { quoteText } from './fuse.mjs';
 import { TEXT_FUNCTIONS, toText, isNull, textToNumber, textToDate } from './sqltext.mjs';
 
@@ -821,19 +821,29 @@ function compileSelect(ast, env, outer, tail) {
   function outerJoinG(rq, on, how, leftNames, rightCols, rightOut) {
     const tag = n.hidden++;
     const leftQ = q.select(...leftNames);
+    const keysOn = on.left.every((x, k) => x === on.right[k]) ? on.left : on;
+    const order = [...leftNames, ...rightOut];
+    if (!findDataset(leftQ.node) && !findDataset(rq.node)) { // in memory: the join's own probe says which right rows matched
+      const state = {};
+      const joined = leftQ.join(rq, { on: keysOn, how: how === 'full' ? 'left' : 'inner', view: true, unmatched: state });
+      return Query.union([joined.select(...order), outerRest(Query.unmatched(state, rightCols), tag, leftNames, rightCols, rightOut)]);
+    }
     const fresh = on.left.map((_, k) => `__a${tag}_${k}`), mark = `__am${tag}`;
     let lkeys = leftQ;
     on.left.forEach((x, k) => { lkeys = lkeys.derive(fresh[k], x); });
     lkeys = lkeys.select(...fresh).groupBy(fresh).agg({ [`__ac${tag}`]: 'count()' }).derive(mark, '1').select(...fresh, mark);
-    let lone = rq.join(lkeys, { on: { left: on.right, right: fresh }, how: 'left', view: true }).filter(`!(${mark} == 1)`);
+    const lone = rq.join(lkeys, { on: { left: on.right, right: fresh }, how: 'left', view: true }).filter(`!(${mark} == 1)`);
+    const joined = leftQ.join(rq, { on: keysOn, how: how === 'full' ? 'left' : 'inner', view: true }); // (unique right keys: right columns looked up)
+    return Query.union([joined.select(...order), outerRest(lone, tag, leftNames, rightCols, rightOut)]);
+  }
+  // the unmatched right rows (columns rightCols) with the left's columns missing, in the join's output order
+  function outerRest(lone, tag, leftNames, rightCols, rightOut) {
     const tmp = rightCols.map((_, k) => `__p${tag}_${k}`);
     rightCols.forEach((x, k) => { lone = lone.derive(tmp[k], x); });
     lone = lone.select(...tmp);
     for (const L of leftNames) lone = kinds.get(L) === 'text' ? lone.textmap(L, { fn: () => '', label: 'null' }) : lone.derive(L, 'NaN');
     rightOut.forEach((o, k) => { lone = lone.derive(o, tmp[k]); });
-    const order = [...leftNames, ...rightOut];
-    const joined = leftQ.join(rq, { on: on.left.every((x, k) => x === on.right[k]) ? on.left : on, how: how === 'full' ? 'left' : 'inner', view: true }); // (unique right keys: right columns looked up)
-    return Query.union([joined.select(...order), lone.select(...order)]);
+    return lone.select(...leftNames, ...rightOut);
   }
 
   // ---- subqueries in expressions: joins that add a column ----------------------------------

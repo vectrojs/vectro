@@ -162,7 +162,7 @@ export function rowsModule({ t, arrays, encs, fields, W, vals, scalarNames, RB }
 // which it was, best when many rows start a new group (a branch would guess wrong).
 export const scratchBytes = (capMax, gMax, RB) => Math.ceil((capMax * 4 + gMax * RB + gMax * 24 + (1 << DIGIT_BITS) * 4) / 64) * 64;
 
-export function aggregateModule({ W, RB, accs }, branchFree, shared) {
+export function aggregateModule({ W, RB, accs }, branchFree, shared, countOnly = false) { // countOnly: groups[part] = G, no sort, records left as they are
   const f = new Fn('k', [I32, I32, I32], []);
   const [task, self, prm] = [0, 1, 2];
   const L = (type) => f.local(type);
@@ -263,6 +263,7 @@ export function aggregateModule({ W, RB, accs }, branchFree, shared) {
     });
   }
   f.emit(get(rec), i32c(RB), i32add, set(rec), br(0), end, end);
+  if (countOnly) { f.emit(groupsOut(get(G))); return buildModule([f], shared); }
 
   // sort: I = 0..G-1; per key word, last first: K = that word of group I[k],
   // then LSD radix passes over the bits that differ, moving (K, I) pairs

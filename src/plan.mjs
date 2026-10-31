@@ -96,6 +96,10 @@ export class Query {
   window(spec) { return new Query({ op: 'window', input: this.node, partition: spec.partition ?? [], order: spec.order ?? [], items: spec.items }); }
   // (SQL) the rows of several queries one after another, columns by position
   static union(queries) { return new Query({ op: 'union', inputs: queries.map((q) => q.node) }); }
+  // (SQL RIGHT / FULL JOIN) the right rows that a join with opts.unmatched =
+  // state matched to no left row, columns `names` (the join's right side);
+  // only after that join ran (an earlier input of the same union).
+  static unmatched(state, names) { return new Query({ op: 'unmatched', state, names }); }
   groupBy(keys) {
     return { agg: (spec, params = {}) => new Query({ op: 'aggregate', input: this.node, keys: keyList(keys), spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) }) };
   }
@@ -135,6 +139,7 @@ export function namesOf(node) {
     case 'window': return [...namesOf(node.input).filter((n) => !node.items.some((it) => it.name === n)), ...node.items.map((it) => it.name)];
     case 'textmap': return [...namesOf(node.input).filter((n) => n !== node.name), node.name];
     case 'union': return namesOf(node.inputs[0]);
+    case 'unmatched': return node.names;
   }
   return [];
 }
@@ -218,7 +223,7 @@ function firstRanks(cond, node) {
 
 export function optimize(node) {
   switch (node.op) {
-    case 'scan': return node;
+    case 'scan': case 'unmatched': return node;
     case 'filter': {
       let input = optimize(node.input);
       for (const c of conjuncts(node.ast)) input = pushFilter(input, c);
@@ -226,6 +231,10 @@ export function optimize(node) {
     }
     case 'join': return { ...node, left: optimize(node.left), right: optimize(node.right) };
     case 'union': return { ...node, inputs: node.inputs.map(optimize) };
+    case 'aggregate': {
+      const input = optimize(node.input);
+      return { ...node, input };
+    }
     default: return { ...node, input: optimize(node.input) };
   }
 }
@@ -238,6 +247,11 @@ export function optimize(node) {
 function* execG(node, needed, temps) {
   switch (node.op) {
     case 'scan': return { table: node.table, derived: new Map(), visible: node.table.columnNames };
+    case 'unmatched': { // (the join that made it ran first, in this run)
+      const t = runState(temps).get(node.state);
+      if (!t) throw new Error('vectro: internal: unmatched rows before their join ran');
+      return { table: t, derived: new Map(), visible: node.names };
+    }
     case 'filter': {
       const s = yield* execG(node.input, union(needed, vars(node.ast)), temps);
       return { ...s, table: s.table.filter(toSource(inline(node.ast, s.derived))) };
@@ -255,6 +269,8 @@ function* execG(node, needed, temps) {
       return { ...s, visible: node.names };
     }
     case 'aggregate': {
+      const fused = yield* lookupAggregateG(node, temps);
+      if (fused) return { table: fused, derived: new Map(), visible: fused.columnNames };
       const specAsts = Object.values(node.spec);
       const want = new Set([...node.keys, ...specAsts.flatMap((a) => [...vars(a)])]);
       const s = yield* execG(node.input, want, temps);
@@ -322,9 +338,18 @@ function* execG(node, needed, temps) {
       const [lk, rk] = typeof on === 'string' || Array.isArray(on) ? [[on].flat(), [on].flat()] : [[on?.left].flat(), [on?.right].flat()];
       const needL = new Set(lk), needR = new Set(rk);
       for (const n of needed ?? namesOf(node)) { if (leftNames.has(n)) needL.add(n); else if (fromRight.has(n)) needR.add(fromRight.get(n)); else if (rk.includes(n)) needR.add(n); }
+      // (a right column renamed for a name it shares: those names come along, so the join names it the same)
+      const suffix = node.opts.suffix ?? '_right';
+      for (const [out, n] of fromRight) {
+        if (out === n || !needR.has(n)) continue;
+        for (let x = n; x !== out; x += suffix) { if (leftNames.has(x)) needL.add(x); else if (fromRight.has(x)) needR.add(fromRight.get(x)); }
+      }
       const sl = yield* execG(node.left, needL, temps), sr = yield* execG(node.right, needR, temps);
       const lt = yield* materializeG(sl, needL, temps, [], true), rt = yield* materializeG(sr, needR, temps, [], true);
-      const j = yield { table: lt, method: 'join', args: [rt, node.opts] };
+      // (RIGHT / FULL JOIN) the right rows it matched to none, kept for this run's 'unmatched' step
+      const holder = node.opts.unmatched ? {} : null;
+      const j = yield { table: lt, method: 'join', args: [rt, holder ? { ...node.opts, unmatched: holder } : node.opts] };
+      if (holder) { temps.push(holder.table); runState(temps).set(node.opts.unmatched, holder.table); }
       return { table: j, derived: new Map(), visible: j.columnNames.filter((n) => n !== '__vectro_found') }; // (a view join's match flag)
     }
     case 'output': {
@@ -347,6 +372,35 @@ function* execG(node, needed, temps) {
     }
   }
   throw new Error(`vectro: unknown plan step ${node.op}`);
+}
+
+// GROUP BY right columns of an inner join on one key, aggregating left
+// columns only: the left rows (still filtered, packed columns as they are)
+// go straight into groups found by looking up their key (see
+// Table._lookupGroupAgg), no joined rows made. Null when that doesn't apply.
+function* lookupAggregateG(node, temps) {
+  const J = node.input;
+  if (J.op !== 'join' || (J.opts.how ?? 'inner') !== 'inner' || !node.keys.length) return null;
+  const lazyOnly = (n) => n.op === 'scan' || ((n.op === 'filter' || n.op === 'derive' || n.op === 'select') && lazyOnly(n.input)); // (views: cheap to make again if this path declines)
+  if (!lazyOnly(J.left) || !lazyOnly(J.right)) return null;
+  const { on } = J.opts;
+  const [lk, rk] = typeof on === 'string' || Array.isArray(on) ? [[on].flat(), [on].flat()] : [[on?.left].flat(), [on?.right].flat()];
+  if (lk.length !== 1 || rk.length !== 1) return null;
+  const { left: leftNames, fromRight } = joinNames(J);
+  if (!node.keys.every((k) => fromRight.has(k))) return null;
+  const specAsts = Object.values(node.spec);
+  const used = new Set(specAsts.flatMap((a) => [...vars(a)]));
+  if (![...used].every((n) => leftNames.has(n))) return null;
+  const rightKeys = node.keys.map((k) => fromRight.get(k));
+  const sl = yield* execG(J.left, new Set([...used, lk[0]]), temps);
+  if (sl.derived.has(lk[0])) return null;
+  const sr = yield* execG(J.right, new Set([...rightKeys, rk[0]]), temps);
+  if (sr.derived.has(rk[0]) || rightKeys.some((k) => sr.derived.has(k))) return null;
+  const spec = Object.fromEntries(Object.entries(node.spec).map(([k, a]) => [k, toSource(inline(a, sl.derived))]));
+  const base = new Set([lk[0]]);
+  for (const a of Object.values(spec)) for (const v of vars(parse(a))) if (sl.table.cols.has(v)) base.add(v);
+  const lt = sl.table.select(...base), rt = sr.table.select(...new Set([rk[0], ...rightKeys]));
+  return yield { table: lt, method: '_lookupGroupAgg', args: [rt, { left: lk[0], right: rk[0] }, node.keys, rightKeys, spec] };
 }
 
 // A table holding `names` (base or derived) of state s, still filtered.
@@ -382,6 +436,9 @@ function* deriveAllG(t, names, derived) {
 }
 
 const union = (a, b) => (a ? new Set([...a, ...b]) : null);
+// what one run of a plan keeps between steps (its temps list stands for the run)
+const runStates = new WeakMap();
+const runState = (temps) => { let m = runStates.get(temps); if (!m) runStates.set(temps, (m = new Map())); return m; };
 const minus = (a, name) => (a ? new Set([...a].filter((n) => n !== name)) : null);
 
 // Free the intermediate tables, except columns the result still uses.
@@ -425,6 +482,7 @@ const record = (temps, req, out) => { if (out && out !== req.table && out.cols &
 // chunk by chunk.
 export function findDataset(node) {
   if (node.op === 'scan') return node.table.isDataset ? node.table : null;
+  if (node.op === 'unmatched') return null;
   if (node.op === 'union') { for (const i of node.inputs) { const d = findDataset(i); if (d) return d; } return null; }
   return node.op === 'join' ? findDataset(node.left) ?? findDataset(node.right) : findDataset(node.input);
 }
@@ -486,6 +544,7 @@ function describe(node, depth = 0) {
     case 'textmap': return `${describe(node.input, depth)}\n${pad}${node.text ? 'text' : 'value'} ${node.name} = ${node.label}(${node.inputs.join(', ')}) (once per distinct value)`;
     case 'window': return `${describe(node.input, depth)}\n${pad}window ${node.items.map((it) => `${it.name} = ${it.fn}(${it.arg ?? ''})`).join(', ')}${node.partition.length ? ` partition by ${node.partition.join(', ')}` : ''}${node.order.length ? ` order by ${node.order.map((o) => (o.desc ? `-${o.name}` : o.name)).join(', ')}` : ''}${node.firstRanks ? ` (rows that can rank in the first ${node.firstRanks} only)` : ''}`;
     case 'union': return `${pad}union all\n${node.inputs.map((i) => describe(i, depth + 1)).join(`\n${pad}  and\n`)}`;
+    case 'unmatched': return `${pad}right rows the join above matched to none (from its probe) [${node.names.join(', ')}]`;
     case 'total': return `${describe(node.input, depth)}\n${pad}totals: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}`;
   }
   return `${pad}${node.op}`;

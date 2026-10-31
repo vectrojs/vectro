@@ -644,7 +644,7 @@ const onKeys = (on) => (typeof on === 'string' || Array.isArray(on) ? [[on].flat
 
 // The joins in a per-chunk plan, marked to return views (scans kept as they are).
 function viewJoins(node) {
-  if (node.op === 'scan') return node;
+  if (node.op === 'scan' || node.op === 'unmatched') return node;
   if (node.op === 'join') return { ...node, opts: { ...node.opts, view: true }, left: viewJoins(node.left) };
   return { ...node, input: viewJoins(node.input) };
 }
@@ -652,7 +652,7 @@ function viewJoins(node) {
 // node with `target` (the same object) replaced by `repl`
 function substitute(node, target, repl) {
   if (node === target) return repl;
-  if (node.op === 'scan') return node;
+  if (node.op === 'scan' || node.op === 'unmatched') return node;
   if (node.op === 'join') return { ...node, left: substitute(node.left, target, repl), right: substitute(node.right, target, repl) };
   return { ...node, input: substitute(node.input, target, repl) };
 }
@@ -662,6 +662,7 @@ function substitute(node, target, repl) {
 function needs(node, need, ds) {
   switch (node.op) {
     case 'scan': return node.table === ds ? need : undefined;
+    case 'unmatched': return undefined;
     case 'filter': return needs(node.input, need && union(need, vars(node.ast)), ds);
     case 'derive':
       if (!need) return needs(node.input, null, ds);
@@ -789,7 +790,7 @@ function emptyLike(engine, spill) {
 // filtered or packed table is collected / decoded, so each chunk's join finds
 // the same table (and its hash table, kept in engine._joinBuilds).
 function* materializeRights(node, temps) {
-  if (node.op === 'scan') return node;
+  if (node.op === 'scan' || node.op === 'unmatched') return node; // (unmatched: a FULL JOIN's right rows, made by its join)
   if (node.op === 'union') { // each input with a dataset in it: read (its matching rows) into memory
     const inputs = [];
     for (const input of node.inputs) {
@@ -853,6 +854,7 @@ function* runChunksG(plan, path, sink) {
   let bi = path.length - 2;
   while (!BLOCKING[path[bi].op]) bi--;
   let B = path[bi], kind = BLOCKING[B.op];
+  const below = path.slice(bi + 1, -1); // (the steps between the dataset and B: what each chunk runs)
   if (B.op === 'sort' && bi > 0 && path[bi - 1].op === 'limit' && path[bi - 1].input === B) { B = path[bi - 1]; kind = 'top'; }
   const top = kind === 'top' ? B.input.input : B.input; // what runs on each chunk
   // columns to read, and the chunks the filters right above the dataset allow
@@ -870,7 +872,10 @@ function* runChunksG(plan, path, sink) {
   const pieces = ds._piecesFor(conds);
   ds.lastRun.skipped = ds.chunkCount - pieces.length;
   const list = pieces.length ? pieces : [{ i: -1, lo: 0, hi: 0 }]; // (no rows, but the plan still runs once for the result's shape)
-  const derived = new Set(path.slice(0, -1).filter((n) => n.op === 'derive' || n.op === 'textmap' || n.op === 'join').flatMap((n) => (n.op === 'join' ? namesOf(n.right) : [n.name])));
+  // columns made below B (names made above it, such as a result's renames, are not: B sees the dataset's)
+  const derived = new Set(below.filter((n) => n.op === 'derive' || n.op === 'textmap' || n.op === 'join').flatMap((n) => (n.op === 'join' ? namesOf(n.right) : [n.name])));
+  // derived columns that are arithmetic on number columns of the dataset (a top-k cutoff can compare them)
+  derived.numeric = new Set(below.filter((n) => n.op === 'derive' && arithmetic(n.ast, ds)).map((n) => n.name));
   const acc = accumulator(kind, B, engine, sink, ds, derived);
   let finalTable = null;
   engine._joinRuns = (engine._joinRuns ?? 0) + 1; // joins keep their right side's build while a dataset runs
@@ -879,17 +884,35 @@ function* runChunksG(plan, path, sink) {
     let pj = viewTop;
     while (pj.op !== 'scan' && !(pj.op === 'join' && pj.partitioned)) pj = pj.op === 'join' ? pj.left : pj.input;
     if (pj.op === 'join') yield* partitionedJoinG(pj, viewTop, ds, names, acc);
-    else for (let k = 0; k < list.length; k++) {
-      if (k > 0 && acc.done) break;
-      const chunk = yield { read: ds, piece: list[k], names };
-      if (k + 1 < list.length && !acc.done) yield { prefetch: ds, piece: list[k + 1], names };
-      ds.lastRun.read += list[k].i >= 0 ? 1 : 0;
-      ds.lastRun.rows += chunk.n;
-      try {
-        yield* acc.chunk(substitute(viewTop, scan, { op: 'scan', table: chunk }), chunk);
-      } finally {
-        chunk.dispose();
+    else {
+      // top-k: each chunk is narrowed to the blocks that can still beat the
+      // k-th row so far (acc.prune), just before it is read or prefetched
+      let at = 0, pruned = 0;
+      const next = () => { // the next piece to read (null: none left)
+        while (at < list.length) {
+          const p = list[at++], q = acc.prune && p.i >= 0 ? acc.prune(p) : p;
+          if (q) return q;
+          pruned++;
+        }
+        return null;
+      };
+      let piece = next(), k = 0;
+      while (piece) {
+        if (k++ > 0 && acc.done) break;
+        const chunk = yield { read: ds, piece, names };
+        // (top-k: no prefetch during the first chunk, so the next one is narrowed by its result)
+        const ahead = acc.done || (acc.prune && !acc.ready() && k === 1) ? null : next();
+        if (ahead) yield { prefetch: ds, piece: ahead, names };
+        ds.lastRun.read += piece.i >= 0 ? 1 : 0;
+        ds.lastRun.rows += chunk.n;
+        try {
+          yield* acc.chunk(substitute(viewTop, scan, { op: 'scan', table: chunk }), chunk);
+        } finally {
+          chunk.dispose();
+        }
+        piece = ahead ?? (acc.done ? null : next());
       }
+      ds.lastRun.skipped += pruned;
     }
     const merged = yield* acc.finish();
     if (kind === 'total' || merged === null) return merged;
@@ -930,21 +953,74 @@ function accumulator(kind, B, engine, sink, ds, derived) {
   // top-k: once k rows are kept, a row whose first key is worse than the
   // k-th can't make it, so later chunks get that cutoff as a filter (ties pass)
   const k = B.n + (B.offset ?? 0);
-  const first = kind === 'top' && k > 0 ? firstSortKey(B.input.by[0], ds, derived) : null;
+  const first = kind === 'top' && k > 0 ? firstSortKey(B.input.by[0], ds, derived, true) : null;
   let cutoff = null;
+  // the leading sort keys that are plain number columns of the dataset (their
+  // min / max per block are in the footer), and the k-th row's values of them
+  const zkeys = [];
+  if (first) for (const by of B.input.by) {
+    const key = firstSortKey(by, ds, derived, true);
+    const c = key && /^[A-Za-z_]\w*$/.test(key.expr) && !derived.has(key.expr) && ds.cols.get(key.expr);
+    if (!c || c.dict || c.strings) break;
+    zkeys.push(key);
+  }
+  // the leading sort keys that sort by value (the k-th row's values of them are found)
+  const ckeys = [];
+  if (first) for (const by of B.input.by) { const key = firstSortKey(by, ds, derived, true); if (!key) break; ckeys.push(key); }
+  let bound = null, dense = false, cutFirst = null;
   const acc = {
     done: false,
+    ready: () => bound !== null,
+    // piece narrowed to the blocks that may hold a row at least as good as
+    // the k-th so far (from the first such block to the last; null: none): a
+    // block whose max (desc) / min (asc) of the first key is worse can't, nor
+    // one that at best ties it there and is worse on the next key, and so on
+    // (missing values sort last: never better)
+    prune: zkeys.length ? (piece) => {
+      if (!bound) return piece;
+      const ch = ds.meta.chunks[piece.i];
+      const b0 = Math.floor(piece.lo / BLOCK), b1 = Math.ceil(piece.hi / BLOCK);
+      const zone = (z, b, which) => fromJson(z.blocks && b1 - b0 > 0 ? z.blocks[which][b] : z[which]);
+      const may = (b) => {
+        for (let j = 0; j < zkeys.length; j++) {
+          const z = ch.cols[zkeys[j].expr], v = bound[j];
+          if (!z || v !== v) return true;
+          if (z.missing === ch.rows) return false; // (only missing values: last)
+          const lo = zone(z, b, 'min'), hi = zone(z, b, 'max');
+          if (zkeys[j].desc ? hi > v : lo < v) return true;   // may be better on this key
+          if (zkeys[j].desc ? hi < v : lo > v) return false;  // worse on this key
+          if (!(lo <= v && v <= hi)) return false;            // (an all-missing block)
+          // at best a tie on this key: the next key decides
+        }
+        return true; // (ties with the k-th pass: the merge picks)
+      };
+      let first = b0, last = b1 - 1;
+      while (first <= last && !may(first)) first++;
+      while (last > first && !may(last)) last--;
+      if (first > last) return null;
+      return { i: piece.i, lo: Math.max(piece.lo, first * BLOCK), hi: Math.min(piece.hi, (last + 1) * BLOCK) };
+    } : null,
     *chunk(P, chunk) {
       let node;
       if (kind === 'top') {
         node = { op: 'output', input: { op: 'limit', n: k, offset: 0, input: { ...B.input, input: P } } };
         if (cutoff !== null) { // only rows at least as good as the k-th so far: keep them all (the merge picks the best)
-          node = { op: 'output', input: { op: 'filter', ast: parse(`(${first.expr}) ${first.desc ? '>=' : '<='} ${toSource({ t: 'num', v: cutoff })}`), input: P } };
+          const F = { op: 'filter', ast: cutFirst, input: P };
+          node = dense ? { op: 'output', input: { op: 'limit', n: k, offset: 0, input: { ...B.input, input: F } } } : { op: 'output', input: F };
         }
       }
       else if (kind === 'head') node = { op: 'output', input: { op: 'limit', n: B.n + (B.offset ?? 0) - rows, offset: 0, input: P } };
       else node = { op: 'output', input: P };
-      const r = yield { run: node };
+      let r = yield { run: node };
+      if (kind === 'top' && cutoff !== null && !dense && r.n > Math.max(8 * k, 1 << 14)) {
+        // many rows beat the cutoff (e.g. newest first over time-ordered chunks):
+        // the best k of them now, and top-k straight away on the chunks after
+        dense = true;
+        const own = yield* keep(engine, r, chunk);
+        const best = yield { run: { op: 'output', input: { op: 'limit', n: k, offset: 0, input: { ...B.input, input: { op: 'scan', table: own } } } } };
+        r = yield* keep(engine, best, own);
+        if (r !== own) own.dispose();
+      }
       if (sink && kind === 'collect') { // straight to the dataset being written (or to spill partitions)
         if (sink.appendG) { yield* sink.appendG(yield* keep(engine, r, chunk)); return; }
         try { sink.append(r); } finally { if (r !== chunk) r.dispose(); }
@@ -962,8 +1038,16 @@ function accumulator(kind, B, engine, sink, ds, derived) {
         rows = parts[0].n;
       }
       if (first && rows >= k && parts.length === 1) { // the k-th row's first key
-        const v = (yield { run: { op: 'total', spec: { v: parse(`min(${first.expr})`) }, input: { op: 'limit', n: 1, offset: k - 1, input: { op: 'scan', table: parts[0] } } } }).v;
-        if (v === v) cutoff = v;
+        const spec = {};
+        ckeys.forEach((c, j) => { spec[`c${j}`] = parse(`min(${c.expr})`); });
+        const r = yield { run: { op: 'total', spec, input: { op: 'limit', n: 1, offset: k - 1, input: { op: 'scan', table: parts[0] } } } };
+        const num = (x) => (x instanceof Date ? x.getTime() : typeof x === 'number' ? x : NaN);
+        const vals = ckeys.map((_, j) => num(r[`c${j}`]));
+        if (vals[0] === vals[0]) {
+          cutoff = vals[0];
+          cutFirst = parse(`(${first.expr}) ${first.desc ? '>=' : '<='} ${toSource({ t: 'num', v: cutoff })}`);
+        }
+        if (zkeys.length) bound = vals.slice(0, zkeys.length);
       }
     },
     *finish() {
@@ -1142,14 +1226,24 @@ function sortSpillAccumulator(B, engine, ds, derived, first) {
 
 // The first sort key as an expression and its direction, if it sorts by
 // value (a text column sorts by label: no cutoff then).
-function firstSortKey(by, ds, derived) {
+// (numeric: a derived column that is arithmetic on number columns counts as a value too)
+function firstSortKey(by, ds, derived, numeric = false) {
   const src = String(by).trim();
   const desc = src.startsWith('-');
   const expr = desc ? src.slice(1).trim() : src;
   const ident = /^[A-Za-z_]\w*$/.test(expr);
   if (ident && !derived.has(expr) && (ds.cols.get(expr)?.dict || ds.cols.get(expr)?.strings)) return null;
-  if (ident && derived.has(expr)) return null; // (a join's text column, or a derived label: be safe)
+  if (ident && derived.has(expr) && !(numeric && derived.numeric?.has(expr))) return null; // (a join's text column, or a derived label: be safe)
   return { expr, desc };
+}
+
+// numbers, number columns of ds, + - * / and minus only
+function arithmetic(ast, ds) {
+  if (ast.t === 'num') return true;
+  if (ast.t === 'var') { const c = ds.cols.get(ast.name); return !!c && !c.dict && !c.strings; }
+  if (ast.t === 'un') return ast.op === '-' && arithmetic(ast.x, ds);
+  if (ast.t === 'bin') return ['+', '-', '*', '/'].includes(ast.op) && arithmetic(ast.l, ds) && arithmetic(ast.r, ds);
+  return false;
 }
 
 // totals and groups: each aggregation as partial values per chunk, merged

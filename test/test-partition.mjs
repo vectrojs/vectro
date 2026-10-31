@@ -6,6 +6,7 @@
 // parameters, on any number of threads; and the hash path where this one
 // doesn't apply (more key words than it takes, too little memory).
 import { Engine } from '../src/node.mjs';
+import { estimateGroups } from '../src/partition.mjs';
 
 let failures = 0, checks = 0;
 const fail = (msg) => { failures++; if (failures <= 15) console.log('FAIL', msg); };
@@ -178,6 +179,20 @@ for (const [label, opts] of [['threads', {}], ['one thread', { threads: 1 }], ['
   }
   checks++;
   if (new Set(sums).size !== 1) fail('sums differ between thread counts');
+  await e.close();
+}
+// the group estimate on runs of the same sorted keys (partial groups put
+// together): not one key per run seen
+{
+  const e = new Engine();
+  for (const runs of [2, 3, 8]) {
+    const G = 100_000, k = new Float64Array(G * runs);
+    for (let r = 0; r < runs; r++) for (let i = 0; i < G; i++) k[r * G + i] = i;
+    const t = e.table({ k }, { compress: false }), est = estimateGroups(t, ['k']);
+    checks++;
+    if (!(est >= G / 4 && est <= G * runs)) fail(`estimate over ${runs} sorted runs of ${G} keys: ${est}`);
+    t.dispose();
+  }
   await e.close();
 }
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} partitioned group-by checks passed`);

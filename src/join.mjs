@@ -33,7 +33,8 @@ function parseOn(on) {
 }
 
 // L, R: tables without filters. makeTable(cols, n) builds the result.
-export function* joinTablesG(L, R, { on, how = 'inner', suffix = '_right' } = {}, makeTable) {
+export function* joinTablesG(L, R, opts = {}, makeTable) {
+  const { on, how = 'inner', suffix = '_right' } = opts;
   const engine = L.engine;
   if (R.engine !== engine) throw new Error('vectro: join needs two tables of the same engine');
   if (how !== 'inner' && how !== 'left') throw new Error(`vectro: join how must be 'inner' or 'left', got "${how}"`);
@@ -69,8 +70,11 @@ export function* joinTablesG(L, R, { on, how = 'inner', suffix = '_right' } = {}
 
     // 2. each left row's group number, or -1
     const lid = alloc(Int32Array, nL);
-    if (engine.jit) yield* probeG(engine, t, build, leftKeys, lid);
+    const hit = opts.unmatched ? newHits(engine, build, alloc) : null;
+    let marked = false;
+    if (engine.jit) marked = yield* probeG(engine, t, build, leftKeys, lid, -1, hit);
     else probeJS(engine, build, leftKeys, lid);
+    if (hit) opts.unmatched.result = yield* unmatchedRightG(engine, R, build, hit, marked ? null : lid, nL, t);
 
     // 3. the pairs (left rows in order, each with its matches in right-table order)
     const left = how === 'left';
@@ -129,7 +133,8 @@ export function* joinTablesG(L, R, { on, how = 'inner', suffix = '_right' } = {}
 //   collectLeft(): the left table's matching rows (a generator)
 //   makeView(cols, n, pred, left): the result, which takes over `left`'s columns
 export const FOUND = '__vectro_found';
-export function* joinViewG(L, R, { on, how = 'inner', suffix = '_right' } = {}, collectLeft, makeView) {
+export function* joinViewG(L, R, opts = {}, collectLeft, makeView) {
+  const { on, how = 'inner', suffix = '_right' } = opts;
   const engine = L.engine;
   if (R.engine !== engine || L.type !== R.type || (how !== 'inner' && how !== 'left')) return null;
   const [lk, rk] = parseOn(on);
@@ -163,12 +168,15 @@ export function* joinViewG(L, R, { on, how = 'inner', suffix = '_right' } = {}, 
       keys.push(plain);
     }
     const idx = alloc(Uint32Array, n);
-    if (build.lut) { if (n) yield* probeG(engine, t, build, keys, idx, K); } // (misses go straight to slot K)
+    const hit = opts.unmatched ? newHits(engine, build, alloc) : null;
+    let marked = false;
+    if (build.lut) { if (n) marked = yield* probeG(engine, t, build, keys, idx, K, hit); } // (misses go straight to slot K)
     else {
       const lid = alloc(Int32Array, n);
       if (n) yield* probeG(engine, t, build, keys, lid);
       noMatchAt(engine.live(lid), engine.live(idx), n, K);
     }
+    if (hit) opts.unmatched.result = yield* unmatchedRightG(engine, R, build, hit, marked ? null : idx, n, t);
     // right columns in group-number order (made once per build), then looked up
     const byGroup = (name, c) => {
       let x = build.byGroup?.get(name);
@@ -206,6 +214,151 @@ export function* joinViewG(L, R, { on, how = 'inner', suffix = '_right' } = {}, 
     for (const a of made) engine.free(a);
     if (ownBuild) freeBuild(engine, build);
   }
+}
+
+// (RIGHT / FULL JOIN) which right rows some left row matched: hit[g + 1]
+// is 1 once a probe found group g (hit[0] and hit[K + 1] take the misses,
+// -1 or K). The dense probe marks them as it goes; otherwise one pass over
+// the probe's group numbers does.
+function newHits(engine, build, alloc) { const h = alloc(Int32Array, build.K + 2); engine.live(h).fill(0); return h; }
+
+// The right rows no left row matched, in right-table order, with all of R's
+// columns: { cols, n }. ids: the probe's group numbers (n of them) when
+// the probe didn't mark hit itself.
+function* unmatchedRightG(engine, R, build, hit, ids, n, t) {
+  const nR = R.n;
+  let rows = null;
+  try {
+    if (ids && n) {
+      if (engine.jit) {
+        const k = kernel(engine, 'markhits', () => markHitsModule(engine.isShared));
+        yield* engine._unitsG(k, n, [engine.live(ids).byteOffset, engine.live(hit).byteOffset + 4]);
+      } else { const g = engine.live(ids), h = engine.live(hit); for (let i = 0; i < n; i++) h[g[i] + 1] = 1; }
+    }
+    let h = engine.live(hit), rid = engine.live(build.rid);
+    let u = 0;
+    for (let r = 0; r < nR; r++) u += 1 - h[rid[r] + 1];
+    rows = engine.alloc(Uint32Array, u);
+    const rv = engine.live(rows);
+    h = engine.live(hit); rid = engine.live(build.rid); // (the allocation may have moved memory)
+    if (u) for (let r = 0, o = 0; r < nR; r++) if (!h[rid[r] + 1]) rv[o++] = r;
+    const cols = new Map();
+    for (const [name, c] of R.cols) {
+      let data;
+      if (engine.jit && u) data = yield* gatherG(engine, c.data, rows, u, t);
+      else { data = engine.alloc(R.type, u); const a = engine.live(c.data), d = engine.live(data); for (let i = 0; i < u; i++) d[i] = a[rv[i]]; }
+      cols.set(name, { data: engine.live(data), dict: c.dict, codes: c.codes, strings: c.strings, date: c.date });
+    }
+    return { cols, n: u };
+  } finally {
+    if (rows) engine.free(rows);
+  }
+}
+
+// mark(start, end, unit, ids, hit): hit[ids[i]] = 1 (int32s; threads
+// racing on one slot all store 1)
+function markHitsModule(shared) {
+  const f = new Fn('k', [I32, I32, I32, I32, I32], []);
+  const [start, stop, , ids, hit] = [0, 1, 2, 3, 4];
+  const i = f.local(I32), at = f.local(I32);
+  f.emit(get(start), set(i));
+  f.emit(block, loop, get(i), get(stop), i32geu, brIf(1));
+  f.emit(get(i), i32c(2), [0x74], get(ids), i32add, [0x28, 2, 0], i32c(2), [0x74], get(hit), i32add, set(at)); // &hit[ids[i]]
+  f.emit(get(at), [0x28, 2, 0], [0x45], [0x04, 0x40], get(at), i32c(1), [0x36, 2, 0], end); // (stored only while still 0: the slot's cache line stays shared)
+  f.emit(get(i), i32c(1), i32add, set(i), br(0), end, end);
+  return buildModule([f], shared);
+}
+
+// GROUP BY right columns over an inner join on unique right keys (see
+// Table._lookupGroupAgg): instead of joined rows, one int32 lookup array
+// from the left key straight to a group number, so the group kernel adds
+// each matching left row into its group as it reads the key. Groups are the
+// distinct tuples of the right columns `rightKeys` (numbers ascending, NaN
+// last; text in dictionary order), numbered in that order. Made once per
+// right table and kept with its hash table while a dataset runs (freed
+// with it). Null when the right keys repeat or aren't whole numbers in a
+// small range (no direct lookup array): the usual join path then runs.
+//   -> { lut, min, size, G, values: [Float64Array(G)] per key, meta: [{ dict, codes, date }] }
+export function* lookupGroupsG(L, R, on, rightKeys) {
+  const engine = L.engine;
+  if (!engine.jit || R.engine !== engine || L.type !== R.type) return null;
+  const a = L.cols.get(on.left), b = R.cols.get(on.right);
+  if (!a || !b || a.strings || b.strings || a.dict || b.dict) return null; // (number keys; text keys: the usual path)
+  const cols = rightKeys.map((n) => R.cols.get(n));
+  if (cols.some((c) => !c || c.strings)) return null;
+  const cache = engine._joinBuilds ?? null;
+  if (!cache) return null; // (one-off joins: the usual path)
+  const sig = `lookup|${rightKeys.map((n) => arrayId(R.cols.get(n).data)).join(',')}`;
+  let x = cache.get(b.data)?.get(sig);
+  if (x !== undefined) return x;
+  engine._joinBuildCount = (engine._joinBuildCount ?? 0) + 1; // (tests: once per run, as the hash build)
+  x = directLookup(engine, R, b, cols);
+  if (!cache.has(b.data)) cache.set(b.data, new Map());
+  cache.get(b.data).set(sig, x ?? null); // (null: tried, doesn't apply; freed with the builds)
+  return x;
+}
+
+// One pass over the right rows: keys must be whole numbers in a small range
+// and unique (a repeat: null), group tuples numbered in sorted order.
+function directLookup(engine, R, b, cols) {
+  const nR = R.n, keys = engine.live(b.data);
+  const kr = keyRange(keys, nR);
+  if (!kr) return null;
+  const [lo, hi] = kr, size = hi - lo + 1;
+  if (!(size <= Math.max(4 * nR, 1 << 16) && size <= 2 ** 26)) return null;
+  const nk = cols.length, src = cols.map((c) => engine.live(c.data));
+  let lut;
+  try { lut = engine.alloc(Int32Array, size); } catch (err) { if (err instanceof RangeError) return null; throw err; } // (no room: the usual join path)
+  const T = engine.live(lut);
+  T.fill(-1);
+  let G, values, ok;
+  const one = nk === 1 ? wholeRange(src[0], nR) : null;
+  if (one && one[1] - one[0] + 1 <= Math.max(nR, 1 << 16)) { // one whole-number column in a small range: its own group number
+    G = one[1] - one[0] + 1;
+    values = [Float64Array.from({ length: G }, (_, g) => one[0] + g)];
+    ok = fillDirect(T, keys, src[0], nR, lo, one[0]);
+  } else {
+    const index = new Map(), firstRow = [], at = new Int32Array(nR);
+    for (let r = 0; r < nR; r++) {
+      let id = '';
+      for (let k = 0; k < nk; k++) { const v = src[k][r]; id += (v === v ? (v === 0 ? 0 : v) : 'NaN') + ','; } // (-0 as 0, NaN alike)
+      let c = index.get(id);
+      if (c === undefined) { c = firstRow.length; index.set(id, c); firstRow.push(r); }
+      at[r] = c;
+    }
+    G = firstRow.length;
+    const cmp = (x, y) => (x === y || (x !== x && y !== y) ? 0 : x !== x ? 1 : y !== y ? -1 : x < y ? -1 : 1); // NaN last
+    const order = Array.from({ length: G }, (_, i) => i).sort((i, j) => { for (let k = 0; k < nk; k++) { const d = cmp(src[k][firstRow[i]], src[k][firstRow[j]]); if (d) return d; } return 0; });
+    const rank = new Int32Array(G);
+    order.forEach((i, r) => { rank[i] = r; });
+    for (let r = 0; r < nR; r++) at[r] = rank[at[r]];
+    values = src.map((s) => Float64Array.from({ length: G }, (_, g) => { const v = s[firstRow[order[g]]]; return v === 0 ? 0 : v; }));
+    ok = fillDirect(T, keys, at, nR, lo, 0);
+  }
+  if (!ok) { engine.free(lut); return null; } // the right keys repeat
+  return { arrays: [lut], lut, min: lo, size, G, values, meta: cols.map((c) => ({ dict: c.dict ?? null, codes: c.dict ? c.codes : null, date: c.date })) };
+}
+
+// (plain functions: hot loops)
+function keyRange(keys, n) { // whole-number keys (NaN skipped): [min, max], else null
+  let lo = Infinity, hi = -Infinity;
+  for (let r = 0; r < n; r++) { const v = keys[r]; if (v !== v) continue; if (v !== Math.floor(v)) return null; if (v < lo) lo = v; if (v > hi) hi = v; }
+  return lo === Infinity ? null : [lo, hi];
+}
+function wholeRange(v, n) { // every value whole (no NaN): [min, max], else null
+  let lo = Infinity, hi = -Infinity;
+  for (let r = 0; r < n; r++) { const x = v[r]; if (x !== Math.floor(x)) return null; if (x < lo) lo = x; if (x > hi) hi = x; }
+  return lo === Infinity ? null : [lo, hi];
+}
+function fillDirect(T, keys, code, n, lo, base) { // T[key - lo] = code[r] - base; false on a repeated key
+  for (let r = 0; r < n; r++) {
+    const v = keys[r];
+    if (v !== v) continue; // (a missing key matches nothing)
+    const j = v - lo;
+    if (T[j] !== -1) return false;
+    T[j] = code[r] - base;
+  }
+  return true;
 }
 
 function noMatchAt(lid, idx, n, K) { for (let i = 0; i < n; i++) { const g = lid[i]; idx[i] = g < 0 ? K : g; } }
@@ -320,7 +473,7 @@ function* buildRight(engine, t, L, R, lk, rk, how) {
       if (m > 1) { rowOf = null; break; }
       rowOf[g] = m ? rows[start[g]] : -1;
     }
-    Object.assign(build, { start, rows, rowOf });
+    Object.assign(build, { start, rows, rowOf, rid });
     return build;
   } catch (err) {
     freeBuild(engine, build);
@@ -329,12 +482,14 @@ function* buildRight(engine, t, L, R, lk, rk, how) {
 }
 
 // Step 2 on every thread: look up the left keys (no inserts).
-function* probeG(engine, t, build, leftKeys, lid, miss = -1) {
+// hit (RIGHT / FULL JOIN): the dense probe also marks the groups it finds
+// (see newHits); returns whether it did.
+function* probeG(engine, t, build, leftKeys, lid, miss = -1, hit = null) {
   const p = (a) => engine.live(a).byteOffset;
   if (build.lut) { // whole-number keys in a small range: a direct lookup (lut[key - min])
-    const k = kernel(engine, `denseprobe|${t}`, () => denseProbeModule(t, engine.isShared));
-    yield* engine._unitsG(k, engine.live(lid).length, [p(leftKeys[0]), p(build.lut), p(lid), build.lutMin, build.lutSize, miss]);
-    return true;
+    const k = kernel(engine, `denseprobe|${t}|${hit ? 'mark' : ''}`, () => denseProbeModule(t, engine.isShared, !!hit));
+    yield* engine._unitsG(k, engine.live(lid).length, [p(leftKeys[0]), p(build.lut), p(lid), build.lutMin, build.lutSize, miss, ...(hit ? [p(hit) + 4] : [])]);
+    return !!hit;
   }
   const probe = kernel(engine, `hashprobe|${t}|${leftKeys.length}`, () => generateHashProbe(t, leftKeys.length, engine.isShared));
   yield* engine._fusedG(probe, engine.live(lid).length, [...leftKeys, lid], [p(build.slots), build.cap - 1, p(build.keyBits)], 0);
@@ -344,10 +499,10 @@ function* probeG(engine, t, build, leftKeys, lid, miss = -1) {
 // probe(start, end, unit, keys, lut, out, min, size, miss): out[i] = lut[key - min]
 // for a whole-number key in [min, min + size) that the right table has
 // (lut holds -1 for keys it lacks), else miss.
-function denseProbeModule(t, shared) {
-  const f = new Fn('k', [I32, I32, I32, I32, I32, I32, F64, I32, I32], []);
-  const [start, stop, , keys, lut, out, min, size, miss] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
-  const i = f.local(I32), v = f.local(F64), g = f.local(I32), ok = f.local(I32), x = f.local(I32);
+function denseProbeModule(t, shared, mark = false) {
+  const f = new Fn('k', [I32, I32, I32, I32, I32, I32, F64, I32, I32, ...(mark ? [I32] : [])], []);
+  const [start, stop, , keys, lut, out, min, size, miss, hit] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  const i = f.local(I32), v = f.local(F64), g = f.local(I32), ok = f.local(I32), x = f.local(I32), at = f.local(I32);
   const bytes = t === 'f32' ? 4 : 8;
   f.emit(get(start), set(i));
   f.emit(block, loop, get(i), get(stop), i32geu, brIf(1));
@@ -358,6 +513,11 @@ function denseProbeModule(t, shared) {
   f.emit(get(i), i32c(2), [0x74], get(out), i32add); // address of out[i]
   f.emit(get(x), get(miss), get(ok), get(x), i32c(0), [0x4e], [0x71], [0x1b]); // ok && x >= 0 ? x : miss
   f.emit([0x36, 2, 0]);
+  if (mark) { // a match: hit[x] = 1 (stored only while still 0, so the slot's cache line stays shared)
+    f.emit(get(ok), get(x), i32c(0), [0x4e], [0x71], [0x04, 0x40]);
+    f.emit(get(x), i32c(2), [0x74], get(hit), i32add, set(at));
+    f.emit(get(at), [0x28, 2, 0], [0x45], [0x04, 0x40], get(at), i32c(1), [0x36, 2, 0], end, end);
+  }
   f.emit(get(i), i32c(1), i32add, set(i), br(0), end, end);
   return buildModule([f], shared);
 }
