@@ -393,5 +393,163 @@
    "vectroOneConnection": 16910000.0,
    "vectroConnectionPerWorker": 15110000.0
   }
+ },
+ "groupby2m": {
+  "title": "The LinkedIn test: SELECT product_id, sum(amount) FROM orders GROUP BY 1 on 2M orders",
+  "script": "compare/bench-2m-groupby.mjs",
+  "date": "2026-11-01",
+  "vectroCommit": "2a00113",
+  "vectroCommitBefore": "9cb0e53",
+  "postgres": "PostgreSQL 16.11 (Homebrew), default settings: 3 processes on 8 threads' rows, max_parallel_workers_per_gather = 0 on 1 thread's",
+  "load": "3.2-3.5 at the start of each run (one benchmark at a time); each run's own 8 threads push it to 4-7",
+  "note": "median of 7 runs after 3 warm-ups; each case alone in its own process; ms, each cell the median of 3 runs (DuckDB: of 6). Before = commit 9cb0e53 (npm 0.1.0), after = 2a00113. Every answer checked against DuckDB's, product by product. DuckDB and Vectro time to a result in engine memory; Postgres is psql's \\timing. Postgres at 100,000 products left out (its run was disturbed: 830 ms vs 411 ms on 1 Nov 13:00). Vectro reads .vectro files, not Parquet",
+  "rows": [
+   {
+    "products": 100,
+    "threads": 1,
+    "duckdb": 6.93,
+    "vectroSql": 3.01,
+    "vectroGroupBy": 2.69,
+    "vectroSqlBefore": 5.32,
+    "vectroGroupByBefore": 4.22,
+    "duckdbParquetFile": 19.64,
+    "duckdbFile": 7.82,
+    "vectroFileSql": 8.5,
+    "vectroFileGroupBy": 8.3,
+    "postgres": 224.7
+   },
+   {
+    "products": 100,
+    "threads": 8,
+    "duckdb": 2.14,
+    "vectroSql": 2.03,
+    "vectroGroupBy": 2.03,
+    "vectroSqlBefore": 4.71,
+    "vectroGroupByBefore": 5.99,
+    "duckdbParquetFile": 8.8,
+    "duckdbFile": 2.5,
+    "vectroFileSql": 4.45,
+    "vectroFileGroupBy": 5.46,
+    "postgres": 84.6
+   },
+   {
+    "products": 1000,
+    "threads": 1,
+    "duckdb": 6.84,
+    "vectroSql": 3.02,
+    "vectroGroupBy": 2.92,
+    "vectroSqlBefore": 5.56,
+    "vectroGroupByBefore": 4.38,
+    "duckdbParquetFile": 19.24,
+    "duckdbFile": 8.02,
+    "vectroFileSql": 8.57,
+    "vectroFileGroupBy": 8.42,
+    "postgres": 205.7
+   },
+   {
+    "products": 1000,
+    "threads": 8,
+    "duckdb": 2.36,
+    "vectroSql": 2.33,
+    "vectroGroupBy": 2.4,
+    "vectroSqlBefore": 4.36,
+    "vectroGroupByBefore": 4.39,
+    "duckdbParquetFile": 5.84,
+    "duckdbFile": 2.28,
+    "vectroFileSql": 5.25,
+    "vectroFileGroupBy": 5.49,
+    "postgres": 78
+   },
+   {
+    "products": 10000,
+    "threads": 1,
+    "duckdb": 16.45,
+    "vectroSql": 3.43,
+    "vectroGroupBy": 3.16,
+    "vectroSqlBefore": 6.98,
+    "vectroGroupByBefore": 4.66,
+    "duckdbParquetFile": 29.38,
+    "duckdbFile": 18,
+    "vectroFileSql": 9.39,
+    "vectroFileGroupBy": 9.19,
+    "postgres": 259.9
+   },
+   {
+    "products": 10000,
+    "threads": 8,
+    "duckdb": 4.64,
+    "vectroSql": 3.35,
+    "vectroGroupBy": 2.77,
+    "vectroSqlBefore": 3.79,
+    "vectroGroupByBefore": 3.56,
+    "duckdbParquetFile": 8.37,
+    "duckdbFile": 4.71,
+    "vectroFileSql": 7.32,
+    "vectroFileGroupBy": 5.98,
+    "postgres": 101
+   },
+   {
+    "products": 100000,
+    "threads": 1,
+    "duckdb": 23.18,
+    "vectroSql": 6.37,
+    "vectroGroupBy": 5.94,
+    "vectroSqlBefore": 11.22,
+    "vectroGroupByBefore": 8.01,
+    "duckdbParquetFile": 35.51,
+    "duckdbFile": 25.18,
+    "vectroFileSql": 14.63,
+    "vectroFileGroupBy": 10.62,
+    "postgres": null
+   },
+   {
+    "products": 100000,
+    "threads": 8,
+    "duckdb": 14.87,
+    "vectroSql": 5.63,
+    "vectroGroupBy": 5.24,
+    "vectroSqlBefore": 7.39,
+    "vectroGroupByBefore": 5.91,
+    "duckdbParquetFile": 18.82,
+    "duckdbFile": 14.22,
+    "vectroFileSql": 12.85,
+    "vectroFileGroupBy": 13.85,
+    "postgres": null
+   }
+  ],
+  "sizesMB": [
+   {
+    "products": 100,
+    "parquet": 21,
+    "duckdb": 14.3,
+    "vectro": 9.3,
+    "postgres": 99.9,
+    "csv": 53.7
+   },
+   {
+    "products": 1000,
+    "parquet": 21.8,
+    "duckdb": 16.5,
+    "vectro": 10,
+    "postgres": 99.9,
+    "csv": 55.5
+   },
+   {
+    "products": 10000,
+    "parquet": 23.6,
+    "duckdb": 17.5,
+    "vectro": 11,
+    "postgres": 99.9,
+    "csv": 57.4
+   },
+   {
+    "products": 100000,
+    "parquet": 26.9,
+    "duckdb": 17.8,
+    "vectro": 11.7,
+    "postgres": 99.9,
+    "csv": 59.3
+   }
+  ]
  }
 }
