@@ -31,6 +31,7 @@ const IDENTITY = { sum: 0, count: 0, mean: 0, min: Infinity, max: -Infinity };
 const MAX_GROUP_SLOTS = 2 ** 28; // threads * aggregations * groups (2GB of float64)
 const PARALLEL_SORT_ROWS = 50_000; // smaller tables sort on the calling thread
 const TIME_STEPS = [86_400_000, 3_600_000, 60_000, 1_000]; // a day, an hour, a minute, a second (ms): see #directGroups
+const MISSING = new WeakMap(); // a column's array -> how many missing values it holds (arrays are never written once in a table)
 
 export class Table {
   // cols: Map name -> { data, dict, codes, strings }
@@ -578,6 +579,20 @@ export class Table {
     return Math.floor((engine._directSlots ?? DIRECT_SLOTS) / (engine.T * totals));
   }
 
+  // Is src a number column of this table with no missing values? Counted
+  // once per column (one pass on every thread) and remembered with its array.
+  *#noMissingG(src) {
+    const c = src && IDENT.test(src) ? this.cols.get(src) : null;
+    if (!c || c.dict || c.strings) return false;
+    let m = MISSING.get(c.data);
+    if (m === undefined) {
+      const k = c.enc ? { data: c.data, enc: c.enc, n: this.n, type: this.type === Float32Array ? 'f32' : 'f64' } : c.data;
+      [m] = yield* this.engine.evalG(['count(k != k)'], { k });
+      MISSING.set(c.data, m);
+    }
+    return m === 0;
+  }
+
   // Keys small enough to be group numbers as they are: a text column's codes
   // or whole numbers 0..2^24, several combined as k1 * size2 + k2..., while
   // the accumulators stay small (or no larger than the rows). Else null.
@@ -604,9 +619,16 @@ export class Table {
       offsets.push(lo);
       steps.push(step);
     }
+    const fits = (K) => !(K > 2 ** 24 || engine.T * J * K * (engine.jit && K <= 1024 ? 4 : 1) > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (K > 65_536 && K > 8 * this.n));
+    // One key from a small positive number (IDs from 1, years from 1990):
+    // numbered from 0 with a few groups left empty, so the key column itself
+    // is the group number and needs no copy.
+    if (keys.length === 1 && steps[0] === 1 && offsets[0] > 0 && offsets[0] <= Math.max(1024, sizes[0]) && offsets[0] + sizes[0] <= maxK && fits(offsets[0] + sizes[0])) {
+      sizes[0] += offsets[0];
+      offsets[0] = 0;
+    }
     const K = sizes.reduce((a, b) => a * b, 1);
-    const C = engine.jit && K <= 1024 ? 4 : 1;
-    if (K > 2 ** 24 || engine.T * J * K * C > (engine._maxGroupSlots ?? MAX_GROUP_SLOTS) || (K > 65_536 && K > 8 * this.n)) return null;
+    if (!fits(K)) return null;
     if (K > maxK) { if (info) info.K = K; return null; }
     const below = sizes.map((_, k) => sizes.slice(k + 1).reduce((a, b) => a * b, 1));
     const keyColumn = (k, keep) => directKeys(keep, below[k], sizes[k], steps[k], offsets[k]); // key k of each kept group (codes for text)
@@ -747,12 +769,20 @@ export class Table {
   *#runGroupsG(keys, groups, allItems, merged) {
     const { engine } = this;
     const { K } = groups;
-    const items = allItems.filter((it) => !DISTINCT.has(it.fn));
+    // Over a column with no missing values, count(x) is the row count (always
+    // counted) and sum / mean / min / max need no check for missing values:
+    // SQL's SUM(x) is sum(x) and count(x), so this takes a whole accumulator off.
+    const full = new Set();
+    for (const it of allItems) if (!DISTINCT.has(it.fn) && (yield* this.#noMissingG(it.raw))) full.add(it);
+    const rowCount = (it) => it.fn === 'count' && (!it.arg || full.has(it));
+    const items = allItems.filter((it) => !DISTINCT.has(it.fn) && !rowCount(it));
     // means need the count of values present: one more kernel item each
-    const kernelItems = [...items, ...items.filter((it) => it.present).map((it) => ({ fn: 'count', arg: it.present, of: it }))]; // means, mins, maxes
+    const kernelItems = [...items.map((it) => (full.has(it) ? { fn: it.fn, arg: it.raw } : it)),
+      ...items.filter((it) => it.present && !full.has(it)).map((it) => ({ fn: 'count', arg: it.present, of: it }))]; // means, mins, maxes
     const totals = yield* this.#groupTotalsG(groups, kernelItems, merged);
     if (!totals) return null; // (lookup groups the kernels can't take)
-    const presentOf = (it) => totals[1 + kernelItems.findIndex((k) => k.of === it)];
+    const totalOf = (it) => (rowCount(it) ? totals[0] : totals[1 + items.indexOf(it)]);
+    const presentOf = (it) => (full.has(it) ? totals[0] : totals[1 + kernelItems.findIndex((k) => k.of === it)]);
     // Keep groups that have rows, sorted by key (codes for text keys, so
     // dictionary order; NaN last), and build whole columns.
     let keep = keptGroups(totals[0], K);
@@ -768,7 +798,7 @@ export class Table {
     }
     // each item's value for every group number
     const perGroup = allItems.map((it) => {
-      const i = items.indexOf(it), v = i >= 0 ? totals[i + 1] : it.perGroup;
+      const v = DISTINCT.has(it.fn) ? it.perGroup : totalOf(it);
       return it.fn === 'mean' ? ratioOf(v, presentOf(it)) : it.fn === 'min' || it.fn === 'max' ? presentOnly(v, presentOf(it)) : v;
     });
     if (engine.jit && m >= PARALLEL_SORT_ROWS) return yield* this.#groupTableG(keys, groups, allItems, perGroup, keep);
@@ -1821,12 +1851,14 @@ function checkName(name) {
 // (mean divides by the values present), min and max skip them, count(x)
 // counts the values present (count(condition) still counts where it holds).
 // arg is the bound source; returns the aggregation item.
+// (raw: the argument as given; where it is a column with no missing values,
+// the group-by uses it as it is and takes counts from the row count)
 function missingRules(fn, arg) {
   const present = `(${arg}) == (${arg})`;
-  if (fn === 'count') return { fn, arg: isMask(parse(arg)) ? arg : present };
-  if (fn === 'min') return { fn, arg: `(${present} ? (${arg}) : Infinity)`, present }; // (present: NaN when nothing is)
-  if (fn === 'max') return { fn, arg: `(${present} ? (${arg}) : -Infinity)`, present };
-  return fn === 'mean' ? { fn, arg: `(${present} ? (${arg}) : 0)`, present } : { fn, arg: `(${present} ? (${arg}) : 0)` }; // sum, mean
+  if (fn === 'count') return isMask(parse(arg)) ? { fn, arg } : { fn, arg: present, raw: arg };
+  if (fn === 'min') return { fn, arg: `(${present} ? (${arg}) : Infinity)`, present, raw: arg }; // (present: NaN when nothing is)
+  if (fn === 'max') return { fn, arg: `(${present} ? (${arg}) : -Infinity)`, present, raw: arg };
+  return fn === 'mean' ? { fn, arg: `(${present} ? (${arg}) : 0)`, present, raw: arg } : { fn, arg: `(${present} ? (${arg}) : 0)`, raw: arg }; // sum, mean
 }
 
 // a category column given as codes into a labels array: { codes, labels }
