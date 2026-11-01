@@ -5,8 +5,9 @@
 // memory and from a file on disk: DuckDB over Parquet and its own .duckdb
 // file, Vectro over its .vectro dataset (Vectro can't read Parquet).
 // The post doesn't say how many products there are, so it runs at several.
-// Each system and thread count alone in its own process; 3 warm-up runs,
-// then the median of 7; every answer (every product's sum) checked against
+// Each way of running it (system, threads, API, file) alone in its own
+// process, so none is measured warmer than another; 3 warm-up runs, then the
+// median of 7; every answer (every product's sum) checked against
 // DuckDB's.
 //   node compare/bench-2m-groupby.mjs        (needs this folder's npm install)
 //   PRODUCTS=1000,100000   product_id cardinalities (default)
@@ -27,6 +28,8 @@ const WARM = Number(process.env.WARM ?? 3), RUNS = 7;
 const T0 = Date.UTC(2024, 0, 1), DAY = 86_400_000;
 const PGDB = process.env.PGDATABASE ?? 'vectro_bench_2m';
 const file = (k, ext) => join(DIR, `orders-${N}-${k}.${ext}`);
+const DUCK_CASES = ['memory: sql()', 'file: sql()', '.duckdb file'];
+const VECTRO_CASES = ['memory: sql()', 'memory: groupBy().agg()', 'file: sql()', 'file: groupBy().agg()'];
 const QUERY = (from) => `SELECT product_id, sum(amount) FROM ${from} GROUP BY 1`;
 
 function makeColumns(k) {
@@ -61,7 +64,7 @@ async function time(fn, answerOf) {
   return { ms: median(ms), all: ms, answer: last };
 }
 
-const [child, karg, targ] = process.argv.slice(2);
+const [child, karg, targ, which] = process.argv.slice(2);
 const k = Number(karg), threads = Number(targ);
 // (exit once the pipe has taken it all: answers run to megabytes)
 const done = (out) => new Promise(() => process.stdout.write('@@RESULT' + JSON.stringify(out), () => process.exit(0)));
@@ -91,17 +94,15 @@ if (child === 'vectro') {
   const { Engine, sql } = await import('../src/node.mjs');
   const engine = new Engine({ threads });
   await new Promise((r) => setTimeout(r, 300)); // workers up
-  const orders = engine.table(makeColumns(k), { dates: ['date'] });
-  const ds = engine.openDataset(file(k, 'vectro'));
+  const memory = which.startsWith('memory');
+  const orders = memory ? engine.table(makeColumns(k), { dates: ['date'] }) : engine.openDataset(file(k, 'vectro'));
   const rows = (t) => t.toRows().map((r) => Object.values(r));
   const release = (t) => () => t.dispose();
-  const out = {
-    'memory: sql()': await time(() => { const t = sql(QUERY('orders'), { orders }).collect(); return [t, release(t)]; }, rows),
-    'memory: groupBy().agg()': await time(() => { const t = orders.groupBy('product_id').agg({ s: 'sum(amount)' }); return [t, release(t)]; }, rows),
-    'file: sql()': await time(() => { const t = sql(QUERY('orders'), { orders: ds }).collect(); return [t, release(t)]; }, rows),
-    'file: groupBy().agg()': await time(() => { const t = ds.groupBy('product_id').agg({ s: 'sum(amount)' }).collect(); return [t, release(t)]; }, rows),
-  };
-  await ds.close();
+  const run = which.endsWith('sql()') ? () => { const t = sql(QUERY('orders'), { orders }).collect(); return [t, release(t)]; }
+    : memory ? () => { const t = orders.groupBy('product_id').agg({ s: 'sum(amount)' }); return [t, release(t)]; }
+    : () => { const t = orders.groupBy('product_id').agg({ s: 'sum(amount)' }).collect(); return [t, release(t)]; };
+  const out = { [which]: await time(run, rows) };
+  if (!memory) await orders.close();
   await engine.close();
   await done(out);
 }
@@ -117,9 +118,7 @@ if (child === 'duckdb') {
   const run = (c, q) => async () => [await c.runAndReadAll(q)];
   const rows = (r) => r.getRows();
   const out = {
-    'memory: sql()': await time(run(mem, QUERY('orders')), rows),
-    'file: sql()': await time(run(mem, QUERY(`'${file(k, 'parquet')}'`)), rows),
-    '.duckdb file': await time(run(disk, QUERY('orders')), rows),
+    [which]: await time(which === 'memory: sql()' ? run(mem, QUERY('orders')) : which === 'file: sql()' ? run(mem, QUERY(`'${file(k, 'parquet')}'`)) : run(disk, QUERY('orders')), rows),
   };
   mem.closeSync?.(); disk.closeSync?.();
   await done({ ...out, threadsSeen, version });
@@ -191,9 +190,9 @@ for (const k of PRODUCTS) {
   const res = { sizes: { csv: statSync(file(k, 'csv')).size, parquet: statSync(file(k, 'parquet')).size, duckdb: statSync(file(k, 'duckdb')).size, vectro: statSync(file(k, 'vectro')).size } };
   for (const t of [1, ALL]) {
     process.stderr.write(`  ${k} products, ${t} thread(s): duckdb... `);
-    res[`duckdb-${t}`] = spawn('duckdb', k, t);
+    res[`duckdb-${t}`] = Object.assign({}, ...DUCK_CASES.map((c) => spawn('duckdb', k, t, c)));
     process.stderr.write('vectro...\n');
-    res[`vectro-${t}`] = spawn('vectro', k, t);
+    res[`vectro-${t}`] = Object.assign({}, ...VECTRO_CASES.map((c) => spawn('vectro', k, t, c)));
   }
   if (pgVersion) { process.stderr.write(`  ${k} products: postgres...\n`); res.postgres = postgres(k); }
   results[k] = res;
