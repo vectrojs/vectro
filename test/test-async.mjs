@@ -95,10 +95,19 @@ for (const n of [500, 300_000]) {
 
 // 4. a sync call while an async query is on the workers is refused, clearly
 {
-  const t = makeTable(e, 4_000_000);
-  const pending = t.groupBy('cust').aggAsync({ s: 'sum(price * qty)' });
-  let waited = 0;
-  while (!e.busy && waited++ < 1000) await new Promise((r) => setImmediate(r));
+  // `busy` is true only while a stage is on the workers, and a fast machine (or
+  // a slow runner with few cores) can finish a stage between two polls: try a
+  // few times, on more rows each time, before calling it a failure
+  let t, pending;
+  for (const rows of [4_000_000, 4_000_000, 8_000_000, 8_000_000]) {
+    t?.dispose?.();
+    t = makeTable(e, rows);
+    pending = t.groupBy('cust').aggAsync({ s: 'sum(price * qty)' });
+    let waited = 0;
+    while (!e.busy && waited++ < 1000) await new Promise((r) => setImmediate(r));
+    if (e.busy) break;
+    await pending;
+  }
   checks++;
   if (!e.busy) fail('async query never showed as busy');
   else {
@@ -109,7 +118,7 @@ for (const n of [500, 300_000]) {
   const g = await pending;
   // the refused sync call must not have disturbed the async query
   expectSame('async groupBy after refused sync call', (await g.toRowsAsync()).map((r) => [r.cust, r.s]), t.groupBy('cust').agg({ s: 'sum(price * qty)' }).toRows().map((r) => [r.cust, r.s]));
-  expectSame('sync works again afterwards', t.agg({ n: 'count()' }).n, 4_000_000);
+  expectSame('sync works again afterwards', t.agg({ n: 'count()' }).n, t.length);
 }
 
 // 5. errors reject the promise; the engine keeps working

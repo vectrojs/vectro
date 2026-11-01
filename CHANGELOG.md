@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.1
+
+A performance release. No API changes.
+
+**Faster group-by**
+- SQL `SUM` no longer computes a hidden count of non-missing values when the
+  column has none missing, and sum, mean, min and max skip the per-row
+  missing-value check on such columns.
+- On many threads, a group-by remembers its key range and merges the
+  threads' partial results with a WebAssembly kernel instead of a JavaScript
+  loop. This also removes the 31-thread limit for queries with many groups.
+- Measured on 2M orders (`SELECT product_id, sum(amount) ... GROUP BY 1`,
+  `compare/bench-2m-groupby.mjs`, numbers in `compare/results.json`): with
+  1,000 products, 3.0 ms on 1 thread (DuckDB 2.0: 6.8 ms) and 2.3 ms on 8
+  threads (DuckDB 2.0: 2.4 ms). Before this release Vectro was 1.9x slower
+  than DuckDB on 8 threads in this case; it is now level or faster at every
+  size from 100 to 100,000 products.
+
 ## 0.1.0 (first release)
 
 The first public release. Everything below is new.
