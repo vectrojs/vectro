@@ -1258,7 +1258,10 @@ function groupAccumulator(kind, B, engine, ds, derived) {
   Object.entries(B.spec).forEach(([out, ast], j) => {
     const p = `__vectro_p${j}`;
     if (ast.fn === 'countDistinct' || ast.fn === 'approxDistinct') {
-      distinct.push({ out, arg: ast.args[0], parts: [], rows: 0, last: 0, bitmap: bitmapPlan(ds, derived, keys, ast.args[0]) });
+      // (a category column: its missing values, '', are not counted)
+      const a0 = ast.args[0], blankable = a0.t === 'var' && !derived.has(a0.name) && ds.cols.get(a0.name)?.dict?.includes('');
+      const arg = blankable ? parse(`${a0.name} != '' ? ${a0.name} : 0 / 0`) : a0;
+      distinct.push({ out, arg, parts: [], rows: 0, last: 0, bitmap: bitmapPlan(ds, derived, keys, a0) });
       outs.push({ out, distinct: distinct.length - 1 });
       return;
     }
@@ -1364,7 +1367,7 @@ function groupAccumulator(kind, B, engine, ds, derived) {
       }
       if (kind === 'total') {
         const out = {};
-        const value = (c) => (c.bits ? countBits(c.bits, 0, c.range) : c);
+        const value = (c) => (c.bits ? countBits(c.bits, 0, c.range) - blankBit(c, 0) : c);
         for (const o of outs) out[o.out] = o.distinct !== undefined ? value(counts[o.distinct]) : o.mean ? totals[`${o.mean}s`] / totals[`${o.mean}n`] : totals[o.col];
         return out;
       }
@@ -1446,7 +1449,7 @@ function groupAccumulator(kind, B, engine, ds, derived) {
             for (let r = 0; r < G.n; r++) {
               let g = 0;
               for (let k = 0; k < keys.length; k++) g += (keyData[k][r] - bm.mins[k]) * bm.strides[k];
-              out[r] = countBits(bm.bits, g * bm.range, (g + 1) * bm.range);
+              out[r] = countBits(bm.bits, g * bm.range, (g + 1) * bm.range) - blankBit(bm, g);
             }
             cols.set(o.out, { data: engine.live(data), dict: null, codes: null });
           } else {
@@ -1474,7 +1477,8 @@ function bitmapPlan(ds, derived, keys, arg) {
   if (arg.t !== 'var') return null;
   const v = wholeRange(ds, derived, arg.name), g = v && denseKeys(ds, derived, keys);
   if (!g || g.groups * v[1] > MAX_BITS) return null;
-  return { code: parse(`(${g.src}) * ${v[1]} + ((${arg.name}) - (${v[0]}))`), range: v[1], mins: g.mins, strides: g.strides, bits: new Uint32Array(Math.ceil((g.groups * v[1]) / 32)) };
+  const blank = ds.cols.get(arg.name).dict?.indexOf('') ?? -1; // (the blank label's code: missing text)
+  return { code: parse(`(${g.src}) * ${v[1]} + ((${arg.name}) - (${v[0]}))`), range: v[1], blank, mins: g.mins, strides: g.strides, bits: new Uint32Array(Math.ceil((g.groups * v[1]) / 32)) };
 }
 
 // [min, size, missing] of a dataset column's values when they are whole
@@ -1599,6 +1603,13 @@ function setBits(bits, codes, n) {
     const c = codes[i];
     if (c === c) bits[c >>> 5] |= 1 << (c & 31); // (missing values: NaN, not counted)
   }
+}
+
+// 1 when group g of a bitmap saw the blank label (missing text: not counted), else 0
+function blankBit(bm, g) {
+  if (bm.blank < 0) return 0;
+  const i = g * bm.range + bm.blank;
+  return (bm.bits[i >>> 5] >>> (i & 31)) & 1;
 }
 
 function countBits(bits, from, to) {

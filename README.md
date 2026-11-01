@@ -67,7 +67,8 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
 - **Group by any keys:** `groupBy('region')`, `groupBy(['region', 'day'])`,
   `groupBy('account_id')`. Keys are category columns or any numbers (big IDs,
   amounts, negatives; NaN is its own group, -0 groups with 0). Groups come
-  back sorted by key. Small keys (a category, or whole numbers in a narrow
+  back sorted by key: numbers ascending (NaN last), text in the order its
+  labels first appeared (sort the result for A to Z). Small keys (a category, or whole numbers in a narrow
   range, alone or combined) are group numbers as they are. With many groups
   on a big table, every thread splits the rows into partitions by key range;
   each partition is added up in a small hash table of its own (in the CPU's
@@ -85,12 +86,18 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   | account + region (5.7M pairs) | 42 ms | 115 ms |
 
   Vectro's groups also come back sorted by key; DuckDB's come back unsorted.
-- **Missing values** are NaN and follow SQL's rules: `sum`, `mean`, `min`
-  and `max` skip them (`mean` divides by the values present; `min`/`max` of
-  nothing is NaN), `count(x)` counts the values present and `count(x > 5)`
-  the rows where the condition holds. `isMissing(x)` and
-  `coalesce(x, y, 0)` (first value present) work in any expression. CSV
-  blanks, JSON `null` and Arrow nulls load as missing.
+- **Missing values** are NaN for numbers and `''` for text. `sum`, `mean`,
+  `min` and `max` skip them (`mean` divides by the values present; `min`/`max`
+  of nothing is NaN, the `sum` of nothing in `agg` is 0), `count(x)` and
+  `countDistinct(x)` count the values present (blank text included as
+  missing) and `count(x > 5)` the rows where the condition holds.
+  `isMissing(x)` and `coalesce(x, y, 0)` (first value present) work in any
+  expression. CSV blanks, `null` in arrays, rows and JSON, and Arrow nulls
+  load as missing. In SQL, a comparison with a missing value is unknown, so
+  `NOT (x > 5)`, `x <> 5`, `x NOT IN (...)`, `NOT BETWEEN` and `NOT LIKE`
+  drop those rows, as in other databases; in table expressions comparisons
+  follow JavaScript (`x != 5` and `!(x > 5)` are true where x is missing), so
+  add `&& !isMissing(x)` where that matters.
 - **Dates and times:** a date column holds milliseconds since 1970 (UTC).
   Arrays of `Date` objects become date columns (or `table(cols, { dates:
   ['ts'] })` for ms or ISO text); CSV columns of ISO dates are found by
@@ -126,8 +133,8 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   place (views keep working) and checked value by value with the kernels' own
   arithmetic, so answers never change. The fused kernels read packed columns
   directly (SIMD widen, convert, scale), so do group-by kernels; sort, top and
-  join copy the codes, so results stay small; other operations decode what
-  they need. 10M orders (`npm run bench:pack`): 458 MB → 143 MB (3.2x smaller),
+  collect copy the codes, so results stay small; joins and other operations
+  decode what they need (a join's result is unpacked). 10M orders (`npm run bench:pack`): 458 MB → 143 MB (3.2x smaller),
   compressed in 0.34 s; queries run about as fast as on plain columns (a new
   column 4.0 → 3.0 ms, filtered revenue 2.4 → 2.9 ms, group by region 4.7 →
   4.4 ms, top 10 8.4 → 12.9 ms). The whole test suite also runs with every
@@ -258,9 +265,12 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   codes, so text filters run as fast as number filters.
 - **Zone maps:** each column keeps the min and max of every 16,384-row block
   (built on the first filter that uses it; streams keep them up to date as
-  batches arrive). A filter with `column < number` parts skips every block
-  that can't match, which pays off on time-ordered data such as logs, orders
-  and streams. Exact: only blocks that provably fail are skipped.
+  batches arrive). A filter with `column < number` parts narrows the rows it
+  reads to the run from the first block that can match to the last (on
+  tables of 65,536 rows or more, when that saves at least a tenth of them),
+  which pays off on time-ordered data such as logs, orders and streams;
+  datasets also skip whole chunks. Exact: only blocks that provably fail are
+  skipped.
 - **Sort and top-k:** `sort(by)` and `top(k, by)`, e.g. `top(10, '-revenue')`
   for the 10 largest. Keys are columns or expressions (`'-(price * qty)'`),
   several keys sort in order (`['region', '-price']`), text sorts by label,
@@ -420,7 +430,7 @@ curl 'http://127.0.0.1:8787/sql?q=SELECT region, COUNT(*) AS n FROM orders GROUP
   PostgreSQL connector (pages far into a table cost more).
 - **pandas / Polars**: `pd.read_csv(url)`, `pl.read_csv(url)`; Arrow is ten times faster to fetch: `pyarrow.ipc.open_stream(urlopen(url + '&format=arrow')).read_all()`.
 - **In your own app**: `import { serve } from 'vectrojs/serve'; await serve({ tables: { orders }, port: 8787 })`.
-- **Safety**: listens on 127.0.0.1 unless `--host` is given; `--token <secret>` requires `Authorization: Bearer <secret>` (or `&token=` for tools that can't send headers); SQL here only reads; files outside the folder are never read (links that lead out are skipped).
+- **Safety**: listens on 127.0.0.1 unless `--host` is given; `--token <secret>` requires `Authorization: Bearer <secret>` (or `&token=` for tools that can't send headers); SQL here only reads; files outside the folder are never read (symbolic links in the folder are skipped).
 
 On 10M orders: a group by region answers in 9 ms over HTTP; 1M rows export in 0.6 s as CSV (42 MB) or JSON, 0.07 s as Arrow (28 MB), and all 10M rows as Arrow in 0.45 s. Live connections (Power BI DirectQuery, Tableau, Metabase, Grafana) use the PostgreSQL protocol, below.
 

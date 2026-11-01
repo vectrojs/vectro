@@ -29,7 +29,7 @@ const log = (...a) => process.stderr.write(`[vectro-mcp] ${a.join(' ')}\n`);
 const TOOLS = [
   {
     name: 'load_file',
-    description: 'Load a CSV, TSV or JSON-lines file (one flat JSON object per line) from the data folder into a named table, or open a Vectro dataset (.vectro: a table on disk, any size; queries read it in chunks). Returns its columns, their kinds and a few sample rows. Text columns become categories (filterable, groupable).',
+    description: 'Load a CSV, TSV, JSON-lines (one flat JSON object per line) or Arrow file (.arrow, .feather, .ipc) from the data folder into a named table, or open a Vectro dataset (.vectro: a table on disk, any size; queries read it in chunks). Returns its columns, their kinds and a few sample rows. Text columns become categories (filterable, groupable).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -79,9 +79,9 @@ const TOOLS = [
     name: 'sql',
     description: [
       'Run one SQL SELECT over the loaded tables (by their names).',
-      'SELECT [DISTINCT] ... FROM t [JOIN u ON t.x = u.y | USING (x)] [LEFT JOIN ...] WHERE ... GROUP BY ... HAVING ... ORDER BY ... [ASC|DESC] LIMIT n [OFFSET m].',
+      'SELECT [DISTINCT] ... FROM t [[LEFT | RIGHT | FULL] JOIN u ON t.x = u.y | USING (x)] WHERE ... GROUP BY ... HAVING ... ORDER BY ... [ASC|DESC] LIMIT n [OFFSET m]; WITH (CTEs), subqueries (IN, EXISTS, correlated), UNION / INTERSECT / EXCEPT, window functions (ROW_NUMBER, RANK, SUM(...) OVER (...)), MEDIAN and PERCENTILE_CONT.',
       'Aggregates: COUNT(*), COUNT(x), COUNT(DISTINCT x), SUM, AVG, MIN, MAX, APPROX_COUNT_DISTINCT. Also BETWEEN, IN, LIKE, IS NULL, CASE WHEN, COALESCE, ROUND, LEAST, GREATEST, CAST, DATE \'2024-01-01\', INTERVAL \'7 days\', EXTRACT(YEAR FROM ts), DATE_TRUNC(\'month\', ts), YEAR(ts), MONTH(ts).',
-      'Text columns can be compared, matched (LIKE, IN) and grouped, not computed (no ||, UPPER...).',
+      'Text: compare, LIKE / ILIKE, IN, ||, UPPER, LOWER, TRIM, SUBSTRING, REPLACE, LENGTH, SPLIT_PART, STRFTIME and more. Missing values are NULL (missing text is \'\').',
       'At most 500 rows come back (add LIMIT); the answer says how many rows the query has.',
     ].join(' '),
     inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
@@ -246,7 +246,7 @@ async function handle(msg) {
         protocolVersion: PROTOCOLS.includes(asked) ? asked : PROTOCOLS[0],
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: 'vectro', title: 'Vectro analytics', version: VERSION },
-        instructions: `Load CSV or JSON-lines files from ${ROOT} with load_file, then answer questions with query (filter, group_by, aggregates, sort, limit). Use describe_table to see columns and common values first.`,
+        instructions: `Load CSV, JSON-lines, Arrow or .vectro files from ${ROOT} with load_file, then answer questions with sql (or query: filter, group_by, aggregates, sort, limit). Use describe_table to see columns and common values first.`,
       });
     }
     case 'notifications/initialized':

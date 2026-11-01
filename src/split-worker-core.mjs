@@ -184,7 +184,12 @@ export function serveSplitWorker(post, listen) {
       const g = t.groupBy([...keys, name]).agg({ __np_n: 'count()' });
       try {
         const colOf = (k) => { const c = g.cols.get(k), d = engine.live(c.data); return c.dict ? Array.from(d, (x) => c.dict[x]) : Float64Array.from(d); };
-        const keyCols = keys.map(colOf), values = colOf(name);
+        let keyCols = keys.map(colOf), values = colOf(name);
+        if (Array.isArray(values) && values.includes('')) { // (missing text: not a value to count)
+          const keep = values.map((x) => x !== '');
+          keyCols = keyCols.map((c) => c.filter((_, r) => keep[r]));
+          values = values.filter((_, r) => keep[r]);
+        }
         if (!sketch) return { keyCols, values };
         const index = new Map(), groupCols = keys.map(() => []), regs = [];
         for (let r = 0; r < values.length; r++) {

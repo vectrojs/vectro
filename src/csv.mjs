@@ -12,7 +12,7 @@
 import { Table } from './table.mjs';
 import { OP } from './kernels.mjs';
 import { parseNumber, STR_SHIFT, STR_ESCAPED } from './csv-kernel.mjs';
-import { parseDateBytes, looksLikeDate } from './dates.mjs';
+import { parseDateBytes, looksLikeDate, f32Dates } from './dates.mjs';
 import { decode, encode, indexOfByte } from './bytes.mjs';
 
 const KIND = { number: 0, category: 1, string: 2, date: 2 }; // dates are read as text, then parsed (see below)
@@ -68,6 +68,7 @@ function* loadBytesG(engine, bytes, { delimiter = ',', header = true, types = {}
     names.forEach((nm, f) => {
       if (want && !want.has(nm)) { fieldMap[f] = -1; return; }
       fieldMap[f] = out.length;
+      if (info.kinds[f] === 'date' && type === Float32Array) throw new Error(f32Dates(nm));
       out.push({ name: nm, kind: KIND[info.kinds[f]], date: info.kinds[f] === 'date' });
     });
 

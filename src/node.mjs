@@ -41,7 +41,8 @@ export class Engine extends CoreEngine {
         if (got === 0) throw new Error(`vectro: ${path} ended early`);
         off += got;
       }
-      return loadBytes(this, bytes, opts);
+      const t = loadBytes(this, bytes, opts);
+      return opts.compress ? t.compress() : t;
     } finally {
       closeSync(fd);
     }
@@ -59,7 +60,8 @@ export class Engine extends CoreEngine {
         if (bytesRead === 0) throw new Error(`vectro: ${path} ended early`);
         off += bytesRead;
       }
-      return await loadBytesAsync(this, bytes, opts);
+      const t = await loadBytesAsync(this, bytes, opts);
+      return opts.compress ? await t.compressAsync() : t;
     } finally {
       await file.close();
     }

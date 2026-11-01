@@ -133,3 +133,7 @@ export const DATE_FNS = {
 };
 // functions whose result is itself a date
 export const DATE_RESULT = new Set(['dayStart', 'hourStart', 'weekStart', 'monthStart', 'yearStart', 'date']);
+
+// Times in milliseconds need about 41 bits; float32 keeps 24, so a date column
+// in a Float32Array table would be off by seconds to minutes: refused.
+export const f32Dates = (name) => `vectro: "${name}" is a date column, and a Float32Array table can't hold times exactly (they'd be off by seconds); use the default Float64Array, or store the dates as numbers you choose (days since a start, say)`;

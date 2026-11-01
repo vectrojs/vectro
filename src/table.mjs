@@ -21,7 +21,7 @@ import { copyRows } from './rows.mjs';
 import { textmapRows } from './textmap.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
-import { DATE_FNS, DATE_RESULT, parseDateText, toMillis } from './dates.mjs';
+import { DATE_FNS, DATE_RESULT, parseDateText, toMillis, f32Dates } from './dates.mjs';
 import { chooseEncoding, encodingCandidates, packInto, decodeOne, KINDS } from './pack.mjs';
 
 const IDENT = /^[A-Za-z_]\w*$/;
@@ -75,7 +75,10 @@ export class Table {
   // objects are dates anyway).
   static fromColumns(engine, columns, { type = Float64Array, dates = [], compress = false } = {}) {
     for (const [name, values] of Object.entries(columns)) {
-      if (dates.includes(name) || isDates(values)) columns = { ...columns, [name]: { dates: Float64Array.from(values, toMillis) } };
+      if (dates.includes(name) || isDates(values)) {
+        if (type === Float32Array) throw new Error(f32Dates(name));
+        columns = { ...columns, [name]: { dates: Float64Array.from(values, toMillis) } };
+      }
     }
     const entries = Object.entries(columns);
     if (!entries.length) throw new TypeError('vectro: a table needs at least one column');
@@ -110,8 +113,10 @@ export class Table {
         }
         cols.set(name, { data, dict, codes });
       } else {
-        for (let i = 0; i < n; i++) data[i] = rows[i][name];
-        cols.set(name, { data, dict: null, codes: null });
+        const date = rows[0][name] instanceof Date;
+        if (date && type === Float32Array) throw new Error(f32Dates(name));
+        for (let i = 0; i < n; i++) { const v = rows[i][name]; data[i] = v === null || v === undefined ? NaN : date ? toMillis(v) : v; } // (null: missing)
+        cols.set(name, { data, dict: null, codes: null, ...(date ? { date: true } : {}) });
       }
     }
     return new Table(engine, cols, n, { owned: [...cols.keys()] });
@@ -289,6 +294,9 @@ export class Table {
   }
 
   #mergeParams(params) {
+    for (const [k, v] of Object.entries(params)) {
+      if (typeof v !== 'number' && !(v instanceof Date)) throw new TypeError(`vectro: param "${k}" must be a number or a Date, got ${typeof v === 'string' ? `text "${v}"` : typeof v} (text goes in the expression in quotes, e.g. region == 'EU')`);
+    }
     params = Object.fromEntries(Object.entries(params).map(([k, v]) => [k, v instanceof Date ? v.getTime() : v])); // dates as ms
     for (const k of Object.keys(params)) {
       if (this.cols.has(k)) throw new Error(`vectro: param "${k}" has the same name as a column`);
@@ -405,6 +413,10 @@ export class Table {
       throw new SyntaxError(`vectro: an aggregation must look like sum(expr), mean(expr), min(expr), max(expr), count([expr]) or countDistinct(expr), got "${src}"`);
     }
     if (!ast.args.length) return { fn: ast.fn, arg: null };
+    // a category column: its missing values are '' (count / countDistinct skip them, as SQL skips NULL)
+    const a0 = ast.args[0], text = a0.t === 'var' && this.cols.get(a0.name)?.dict;
+    if (text && ast.fn === 'count') return missingRules('count', this.#bind(`${a0.name} != ''`, params).src);
+    if (text && DISTINCT.has(ast.fn)) return { fn: ast.fn, arg: this.#bind(`${a0.name} != '' ? ${a0.name} : 0 / 0`, params).src };
     if (!DISTINCT.has(ast.fn)) return missingRules(ast.fn, this.#bind(toSource(ast.args[0]), params).src);
     if (DISTINCT.has(ast.fn) && ast.args[0].t === 'var' && this.cols.get(ast.args[0].name)?.strings) {
       throw new Error(`vectro: ${ast.fn} can't count a free-text column ("${ast.args[0].name}"); load it as a category`);
@@ -1842,7 +1854,8 @@ const isText = (values) => !ArrayBuffer.isView(values) && values.length > 0 && t
 
 function copyNumbers(engine, type, values) {
   const data = engine.alloc(type, values.length);
-  data.set(values);
+  if (Array.isArray(values)) for (let i = 0; i < values.length; i++) { const v = values[i]; data[i] = v === null || v === undefined ? NaN : v; } // (null: missing, as in JSON)
+  else data.set(values);
   return data;
 }
 

@@ -40,6 +40,20 @@ The first public release. Everything below is new.
 - `connectors/dist/Vectro.mez` for Power BI and `vectro.taco` for Tableau.
   Not signed, not yet tried in the applications.
 
+**Missing values**
+- SQL uses three-valued logic for missing values: `NOT (x > 5)`, `x <> 5`,
+  `NOT IN`, `NOT BETWEEN`, `NOT LIKE` and `LIKE` drop rows where the value
+  is missing, as other databases do. Table expressions keep JavaScript's rules
+  (`x != 5` is true where x is missing).
+- Blank text (`''`, the missing value of a text column) is not counted by
+  `count(x)`, `countDistinct(x)`, `approxDistinct(x)` or SQL's `COUNT`, on
+  tables, datasets and split tables.
+- `null` in arrays and rows loads as missing (it used to load as 0); a `Date`
+  in `tableFromRows` makes a date column.
+- Clear errors for a text param, for date columns in a `Float32Array` table
+  (times don't fit in float32) and for SQL on a split table.
+- `readCSV(path, { compress: true })` packs the columns, as `parseCSV` does.
+
 **Testing**
 - `VECTRO_POISON=1` overwrites memory as it is freed, so code that reads an
   array after freeing it gives wrong answers in tests (part of `test:all`).

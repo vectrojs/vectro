@@ -555,6 +555,10 @@ function columnType(t, name) {
 // A relation: { query, names, kinds (name -> 'text' | 'date' | 'number') }.
 const kindOfTable = (t, col) => { const c = t.cols?.get(col); return c?.dict || c?.strings ? 'text' : c?.date ? 'date' : 'number'; };
 function tableRelation(t) {
+  if (typeof t?.lazy !== 'function') { // (a split table, or something that isn't a table)
+    const what = t?.constructor?.name === 'SplitTable' || t?.constructor?.name === 'StreamTable' ? `a ${t.constructor.name}: SQL runs on Table and Dataset, not on split tables (use its own methods, filter / groupBy / aggAsync, or copy its rows into a Table: splitEngine.local.table(await t.toColumnsAsync()))` : 'not a Vectro Table or Dataset';
+    throw new TypeError(`vectro: sql() got ${what}`);
+  }
   return { query: t.lazy(), names: t.columnNames, kinds: new Map(t.columnNames.map((n) => [n, kindOfTable(t, n)])), typeOf: (n) => columnType(t, n) };
 }
 
@@ -1092,6 +1096,36 @@ function compileSelect(ast, env, outer, tail) {
       return test(x < y ? -1 : x > y ? 1 : 0) ? 1 : 0;
     }, { text: false, label: op });
   }
+  // true where a value is there (SQL's NULL is NaN for numbers, '' for text); null: always there (a literal)
+  function present(e, ctx) {
+    if (e.k === 'num' || e.k === 'str' || e.k === 'date' || e.k === 'interval') return num(1);
+    const x = translate(e, ctx);
+    return kindOf(e, ctx) === 'text' ? bin('!=', x, { t: 'str', v: '' }) : bin('==', x, x);
+  }
+  // NOT x with SQL's three values: where x is unknown (a missing value), so is NOT x, and the
+  // row is dropped. Comparisons become their opposites (false on missing values already).
+  const FLIP = { '=': '<>', '<>': '=', '!=': '=', '<': '>=', '<=': '>', '>': '<=', '>=': '<' };
+  function negated(x, ctx) {
+    const T = (y) => translate(y, ctx);
+    switch (x.k) {
+      case 'not': return T(x.x);
+      case 'bin':
+        if (x.op === 'AND') return bin('||', negated(x.l, ctx), negated(x.r, ctx));
+        if (x.op === 'OR') return bin('&&', negated(x.l, ctx), negated(x.r, ctx));
+        if (FLIP[x.op]) return T({ ...x, op: FLIP[x.op] });
+        return { t: 'un', op: '!', x: T(x) }; // (IS, regular expressions: true or false, never unknown)
+      case 'between': return T({ k: 'bin', op: 'OR', l: { k: 'bin', op: '<', l: x.x, r: x.lo }, r: { k: 'bin', op: '>', l: x.x, r: x.hi } });
+      case 'in':
+        if (kindOf(x.x, ctx) === 'text') return bin('&&', { t: 'un', op: '!', x: T(x) }, present(x.x, ctx));
+        return x.list.map((i) => T({ k: 'bin', op: '<>', l: x.x, r: i })).reduce((a, b) => bin('&&', a, b));
+      case 'like': case 'insub': return bin('&&', { t: 'un', op: '!', x: T(x) }, present(x.x, ctx));
+      case 'exists': case 'isnull': return { t: 'un', op: '!', x: T(x) };
+      default: { // a true / false value (1 / 0): NOT of a missing one stays missing
+        const v = T(x);
+        return bin('==', v, num(0));
+      }
+    }
+  }
   function translate(e, ctx) {
     const T = (x) => translate(x, ctx);
     switch (e.k) {
@@ -1108,7 +1142,7 @@ function compileSelect(ast, env, outer, tail) {
       case 'col': { const sv = sessionRef(e); return sv ? constValue(sv, ctx) : ctx.col(e); }
       case 'star': fail('* only works as a whole SELECT item (or COUNT(*))');
       case 'neg': return { t: 'un', op: '-', x: T(e.x) };
-      case 'not': return { t: 'un', op: '!', x: T(e.x) };
+      case 'not': return negated(e.x, ctx);
       case 'exists': case 'insub': case 'subq': return subqueryValue(e, ctx);
       case 'window': return ctx.window(e);
       case 'bin': {
@@ -1130,10 +1164,14 @@ function compileSelect(ast, env, outer, tail) {
             if ((lk === 'date' && e.r.k === 'str') || (rk === 'date' && e.l.k === 'str')) // a date written as text
               return bin(op, e.l.k === 'str' ? T({ k: 'date', v: e.l.v }) : T(e.l), e.r.k === 'str' ? T({ k: 'date', v: e.r.v }) : T(e.r));
             const lit = e.l.k === 'str' ? e.r : e.r.k === 'str' ? e.l : null;
-            if ((op === '==' || op === '!=') && lit && lit.k !== 'str' && kindOf(lit, ctx) === 'text') return bin(op, T(e.l), T(e.r)); // (a column and a label: by code)
+            if ((op === '==' || op === '!=') && lit && lit.k !== 'str' && kindOf(lit, ctx) === 'text') { // (a column and a label: by code)
+              const c = bin(op, T(e.l), T(e.r));
+              return op === '!=' ? bin('&&', c, present(lit, ctx)) : c;
+            }
             return bin('==', compareValues(op, e, ctx), num(1));
           }
         }
+        if (op === '!=') return bin('&&', bin('!=', T(e.l), T(e.r)), bin('&&', present(e.l, ctx), present(e.r, ctx))); // (missing on either side: unknown, so not kept)
         if (op === '%') { // SQL: the sign of the dividend (truncate the quotient toward 0)
           const a = T(e.l), b = T(e.r), qt = bin('/', a, b);
           return bin('-', a, bin('*', cond(bin('>=', qt, num(0)), call('floor', qt), call('ceil', qt)), b));
@@ -1156,9 +1194,10 @@ function compileSelect(ast, env, outer, tail) {
       case 'like': {
         if (e.pattern.k !== 'str') fail(`${e.ci ? 'ILIKE' : 'LIKE'} needs a pattern in quotes`);
         if (kindOf(e.x, ctx) !== 'text') fail(`${e.ci ? 'ILIKE' : 'LIKE'} works on text`);
-        if (e.ci && e.x.k === 'col') return call('ilike', T(e.x), { t: 'str', v: e.pattern.v }); // (a column: label by label)
-        if (e.ci) return T({ k: 'like', x: { k: 'call', fn: 'LOWER', args: [e.x] }, pattern: { k: 'str', v: e.pattern.v.toLowerCase() } });
-        return call('like', T(e.x), { t: 'str', v: e.pattern.v });
+        const there = present(e.x, ctx); // (missing text matches no pattern: unknown)
+        if (e.ci && e.x.k === 'col') return bin('&&', call('ilike', T(e.x), { t: 'str', v: e.pattern.v }), there); // (a column: label by label)
+        if (e.ci) return bin('&&', T({ k: 'like', x: { k: 'call', fn: 'LOWER', args: [e.x] }, pattern: { k: 'str', v: e.pattern.v.toLowerCase() } }), there);
+        return bin('&&', call('like', T(e.x), { t: 'str', v: e.pattern.v }), there);
       }
       case 'isnull': return kindOf(e.x, ctx) === 'text' ? bin('==', T(e.x), { t: 'str', v: '' }) : call('isMissing', T(e.x));
       case 'case': {
