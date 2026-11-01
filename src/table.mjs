@@ -31,7 +31,10 @@ const IDENTITY = { sum: 0, count: 0, mean: 0, min: Infinity, max: -Infinity };
 const MAX_GROUP_SLOTS = 2 ** 28; // threads * aggregations * groups (2GB of float64)
 const PARALLEL_SORT_ROWS = 50_000; // smaller tables sort on the calling thread
 const TIME_STEPS = [86_400_000, 3_600_000, 60_000, 1_000]; // a day, an hour, a minute, a second (ms): see #directGroups
-const MISSING = new WeakMap(); // a column's array -> how many missing values it holds (arrays are never written once in a table)
+// Column facts worked out once and remembered with the column's array
+// (arrays are never written once in a table):
+const MISSING = new WeakMap(); // { n: rows, missing: how many missing values }
+const KEY_RANGE = new WeakMap(); // { n: rows, range: [min, max, how many aren't whole] } (see #directGroups)
 
 export class Table {
   // cols: Map name -> { data, dict, codes, strings }
@@ -584,13 +587,12 @@ export class Table {
   *#noMissingG(src) {
     const c = src && IDENT.test(src) ? this.cols.get(src) : null;
     if (!c || c.dict || c.strings) return false;
-    let m = MISSING.get(c.data);
-    if (m === undefined) {
+    let known = MISSING.get(c.data);
+    if (known?.n !== this.n) {
       const k = c.enc ? { data: c.data, enc: c.enc, n: this.n, type: this.type === Float32Array ? 'f32' : 'f64' } : c.data;
-      [m] = yield* this.engine.evalG(['count(k != k)'], { k });
-      MISSING.set(c.data, m);
+      MISSING.set(c.data, (known = { n: this.n, missing: (yield* this.engine.evalG(['count(k != k)'], { k }))[0] }));
     }
-    return m === 0;
+    return known.missing === 0;
   }
 
   // Keys small enough to be group numbers as they are: a text column's codes
@@ -605,7 +607,9 @@ export class Table {
       if (!this.n) { sizes.push(0); offsets.push(0); steps.push(1); continue; }
       // whole numbers in a range under 2^24 (from their minimum: 202301..202412, IDs from 1e9, negatives)
       const k = c.enc ? { data: c.data, enc: c.enc, n: this.n, type: this.type === Float32Array ? 'f32' : 'f64' } : c.data;
-      const [lo, hi, frac] = yield* engine.evalG(['min(k)', 'max(k)', 'count(k != floor(k))'], { k });
+      let known = KEY_RANGE.get(c.data);
+      if (known?.n !== this.n) KEY_RANGE.set(c.data, (known = { n: this.n, range: yield* engine.evalG(['min(k)', 'max(k)', 'count(k != floor(k))'], { k }) }));
+      const [lo, hi, frac] = known.range;
       if (frac > 0 || !Number.isFinite(lo) || !Number.isFinite(hi)) return null;
       // or times a whole number of days (hours, minutes, seconds) apart: numbered by that unit
       let step = 1;
@@ -993,29 +997,34 @@ export class Table {
         interpretGroup(engine, t, analysis.items, predAst, cols, merged, groups.data, acc, K, this.n);
       }
 
-      // Combine threads (and copies) into one value per group and aggregation.
+      // Combine threads (and copies) into one value per group and aggregation:
+      // the thread blocks by fused passes added into thread 0's, 15 blocks a
+      // pass (kernels, so fast from the first query; small ones run on this
+      // thread), then the C copies of each group by a plain loop.
       totals = [];
       for (const [j, it] of analysis.items.entries()) {
-        const op = it.reduce === 'min' ? Math.min : it.reduce === 'max' ? Math.max : (a, b) => a + b;
-        if (C > 1 || T === 1 || !engine.jit) { // a plain loop is enough
-          const a = engine.live(acc);
-          const out = new Float64Array(K).fill(IDENTITY[it.reduce]);
-          for (let s = 0; s < T; s++) {
-            const [lo] = slots(s, j);
-            for (let g = 0; g < K; g++) for (let c = 0; c < C; c++) out[g] = op(out[g], a[lo + g * C + c]);
+        let from = T;
+        if (T > 1 && engine.jit) {
+          for (let s0 = 1; s0 < T; s0 += 15) {
+            const vars = { t0: acc.subarray(...slots(0, j)) };
+            for (let s = s0; s < Math.min(T, s0 + 15); s++) vars[`t${s}`] = acc.subarray(...slots(s, j));
+            const vnames = Object.keys(vars);
+            const expr = it.reduce === 'min' || it.reduce === 'max'
+              ? vnames.slice(1).reduce((e, nm) => `${it.reduce}(${e}, ${nm})`, vnames[0])
+              : vnames.join(' + ');
+            yield* engine.evalG(expr, vars, vars.t0);
           }
-          totals.push(out);
-          continue;
+          from = 1;
         }
-        // many groups: one fused pass over all thread blocks, written into thread 0's
-        const vars = {};
-        for (let s = 0; s < T; s++) vars[`t${s}`] = acc.subarray(...slots(s, j));
-        const vnames = Object.keys(vars);
-        const expr = it.reduce === 'min' || it.reduce === 'max'
-          ? vnames.slice(1).reduce((e, nm) => `${it.reduce}(${e}, ${nm})`, vnames[0])
-          : vnames.join(' + ');
-        yield* engine.evalG(expr, vars, vars.t0);
-        totals.push(Float64Array.from(engine.live(vars.t0)));
+        const a = engine.live(acc);
+        if (C === 1 && from === 1) { const [lo, hi] = slots(0, j); totals.push(a.slice(lo, hi)); continue; }
+        const op = it.reduce === 'min' ? Math.min : it.reduce === 'max' ? Math.max : (x, y) => x + y;
+        const out = new Float64Array(K).fill(IDENTITY[it.reduce]);
+        for (let s = 0; s < from; s++) {
+          const [lo] = slots(s, j);
+          for (let g = 0; g < K; g++) for (let c = 0; c < C; c++) out[g] = op(out[g], a[lo + g * C + c]);
+        }
+        totals.push(out);
       }
       engine.free(acc);
     }
