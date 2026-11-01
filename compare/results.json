@@ -1,0 +1,397 @@
+{
+ "machine": "Apple M1 Pro, 8 cores, 16 GB, Node 25",
+ "conditions": "Shared laptop: load 3–8 during the in-memory runs, up to 15 during the billion-row run. Ratios move by up to about ±30% between runs.",
+ "date": "2026-11-01",
+ "vectroCommit": "b2a3033",
+ "duckdb": "DuckDB 2.0 (@duckdb/node-api 2.0.0-r.1)",
+ "main": {
+  "title": "10M orders in memory: Vectro, DuckDB, SQLite, Arquero",
+  "script": "compare/bench.mjs (SQLite: compare/bench-sqlite.mjs, separate run, best of 3)",
+  "note": "best of 5; Arquero single-threaded; SQLite in memory with an index on region",
+  "rows": [
+   {
+    "query": "filtered revenue (price>100 && qty<5)",
+    "vectro": 3.2,
+    "duckdb": 10.1,
+    "arquero": 74.4,
+    "sqlite": 772.4
+   },
+   {
+    "query": "dashboard: 4 aggregates for one region",
+    "vectro": 4.1,
+    "duckdb": 23.9,
+    "arquero": 170.9,
+    "sqlite": 359.3
+   },
+   {
+    "query": "group by region (8 groups)",
+    "vectro": 6.5,
+    "duckdb": 39.7,
+    "arquero": 1000.0,
+    "sqlite": 2590.0
+   },
+   {
+    "query": "group by customer (100K groups)",
+    "vectro": 8.1,
+    "duckdb": 13.2,
+    "arquero": 772.4,
+    "sqlite": 3900.0
+   },
+   {
+    "query": "filter into a new table",
+    "vectro": 6.4,
+    "duckdb": 55.7,
+    "arquero": 123.7,
+    "sqlite": 540.2
+   },
+   {
+    "query": "new column price*qty*(1-discount)",
+    "vectro": 3.7,
+    "duckdb": 32.3,
+    "arquero": 124.9,
+    "sqlite": 1500.0
+   }
+  ],
+  "sqliteRunVectro": "3.0-9.2 ms",
+  "load": {
+   "vectroFromArrays": 244.7,
+   "duckdbReadCsv": 442.6,
+   "sqliteInsertsAndIndex": 10320,
+   "sqliteToVectro": 5970
+  }
+ },
+ "sql": {
+  "title": "The same SQL on 10M orders + 100K customers",
+  "script": "compare/bench-sql.mjs",
+  "note": "best of 5, answers checked",
+  "rows": [
+   {
+    "query": "totals with a filter",
+    "vectro": 4.3,
+    "duckdb": 10.1
+   },
+   {
+    "query": "group by region",
+    "vectro": 7.4,
+    "duckdb": 36.8
+   },
+   {
+    "query": "join + filter + group",
+    "vectro": 19.8,
+    "duckdb": 32.8
+   },
+   {
+    "query": "top 10 customers",
+    "vectro": 13.1,
+    "duckdb": 50.3
+   },
+   {
+    "query": "distinct customers per month",
+    "vectro": 34.2,
+    "duckdb": 82.5
+   },
+   {
+    "query": "top 20 rows by price",
+    "vectro": 9.1,
+    "duckdb": 25.3
+   },
+   {
+    "query": "CASE inside SUM",
+    "vectro": 6.6,
+    "duckdb": 39.6
+   },
+   {
+    "query": "IN (subquery)",
+    "vectro": 23.4,
+    "duckdb": 29.7
+   },
+   {
+    "query": "correlated subquery",
+    "vectro": 16.8,
+    "duckdb": 61.4
+   },
+   {
+    "query": "top 3 per region (RANK)",
+    "vectro": 38.2,
+    "duckdb": 139.3
+   },
+   {
+    "query": "ROW_NUMBER over all rows",
+    "vectro": 128.5,
+    "duckdb": 220.5
+   },
+   {
+    "query": "running total by day",
+    "vectro": 9.8,
+    "duckdb": 17.3
+   },
+   {
+    "query": "median per region",
+    "vectro": 39.1,
+    "duckdb": 83.9
+   },
+   {
+    "query": "UPPER + group",
+    "vectro": 31.4,
+    "duckdb": 46.5
+   },
+   {
+    "query": "|| key + group",
+    "vectro": 84.7,
+    "duckdb": 106.1
+   },
+   {
+    "query": "CASE text + group",
+    "vectro": 6.2,
+    "duckdb": 24.5
+   },
+   {
+    "query": "STRFTIME month + group",
+    "vectro": 50.9,
+    "duckdb": 70.4
+   },
+   {
+    "query": "ILIKE filter",
+    "vectro": 30.0,
+    "duckdb": 54.2
+   },
+   {
+    "query": "RIGHT JOIN + group",
+    "vectro": 29.7,
+    "duckdb": 63.5
+   },
+   {
+    "query": "FULL JOIN + count",
+    "vectro": 19.3,
+    "duckdb": 29.3
+   }
+  ]
+ },
+ "groupby": {
+  "title": "Group-by on 10M rows",
+  "script": "compare/bench-groupby.mjs",
+  "note": "count(*) and sum(price * qty) per group, best of 5",
+  "rows": [
+   {
+    "query": "account (1M big IDs)",
+    "vectro": 36.0,
+    "duckdb": 88.0
+   },
+   {
+    "query": "region + day (2,920 pairs)",
+    "vectro": 6.0,
+    "duckdb": 39.0
+   },
+   {
+    "query": "account + region (~5M pairs)",
+    "vectro": 50.0,
+    "duckdb": 139.0
+   },
+   {
+    "query": "price (~100K amounts)",
+    "vectro": 27.0,
+    "duckdb": 49.0
+   }
+  ]
+ },
+ "join": {
+  "title": "Joins on 10M orders",
+  "script": "compare/bench-join.mjs",
+  "note": "joined table built in full, then counted and summed, best of 5",
+  "rows": [
+   {
+    "query": "orders x 100K customers",
+    "vectro": 77.0,
+    "duckdb": 210.0
+   },
+   {
+    "query": "orders x 1M accounts",
+    "vectro": 151.0,
+    "duckdb": 251.0
+   },
+   {
+    "query": "left join, half match",
+    "vectro": 82.0,
+    "duckdb": 206.0
+   },
+   {
+    "query": "two keys: region + day",
+    "vectro": 61.0,
+    "duckdb": 189.0
+   }
+  ]
+ },
+ "distinct": {
+  "title": "Distinct counts on 10M rows",
+  "script": "compare/bench-distinct.mjs",
+  "note": "exact; best of 5",
+  "rows": [
+   {
+    "query": "distinct accounts (1M)",
+    "vectro": 11.0,
+    "duckdb": 51.0
+   },
+   {
+    "query": "distinct days (365)",
+    "vectro": 5.0,
+    "duckdb": 5.0
+   },
+   {
+    "query": "distinct accounts per region",
+    "vectro": 35.0,
+    "duckdb": 103.0
+   },
+   {
+    "query": "distinct regions per day",
+    "vectro": 9.0,
+    "duckdb": 36.0
+   }
+  ]
+ },
+ "dataset100m": {
+  "title": "100M rows on disk",
+  "script": "compare/bench-dataset.mjs",
+  "note": "best of 3, each system in its own process",
+  "rows": [
+   {
+    "query": "scan everything",
+    "vectro": 70.0,
+    "duckdb": 73.0
+   },
+   {
+    "query": "filter: EU, qty >= 5",
+    "vectro": 100.0,
+    "duckdb": 87.0
+   },
+   {
+    "query": "the last day (time range)",
+    "vectro": 3.0,
+    "duckdb": 1.0
+   },
+   {
+    "query": "group by region",
+    "vectro": 142.0,
+    "duckdb": 149.0
+   },
+   {
+    "query": "top 10 of 1M customers",
+    "vectro": 529.0,
+    "duckdb": 637.0
+   },
+   {
+    "query": "top 10 rows by price",
+    "vectro": 15.0,
+    "duckdb": 100.0
+   },
+   {
+    "query": "join 1M customers",
+    "vectro": 126.0,
+    "duckdb": 85.0
+   },
+   {
+    "query": "distinct customers per region",
+    "vectro": 268.0,
+    "duckdb": 650.0
+   }
+  ],
+  "file": {
+   "vectro": "0.5 GB",
+   "duckdb": "0.5 GB"
+  },
+  "rss": {
+   "vectro": "344 MB",
+   "duckdb": "2.9 GB"
+  }
+ },
+ "dataset1b": {
+  "title": "1 billion rows on disk",
+  "script": "compare/bench-dataset.mjs",
+  "note": "best of 3, each system in its own process",
+  "rows": [
+   {
+    "query": "scan everything",
+    "vectro": 478.0,
+    "duckdb": 662.0
+   },
+   {
+    "query": "filter: EU, qty >= 5",
+    "vectro": 691.0,
+    "duckdb": 729.0
+   },
+   {
+    "query": "the last day (time range)",
+    "vectro": 3.0,
+    "duckdb": 4.0
+   },
+   {
+    "query": "group by region",
+    "vectro": 1053.0,
+    "duckdb": 1249.0
+   },
+   {
+    "query": "top 10 of 1M customers",
+    "vectro": 4391.0,
+    "duckdb": 4500.0
+   },
+   {
+    "query": "top 10 rows by price",
+    "vectro": 11.0,
+    "duckdb": 843.0
+   },
+   {
+    "query": "join 1M customers",
+    "vectro": 880.0,
+    "duckdb": 627.0
+   },
+   {
+    "query": "distinct customers per region",
+    "vectro": 2427.0,
+    "duckdb": 6843.0
+   }
+  ],
+  "file": {
+   "vectro": "5.1 GB",
+   "duckdb": "5.4 GB"
+  },
+  "rss": {
+   "vectro": "0.37 GB",
+   "duckdb": "6.9 GB"
+  },
+  "engineMemory": "163 MB",
+  "plainInMemory": "37.3 GB"
+ },
+ "plainJs": {
+  "title": "Vectro against plain JavaScript, 10M rows",
+  "script": "bench/bench-sort.mjs, bench/bench-vectors.mjs, bench/bench-stream.mjs",
+  "rows": [
+   {
+    "query": "top 10 by -price",
+    "vectro": 9.2,
+    "js": 22.2,
+    "note": "JS: one pass keeping the top 10"
+   },
+   {
+    "query": "sort all rows by -price",
+    "vectro": 116.9,
+    "js": 4146.7,
+    "note": "JS: comparator sort of row indices; Float64Array.sort of values alone 626 ms"
+   },
+   {
+    "query": "vector search, 100K x 384",
+    "vectro": 9.3,
+    "js": 36.6
+   },
+   {
+    "query": "vector search, 200K x 384",
+    "vectro": 13.6,
+    "js": 72.6
+   }
+  ],
+  "streams": {
+   "note": "CSV over TCP, rows per second",
+   "plainNode": 3260000.0,
+   "vectroOneConnection": 16910000.0,
+   "vectroConnectionPerWorker": 15110000.0
+  }
+ }
+}
