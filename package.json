@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "author": "Hamza Masood",
-  "homepage": "https://github.com/vectrojs/vectro#readme",
+  "homepage": "https://vectrojs.dev",
   "bugs": {
     "url": "https://github.com/vectrojs/vectro/issues",
     "email": "support@vectrojs.dev"
@@ -16,6 +16,10 @@
   },
   "keywords": [
     "analytics",
+    "query-engine",
+    "embedded-database",
+    "javascript",
+    "nodejs",
     "sql",
     "dataframe",
     "columnar",

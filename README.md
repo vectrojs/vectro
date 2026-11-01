@@ -7,6 +7,8 @@ Cloudflare Workers, with no native addon, compiler or server.
 
 > Version 0.1.0, the first release. Node 20+ and modern browsers. MIT license.
 
+**Website and docs: [vectrojs.dev](https://vectrojs.dev)**. [Quick start](https://vectrojs.dev/docs/quick-start) · [API reference](https://vectrojs.dev/api) · [Race it in your browser](https://vectrojs.dev/live) · [Benchmarks](https://vectrojs.dev/benchmarks)
+
 ```js
 import { Engine } from 'vectrojs';
 
