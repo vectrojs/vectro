@@ -111,6 +111,87 @@ const there = (v) => v === v && v !== '';
   await e.close();
 }
 
+// 0.1.2: the cases a comparison with DuckDB found (answers as DuckDB gives them; missing text reads '')
+{
+  const e = new Engine();
+  const q = (text, tables) => sql(text, tables).toRows();
+  // missing text sorts last, up or down; NULLS FIRST puts it first
+  const s = e.table({ s: ['b', '', 'a'], n: [1, 2, 3] });
+  same(s.sort('s').toRows().map((r) => r.n), [3, 1, 2], 'sort: missing text last');
+  same(s.sort('-s').toRows().map((r) => r.n), [1, 3, 2], 'sort descending: missing text last');
+  same(q('SELECT s FROM s ORDER BY s', { s }), [{ s: 'a' }, { s: 'b' }, { s: '' }], 'ORDER BY text: missing last');
+  same(q('SELECT s FROM s ORDER BY s DESC NULLS FIRST', { s }), [{ s: '' }, { s: 'b' }, { s: 'a' }], 'ORDER BY text DESC NULLS FIRST');
+  same(q('SELECT s FROM s ORDER BY s NULLS FIRST', { s }), [{ s: '' }, { s: 'a' }, { s: 'b' }], 'ORDER BY text NULLS FIRST');
+  same(q('SELECT s, COUNT(*) AS n FROM s GROUP BY s ORDER BY s LIMIT 1', { s }), [{ s: 'a', n: 1 }], 'GROUP BY text ORDER BY LIMIT: missing group last');
+  // null / undefined in a text column load as missing text, also when the column starts with one
+  const nt = e.table({ s: ['a', null, 'b', undefined], s2: [null, 'x', 'x', 'y'], v: [1, 2, 3, 4] });
+  same(q('SELECT COUNT(s) AS c, COUNT(DISTINCT s) AS d, COUNT(s2) AS c2 FROM nt', { nt }), [{ c: 2, d: 2, c2: 3 }], 'null in text columns: missing');
+  same(q('SELECT COUNT(*) AS n FROM nt WHERE s IS NULL', { nt }), [{ n: 2 }], 'null in a text column: IS NULL');
+  const fr = e.tableFromRows([{ s: null, v: 1 }, { s: 'a', v: 2 }]);
+  same(fr.toRows(), [{ s: '', v: 1 }, { s: 'a', v: 2 }], 'tableFromRows: a text column starting with null');
+  // a text join key that is missing matches nothing
+  const ja = e.table({ k: ['x', ''], n: [1, 2] }), jb = e.table({ k: ['x', ''], m: [10, 20] });
+  same(q('SELECT COUNT(*) AS n FROM ja JOIN jb ON ja.k = jb.k', { ja, jb }), [{ n: 1 }], 'text join: missing keys never match');
+  same(q('SELECT ja.n, jb.m FROM ja LEFT JOIN jb ON ja.k = jb.k ORDER BY ja.n', { ja, jb }), [{ n: 1, m: 10 }, { n: 2, m: null }], 'text left join: missing key unmatched');
+  same(ja.join(jb, { on: 'k' }).toRows(), [{ k: 'x', n: 1, m: 10 }], 'Table.join on text: missing keys never match');
+  // conditions with a missing value: unknown (NULL), and IS TRUE / IS FALSE treat unknown as neither
+  const b = e.table({ a: [5, NaN, -1] });
+  same(q('SELECT a > 0 AS gt, NOT (a > 0) AS ngt, a IN (1, 5) AS i, a BETWEEN 0 AND 9 AS bt FROM b', { b }),
+    [{ gt: 1, ngt: 0, i: 1, bt: 1 }, { gt: NaN, ngt: NaN, i: NaN, bt: NaN }, { gt: 0, ngt: 1, i: 0, bt: 0 }], 'conditions as values: 1 / 0 / NULL');
+  for (const [w, n] of [['(a > 0) IS TRUE', 1], ['(a > 0) IS FALSE', 1], ['(a > 0) IS NOT TRUE', 2], ['(a > 0) IS NOT FALSE', 2], ['(a > 0) = (a < 9)', 1], ['(a > 0) <> (a < 0)', 2],
+    ['a > 0 OR NULL', 1], ['a > 0 AND NULL', 0], ['NOT (a > 0 AND NULL)', 1], ['NULL', 0], ['TRUE', 3], ['1 = 1', 3], ['1 = 0', 0], ['FALSE', 0], ['a IS TRUE', 2]])
+    same(q(`SELECT COUNT(*) AS n FROM b WHERE ${w}`, { b }), [{ n }], `WHERE ${w}`);
+  same(q('SELECT COUNT(*) AS n FROM b GROUP BY a > 99 HAVING NULL', { b }), [], 'HAVING NULL');
+  same(q('SELECT LEAST(a, 2) AS l, GREATEST(a, 2, NULL) AS g FROM b', { b }), [{ l: 2, g: 5 }, { l: 2, g: 2 }, { l: -1, g: 2 }], 'LEAST / GREATEST skip missing values');
+  // x NOT IN (subquery): a missing value in it leaves nothing; an empty one keeps every row
+  const t = e.table({ a: [1, NaN, 3, 4], g: [1, 1, 2, 3] }), d = e.table({ k: [1, NaN, 3], g: [1, 2, 2] }), u = e.table({ k: [3, 3] }), z = e.table({ k: new Float64Array(0) });
+  same(q('SELECT a FROM t WHERE a NOT IN (SELECT k FROM d) ORDER BY a', { t, d }), [], 'NOT IN a subquery with a missing value');
+  same(q('SELECT a FROM t WHERE a NOT IN (SELECT k FROM u) ORDER BY a', { t, u }), [{ a: 1 }, { a: 4 }], 'NOT IN a subquery');
+  same(q('SELECT COUNT(*) AS n FROM t WHERE a NOT IN (SELECT k FROM z)', { t, z }), [{ n: 4 }], 'NOT IN an empty subquery: every row');
+  same(q('SELECT a FROM t WHERE a NOT IN (SELECT k FROM u UNION SELECT 4 AS k) ORDER BY a', { t, u }), [{ a: 1 }], 'NOT IN a UNION');
+  same(q('SELECT a, g FROM t WHERE a NOT IN (SELECT k FROM d WHERE d.g = t.g) ORDER BY a, g', { t, d }), [{ a: 4, g: 3 }], 'NOT IN a correlated subquery');
+  const ts = e.table({ x: ['a', '', 'c'] }), tr = e.table({ y: ['a', 'b'] });
+  same(q('SELECT x FROM ts WHERE x NOT IN (SELECT y FROM tr)', { ts, tr }), [{ x: 'c' }], 'NOT IN on text');
+  same(q('SELECT y FROM tr WHERE y NOT IN (SELECT x FROM ts)', { ts, tr }), [], 'NOT IN text with a missing value');
+  // the same aggregate twice; subqueries in a grouped SELECT
+  const f = e.table({ g: [1, 1, 2], v: [NaN, NaN, 5] });
+  same(q('SELECT g, SUM(v) AS s1, MAX(v) AS m, SUM(v) AS s2 FROM f GROUP BY g ORDER BY g', { f }), [{ g: 1, s1: NaN, m: NaN, s2: NaN }, { g: 2, s1: 5, m: 5, s2: 5 }], 'SUM twice over no values: NULL both times');
+  const gt = e.table({ b: [1, 1, 2] }), gd = e.table({ k: [1, 1, 3] });
+  same(q('SELECT b, (SELECT COUNT(*) FROM gd WHERE gd.k = gt.b) AS n FROM gt GROUP BY b ORDER BY b', { gt, gd }), [{ b: 1, n: 2 }, { b: 2, n: 0 }], 'correlated subquery in a grouped SELECT');
+  same(q('SELECT b, COUNT(*) AS c, (SELECT MAX(k) FROM gd) AS m FROM gt GROUP BY b ORDER BY b', { gt, gd }), [{ b: 1, c: 2, m: 3 }, { b: 2, c: 1, m: 3 }], 'subquery value in a grouped SELECT');
+  same(q('SELECT b FROM gt GROUP BY b HAVING COUNT(*) > (SELECT COUNT(*) FROM gd WHERE gd.k = gt.b) - 1 ORDER BY b', { gt, gd }), [{ b: 1 }, { b: 2 }], 'correlated subquery in HAVING');
+  // filters with no column in them, in the dataframe API
+  const c = e.table({ a: [1, 2, 3] });
+  for (const [p, n] of [['1', 3], ['0', 0], ['1 == 1', 3], ['1 == 0', 0], ['1 < 2 && 3 > 2', 3]]) {
+    same(c.filter(p).count(), n, `filter("${p}").count()`);
+    same(c.filter(p).toRows().length, n, `filter("${p}").toRows()`);
+  }
+  same(c.filter('a > 1').filter('0').count(), 0, 'a constant false filter after another filter');
+  // a text column compared with < or >: a clear error (it used to overflow the stack)
+  const tx = e.table({ ts: ['2024-02-01', '2024-07-01'], region: ['EU', 'US'], price: [1, 2] });
+  throwsLike(() => tx.filter("ts >= '2024-06-01'").groupBy('region').agg({ r: 'sum(price)' }).toRows(), /can only be compared with == or !=.*dates/, 'text compared with >= then groupBy');
+  writeDataset(e, join(dir, 'tx.vectro'), tx);
+  const ds = e.openDataset(join(dir, 'tx.vectro'));
+  throwsLike(() => ds.filter("ts >= '2024-06-01'").groupBy('region').agg({ r: 'sum(price)' }).toRows(), /can only be compared with == or !=/, 'dataset: text compared with >= then groupBy');
+  throwsLike(() => ds.filter('nosuch > 1').count(), /columns: ts, region, price\)/, 'dataset: unknown column lists every column');
+  await e.close();
+}
+
+// an allocation too big for the 4GB memory fails cleanly and leaves the engine as it was
+{
+  const e = new Engine();
+  const t = e.table({ g: Float64Array.from(g), x: Float64Array.from(x) });
+  const want = t.groupBy('g').agg({ s: 'sum(x)', n: 'count(x)' }).toRows();
+  const keep = e.alloc(Float64Array, 1000); e.free(e.alloc(Float64Array, 5000)); // (a free block to protect)
+  const free = JSON.stringify(e.freeList);
+  throwsLike(() => e.alloc(Uint32Array, 3_145_936_686), /out of memory \(4GB limit\)/, 'alloc past 4GB: out of memory');
+  same(JSON.stringify(e.freeList), free, 'alloc past 4GB: free list untouched');
+  for (let i = 0; i < 5; i++) e.alloc(Float64Array, 4000); // (allocations after it must not land on live data)
+  same(t.groupBy('g').agg({ s: 'sum(x)', n: 'count(x)' }).toRows(), want, 'answers after a failed allocation');
+  e.free(keep);
+  await e.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} missing-value checks passed`);
 process.exit(failures ? 1 : 0);

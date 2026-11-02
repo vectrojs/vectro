@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.2
+
+A correctness release, from comparing about 1,700 new SQL queries with DuckDB
+on the same data. No API changes. Every case below now gives DuckDB's answer,
+or a clear error.
+
+**Engine**
+- A query too big for the 4GB memory (a join with billions of output rows)
+  now fails with `out of memory (4GB limit)`. Before, the size wrapped around
+  in the allocator, and later queries on the same engine could return wrong
+  numbers.
+- Missing text (`''`) sorts last, up or down, as missing numbers do, in
+  `sort`, `top`, window ordering and SQL `ORDER BY`.
+- `null` and `undefined` in a text column load as missing text, also when
+  the column starts with one (`engine.table`, `tableFromRows`).
+- A missing text key never matches in a join, as the docs say.
+- A filter with no column in it (`'1'`, `'1 == 0'`) keeps every row or none,
+  instead of failing.
+- Comparing a text column with `<` or `>` and then grouping gives a clear
+  error instead of overflowing the stack. On datasets, the unknown-column
+  error lists every column.
+
+**SQL**
+- Conditions follow SQL's three values everywhere: a condition on a missing
+  value is NULL when selected, `IS TRUE` / `IS FALSE` treat it as neither,
+  comparing two conditions is unknown if either is, and a `NULL` literal in
+  `AND` / `OR` is unknown rather than true.
+- `WHERE TRUE`, `WHERE 1 = 1`, `WHERE NULL` and other constant conditions work.
+- `ORDER BY text NULLS FIRST` works.
+- `x NOT IN (SELECT ...)` keeps every row when the subquery is empty and no
+  row when it contains a NULL.
+- `LEAST` and `GREATEST` skip missing values (NULL only if all are).
+- The same aggregate twice (`SUM(x) AS a, SUM(x) AS b`) gives NULL both times
+  over no values.
+- Subqueries in the SELECT list or HAVING of a GROUP BY query work.
+
 ## 0.1.1
 
 A performance release. No API changes.

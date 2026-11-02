@@ -872,20 +872,39 @@ function compileSelect(ast, env, outer, tail) {
   }
   // join rel (its columns `cols`) on outer key ASTs = rel key columns; the
   // rel's columns get fresh names; returns them
-  function attach(rel, outerKeys, relKeys, cols) {
+  // a subquery's columns looked up on the outer rows by key; in a grouped SELECT (ctx.step deferred),
+  // done after grouping, so the columns are there for the grouped rows
+  function attach(rel, outerKeys, relKeys, cols, ctx) {
     const tag = n.hidden++;
     const fresh = (c) => `__s${tag}_${c}`;
-    let rq = rel.query;
-    const all = [...new Set([...relKeys, ...cols])];
-    all.forEach((c) => { rq = rq.derive(fresh(c), c); });
-    rq = rq.select(...all.map(fresh));
-    let lefts = outerKeys.map((t) => hide(t));
-    let rights = relKeys.map(fresh);
-    if (!lefts.length) { const k = `__x${n.hidden++}`; q = q.derive(k, '0'); rq = rq.derive(k, '0'); lefts = [k]; rights = [k]; }
-    q = q.join(rq, { on: { left: lefts, right: rights }, how: 'left', view: true }); // (its keys are unique: right columns looked up, left rows not copied)
+    const run = () => {
+      let rq = rel.query;
+      const all = [...new Set([...relKeys, ...cols])];
+      all.forEach((c) => { rq = rq.derive(fresh(c), c); });
+      rq = rq.select(...all.map(fresh));
+      let lefts = outerKeys.map((t) => hide(t));
+      let rights = relKeys.map(fresh);
+      if (!lefts.length) { const k = `__x${n.hidden++}`; q = q.derive(k, '0'); rq = rq.derive(k, '0'); lefts = [k]; rights = [k]; }
+      q = q.join(rq, { on: { left: lefts, right: rights }, how: 'left', view: true }); // (its keys are unique: right columns looked up, left rows not copied)
+    };
+    if (ctx?.step) ctx.step({ name: fresh(cols[0]), inputs: [], run }); else run();
     return cols.map(fresh);
   }
-  function subqueryValue(e, ctx) {
+  // x NOT IN (subquery), as SQL has it: true where the subquery has no rows (x missing or not);
+  // else true only where x is present, not among the values, and none of them is missing
+  function notInValue(e, ctx, rel, vcol, mcol, relKeys, outerKeys) { // (rel: one row per value and key, mcol 1 on each)
+    const missing = rel.kinds?.get(vcol) === 'text' ? `${vcol} == ''` : `${vcol} != ${vcol}`;
+    let sq = rel.query;
+    let keys = relKeys;
+    if (!keys.length) { sq = sq.derive('__g', '0'); keys = ['__g']; }
+    sq = sq.groupBy(keys).agg({ __n: 'count()', __nn: `count(${missing})` });
+    const [cn, cnn] = attach({ ...rel, query: sq, names: [...keys, '__n', '__nn'] }, outerKeys, relKeys, ['__n', '__nn'], ctx);
+    const [m] = attach(rel, [translate(e.x, ctx), ...outerKeys], [vcol, ...relKeys], [mcol], ctx);
+    const isIn = bin('==', v(m), num(1));
+    const none = bin('==', call('coalesce', v(cn), num(0)), num(0));
+    return bin('||', none, bin('&&', bin('&&', present(e.x, ctx), { t: 'un', op: '!', x: isIn }), bin('==', call('coalesce', v(cnn), num(0)), num(0))));
+  }
+  function subqueryValue(e, ctx, negate = false) {
     if (e.k === 'exists') {
       const { inner, pairs } = correlate(e.q);
       const body = inner.body;
@@ -893,7 +912,7 @@ function compileSelect(ast, env, outer, tail) {
       const sel = { ...body, distinct: true, items: [...keyItems, { e: { k: 'num', v: 1 }, alias: '__m' }], groupBy: [] };
       if (body.groupBy?.length || body.having) fail('EXISTS (SELECT ... GROUP BY ...) is not supported');
       const rel = compileQuery({ ...inner, body: sel, orderBy: [], limit: pairs.length ? null : 1, offset: 0 }, env, outerHere);
-      const [m] = attach(rel, pairs.map((pr) => translate(pr.outer, ctx)), keyItems.map((it) => it.alias), ['__m']);
+      const [m] = attach(rel, pairs.map((pr) => translate(pr.outer, ctx)), keyItems.map((it) => it.alias), ['__m'], ctx);
       return bin('==', v(m), num(1));
     }
     if (e.k === 'insub') {
@@ -904,7 +923,8 @@ function compileSelect(ast, env, outer, tail) {
           const rel = compileQuery(inner, env, outerHere);
           if (rel.names.length !== 1) fail('IN (SELECT ...) needs exactly one column');
           const dist = { ...rel, query: rel.query.groupBy([rel.names[0]]).agg({ __m: 'count()' }).derive('__m1', '1') };
-          const [m] = attach({ ...dist, names: [rel.names[0], '__m1'] }, [translate(e.x, ctx)], [rel.names[0]], ['__m1']);
+          if (negate) return notInValue(e, ctx, { ...dist, names: [rel.names[0], '__m', '__m1'] }, rel.names[0], '__m1', [], []);
+          const [m] = attach({ ...dist, names: [rel.names[0], '__m1'] }, [translate(e.x, ctx)], [rel.names[0]], ['__m1'], ctx);
           return bin('==', v(m), num(1));
         }
         fail('IN (SELECT ...) needs exactly one column');
@@ -913,7 +933,8 @@ function compileSelect(ast, env, outer, tail) {
       const sel = { ...body, distinct: !body.groupBy?.length, items: [{ e: body.items[0].e, alias: '__v' }, ...keyItems, ...(body.groupBy?.length ? [] : [{ e: { k: 'num', v: 1 }, alias: '__m' }])] };
       let rel = compileQuery({ ...inner, body: sel, orderBy: [], limit: null, offset: 0 }, env, outerHere);
       if (body.groupBy?.length) { const keys = ['__v', ...keyItems.map((it) => it.alias)]; rel = { ...rel, query: rel.query.groupBy(keys).agg({ __c: 'count()' }).derive('__m', '1'), names: [...keys, '__m'] }; }
-      const [m] = attach(rel, [translate(e.x, ctx), ...pairs.map((pr) => translate(pr.outer, ctx))], ['__v', ...keyItems.map((it) => it.alias)], ['__m']);
+      if (negate) return notInValue(e, ctx, rel, '__v', '__m', keyItems.map((it) => it.alias), pairs.map((pr) => translate(pr.outer, ctx)));
+      const [m] = attach(rel, [translate(e.x, ctx), ...pairs.map((pr) => translate(pr.outer, ctx))], ['__v', ...keyItems.map((it) => it.alias)], ['__m'], ctx);
       return bin('==', v(m), num(1));
     }
     // (SELECT one value)
@@ -923,14 +944,14 @@ function compileSelect(ast, env, outer, tail) {
     if (!pairs.length) {
       const rel = compileQuery(inner, env, outerHere);
       if (rel.names.length !== 1) fail('a subquery used as a value needs exactly one column');
-      const [c] = attach(rel, [], [], [rel.names[0]]);
+      const [c] = attach(rel, [], [], [rel.names[0]], ctx);
       return v(c);
     }
     if (!(body.items.length === 1 && hasAgg(body.items[0].e)) || body.groupBy?.length) fail('a correlated subquery used as a value must compute one aggregate, e.g. (SELECT MAX(x) FROM t WHERE t.k = o.k)');
     const keyItems = pairs.map((pr, i) => ({ e: pr.inner, alias: `__k${i}` }));
     const sel = { ...body, items: [...keyItems, { e: body.items[0].e, alias: '__v' }], groupBy: keyItems.map((it) => it.e) };
     const rel = compileQuery({ ...inner, body: sel, orderBy: [], limit: null, offset: 0 }, env, outerHere);
-    const [c] = attach(rel, pairs.map((pr) => translate(pr.outer, ctx)), keyItems.map((it) => it.alias), ['__v']);
+    const [c] = attach(rel, pairs.map((pr) => translate(pr.outer, ctx)), keyItems.map((it) => it.alias), ['__v'], ctx);
     const it = body.items[0].e;
     return it.k === 'call' && it.fn === 'COUNT' ? call('coalesce', v(c), num(0)) : v(c); // (no rows: COUNT is 0)
   }
@@ -1099,9 +1120,19 @@ function compileSelect(ast, env, outer, tail) {
   // true where a value is there (SQL's NULL is NaN for numbers, '' for text); null: always there (a literal)
   function present(e, ctx) {
     if (e.k === 'num' || e.k === 'str' || e.k === 'date' || e.k === 'interval') return num(1);
+    if (isCond(e)) return bin('||', translate(e, ctx), negated(e, ctx)); // (a condition: known where it's true or false)
     const x = translate(e, ctx);
     return kindOf(e, ctx) === 'text' ? bin('!=', x, { t: 'str', v: '' }) : bin('==', x, x);
   }
+  // a true / false / unknown condition (comparisons, AND, OR, NOT, IS, IN, LIKE...): translate()
+  // gives where it's true, negated() where it's false; elsewhere it's unknown
+  function isCond(e) {
+    if (e.k === 'num') return !!e.bool;
+    if (e.k === 'bin') return ['AND', 'OR', 'IS', '=', '<>', '!=', '<', '<=', '>', '>=', '~', '~*', '!~', '!~*'].includes(e.op);
+    return ['not', 'isnull', 'like', 'in', 'between', 'exists', 'insub'].includes(e.k);
+  }
+  // a condition as a value: 1 true, 0 false, NaN unknown (SQL's NULL boolean)
+  function condValue(e, ctx, t) { return cond(t, num(1), cond(negated(e, ctx), num(0), num(NaN))); }
   // NOT x with SQL's three values: where x is unknown (a missing value), so is NOT x, and the
   // row is dropped. Comparisons become their opposites (false on missing values already).
   const FLIP = { '=': '<>', '<>': '=', '!=': '=', '<': '>=', '<=': '>', '>': '<=', '>=': '<' };
@@ -1118,7 +1149,8 @@ function compileSelect(ast, env, outer, tail) {
       case 'in':
         if (kindOf(x.x, ctx) === 'text') return bin('&&', { t: 'un', op: '!', x: T(x) }, present(x.x, ctx));
         return x.list.map((i) => T({ k: 'bin', op: '<>', l: x.x, r: i })).reduce((a, b) => bin('&&', a, b));
-      case 'like': case 'insub': return bin('&&', { t: 'un', op: '!', x: T(x) }, present(x.x, ctx));
+      case 'like': return bin('&&', { t: 'un', op: '!', x: T(x) }, present(x.x, ctx));
+      case 'insub': return subqueryValue(x, ctx, true);
       case 'exists': case 'isnull': return { t: 'un', op: '!', x: T(x) };
       default: { // a true / false value (1 / 0): NOT of a missing one stays missing
         const v = T(x);
@@ -1146,9 +1178,16 @@ function compileSelect(ast, env, outer, tail) {
       case 'exists': case 'insub': case 'subq': return subqueryValue(e, ctx);
       case 'window': return ctx.window(e);
       case 'bin': {
-        if (e.op === 'AND') return bin('&&', T(e.l), T(e.r));
-        if (e.op === 'OR') return bin('||', T(e.l), T(e.r));
+        const B = (x) => (x.k === 'null' ? num(0) : T(x)); // (a NULL condition is unknown: never true)
+        if (e.op === 'AND') return bin('&&', B(e.l), B(e.r));
+        if (e.op === 'OR') return bin('||', B(e.l), B(e.r));
         const op = { '=': '==', '<>': '!=' }[e.op] ?? e.op;
+        if (op === 'IS' && e.r.k === 'num' && e.r.bool) { // x IS TRUE / IS FALSE: never unknown (unknown is neither)
+          const x = e.l;
+          if (isCond(x)) return e.r.v ? T(x) : negated(x, ctx);
+          if (x.k === 'null') return num(0);
+          return e.r.v ? bin('&&', bin('!=', T(x), num(0)), present(x, ctx)) : bin('==', T(x), num(0));
+        }
         if (op === 'IS') { // a IS b: equal, or both missing
           const a = T(e.l), b = T(e.r);
           return bin('||', bin('==', a, b), bin('&&', call('isMissing', a), call('isMissing', b)));
@@ -1159,6 +1198,8 @@ function compileSelect(ast, env, outer, tail) {
           return op.startsWith('!') ? bin('==', m, num(0)) : bin('==', m, num(1));
         }
         if (['==', '!=', '<', '<=', '>', '>='].includes(op)) {
+          if (isCond(e.l) || isCond(e.r)) // (conditions compared: unknown if either one is)
+            return bin('&&', bin(op, T(e.l), T(e.r)), bin('&&', present(e.l, ctx), present(e.r, ctx)));
           const lk = kindOf(e.l, ctx), rk = kindOf(e.r, ctx);
           if (lk === 'text' || rk === 'text') {
             if ((lk === 'date' && e.r.k === 'str') || (rk === 'date' && e.l.k === 'str')) // a date written as text
@@ -1265,7 +1306,11 @@ function compileSelect(ast, env, outer, tail) {
             const s = bin('*', a[0], num(f));
             return bin('/', cond(bin('>=', s, num(0)), call('floor', bin('+', s, num(0.5))), call('ceil', bin('-', s, num(0.5)))), num(f));
           }
-          case 'LEAST': case 'GREATEST': if (a.length < 2) fail(`${e.fn}() needs two values or more`); return a.reduce((x, y) => call(e.fn === 'LEAST' ? 'min' : 'max', x, y));
+          case 'LEAST': case 'GREATEST': { // missing values skipped, as in PostgreSQL and DuckDB (NULL only if all are)
+            if (a.length < 2) fail(`${e.fn}() needs two values or more`);
+            const f = e.fn === 'LEAST' ? 'min' : 'max';
+            return a.reduce((x, y) => call(f, call('coalesce', x, y), call('coalesce', y, x)));
+          }
           case 'COALESCE': case 'IFNULL': case 'NVL': if (a.length < 2) fail(`${e.fn}() needs two values or more`); return call('coalesce', ...a);
           case 'NULLIF': need(2); return cond(bin('==', a[0], a[1]), num(NaN), a[0]);
           case 'DATE_TRUNC': {
@@ -1303,7 +1348,7 @@ function compileSelect(ast, env, outer, tail) {
   if (ast.where) {
     if (hasAgg(ast.where)) fail('aggregates (SUM, COUNT...) can\'t be used in WHERE: use HAVING');
     if (hasWindow(ast.where)) fail('window functions can\'t be used in WHERE (filter on them in an outer query)');
-    const t = translate(ast.where, plain);
+    const t = ast.where.k === 'null' ? num(0) : translate(ast.where, plain); // (WHERE NULL: unknown, no row)
     q = q.filter(src(t));
   }
 
@@ -1440,7 +1485,9 @@ function compileSelect(ast, env, outer, tail) {
     // aggregates, each once
     const aggs = new Map(); // sqlKey -> name
     const spec = {}, extraKeys = [];
-    const aggOf = (e) => {
+    const aggDone = new Map(); // (an aggregate used twice: the same expression, SUM's NULL check included)
+    const aggOf = (e) => { const k = key(e); if (!aggDone.has(k)) aggDone.set(k, aggOnce(e)); return aggDone.get(k); };
+    const aggOnce = (e) => {
       const k = key(e);
       if (aggs.has(k)) return v(aggs.get(k));
       const name = `__a${aggs.size}_${n.hidden++}`;
@@ -1480,8 +1527,9 @@ function compileSelect(ast, env, outer, tail) {
       return translate(e, post);
     };
     planWindows(translatePost, (x) => kindOf(x, post));
-    const outs = withCols(items.map((it) => ({ ...it, ast: textConst(translatePost(it.e), post) })));
-    const havingAst = ast.having ? translatePost(ast.having) : null;
+    const tri = (e, t) => { if (!isCond(e) || e.k === 'num' || t.t === 'var') return t; try { return condValue(e, post, t); } catch { return t; } }; // (built from GROUP BY expressions: as it is)
+    const outs = withCols(items.map((it) => { const t = translatePost(it.e); return { ...it, ast: textConst(tri(it.e, t), post) }; }));
+    const havingAst = ast.having ? (ast.having.k === 'null' ? num(0) : translatePost(ast.having)) : null;
     const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, translatePost) }));
     q = q.groupBy([...keys.map((k) => k.name), ...extraKeys]).agg(Object.keys(spec).length ? spec : { __a_rows: 'count()' });
     const late = new Set(windowVars.values()), after = []; // (those using window values: after the windows)
@@ -1490,16 +1538,16 @@ function compileSelect(ast, env, outer, tail) {
     applyWindows();
     for (const st of after) st.run();
     for (const o of outs) if (o.ast.t !== 'var') q = q.derive(o.col, src(o.ast));
-    for (const o of orderAsts) sortKey(o);
+    for (const o of orderAsts) sortKey(o, orderKind(o, outs, post));
     return finish(outs, (o) => (o.e.k === 'col' ? post.kindOfCol(o.e) ?? kinds.get(resolveSafe(o.e)) : kindOf(o.e, post)), post);
   }
   const pre = windowCtx(plain);
   planWindows((e) => (e.k === 'col' ? colOf(e) : translate(e, pre)), (x) => kindOf(x, pre));
   applyWindows();
-  const outs = withCols(items.map((it) => ({ ...it, ast: textConst(it.e.k === 'col' ? colOf(it.e) : translate(it.e, pre), pre) })));
+  const outs = withCols(items.map((it) => { const t = it.e.k === 'col' ? colOf(it.e) : translate(it.e, pre); return { ...it, ast: textConst(isCond(it.e) && it.e.k !== 'num' ? condValue(it.e, pre, t) : t, pre) }; }));
   const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, (e) => (e.k === 'col' ? colOf(e) : translate(e, pre))) }));
   for (const o of outs) if (o.ast.t !== 'var') q = q.derive(o.col, src(o.ast));
-  for (const o of orderAsts) sortKey(o);
+  for (const o of orderAsts) sortKey(o, orderKind(o, outs, pre));
   if (ast.distinct) q = q.groupBy([...new Set(outs.map((o) => o.col))]).agg({ __distinct_rows: 'count()' });
   return finish(outs, (o) => (o.e.k === 'col' ? (sessionRef(o.e)?.kind ?? kinds.get(o.e.resolved ? o.e.name : resolve(o.e))) : kindOf(o.e, pre)), pre);
 
@@ -1516,11 +1564,17 @@ function compileSelect(ast, env, outer, tail) {
     const t = tr(e), same = outs.find((o) => toSourceAst(o.ast) === toSourceAst(t));
     return same ? v(same.col) : t;
   }
-  function sortKey(o) {
+  // the kind (text or not) of what an ORDER BY item sorts: a select item by number or name, or the expression
+  function orderKind(o, outs, ctx) {
+    const e = o.e.k === 'num' ? outs[o.e.v - 1]?.e : (o.e.k === 'col' && !o.e.table && outs.find((x) => x.name === o.e.name)?.e) || o.e;
+    try { return kindOf(e, ctx); } catch { return null; }
+  }
+  function sortKey(o, kind) {
     let k;
     if (o.ast.t === 'var') k = o.ast.name;
     else { k = `__o${n.hidden++}`; q = q.derive(k, src(o.ast)); }
-    if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, `${k} == ${k} ? 1 : 0`); sortKeys.push(h); }
+    // missing sorts last on its own (NaN, and '' for text); NULLS FIRST sorts present values after missing ones first
+    if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, kind === 'text' ? `${k} == '' ? 0 : 1` : `${k} == ${k} ? 1 : 0`); sortKeys.push(h); }
     sortKeys.push(o.desc ? `-${k}` : k);
   }
   function finish(outs, kindFn, ctx) {

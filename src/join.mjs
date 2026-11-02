@@ -415,7 +415,7 @@ function* buildRight(engine, t, L, R, lk, rk, how) {
     for (let k = 0; k < nk; k++) {
       const a = L.cols.get(lk[k]), b = R.cols.get(rk[k]);
       if (!b.dict) { build.rightKeys.push(b.data); continue; }
-      const lut = b.dict.map((label) => a.codes?.get(label) ?? NaN); // a label the left table lacks matches nothing
+      const lut = b.dict.map((label) => (label === '' ? NaN : a.codes?.get(label) ?? NaN)); // missing text, or a label the left table lacks, matches nothing
       const mapped = alloc(L.type, nR);
       const src = engine.live(b.data), dst = engine.live(mapped);
       for (let i = 0; i < nR; i++) dst[i] = lut[src[i]];

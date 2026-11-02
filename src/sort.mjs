@@ -22,10 +22,11 @@ export function parseKeys(by, cols) {
 }
 
 // Ranks for a category column's codes: code -> position of its label A..Z.
+// Missing text ('') ranks NaN, so it comes last either way, as a missing number does.
 export function labelRanks(dict, desc) {
   const order = dict.map((_, i) => i).sort((a, b) => (dict[a] < dict[b] ? -1 : dict[a] > dict[b] ? 1 : 0));
   const rank = new Float64Array(dict.length);
-  order.forEach((code, r) => { rank[code] = desc ? -r : r; });
+  order.forEach((code, r) => { rank[code] = dict[code] === '' || dict[code] == null ? NaN : desc ? -r : r; });
   return rank;
 }
 

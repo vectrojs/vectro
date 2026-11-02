@@ -125,6 +125,12 @@ export function walk(n, f) {
   else if (n.t === 'cond') { walk(n.c, f); walk(n.x, f); walk(n.y, f); }
 }
 
+// text left in an expression a kernel computes (a text column was compared with < or >, or
+// isn't one): a clear error, not a loop between the value and condition emitters
+function noText(n) {
+  if (n.t === 'str') throw new SyntaxError(`vectro: text like ${JSON.stringify(n.v)} can only be compared with == or != to a text column (to compare dates, load the column as dates: { dates: ['name'] })`);
+}
+
 function checkElementwise(n, src) {
   walk(n, (m) => {
     if (m.t === 'str') throw new SyntaxError(`vectro: text like ${JSON.stringify(m.v)} can only be compared (== / !=) with a text column, in "${src}"`);
@@ -162,7 +168,10 @@ export function analyze(spec) {
 
 // Constant parts computed now: 2 * 3 -> 6, floor(2.5) -> 2, (1 ? x : y) -> x.
 // Same results as the kernels (IEEE doubles; f32 kernels round literals).
-const FOLD_BIN = { '+': (a, b) => a + b, '-': (a, b) => a - b, '*': (a, b) => a * b, '/': (a, b) => a / b };
+const FOLD_BIN = { '+': (a, b) => a + b, '-': (a, b) => a - b, '*': (a, b) => a * b, '/': (a, b) => a / b,
+  // as the kernels compute them: 1 / 0, a comparison with NaN false (but != true), NaN counting as true in && and ||
+  '==': (a, b) => +(a === b), '!=': (a, b) => +(a !== b), '<': (a, b) => +(a < b), '<=': (a, b) => +(a <= b), '>': (a, b) => +(a > b), '>=': (a, b) => +(a >= b),
+  '&&': (a, b) => +(a !== 0 && b !== 0), '||': (a, b) => +(a !== 0 || b !== 0) };
 const FOLD_FN = { abs: Math.abs, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, min: Math.min, max: Math.max };
 export function fold(n) {
   const isNum = (x) => x.t === 'num';
@@ -255,8 +264,8 @@ export class Emitter {
     this.memo.set(m, l);
   }
 
-  vec(n, k) { return this.#reuse(n, k, V128, () => this.#vec(n, k)); }
-  sca(n) { return this.#reuse(n, 'sca', this.ty.val, () => this.#sca(n)); }
+  vec(n, k) { noText(n); return this.#reuse(n, k, V128, () => this.#vec(n, k)); }
+  sca(n) { noText(n); return this.#reuse(n, 'sca', this.ty.val, () => this.#sca(n)); }
 
   #vec(n, k) {
     const { f, env } = this, V = VEC[this.t];

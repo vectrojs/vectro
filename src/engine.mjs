@@ -32,7 +32,7 @@ const DEFAULT_MIN_PARALLEL_WASM = {
 const PAGE = 65536;
 const MAX_PAGES = 65536; // 4GB, the most a 32-bit WASM address can reach
 const HEAP_START = 64;   // keep address 0 unused
-const align16 = (n) => (n + 15) & ~15;
+const align16 = (n) => Math.ceil(n / 16) * 16; // (not bitwise: sizes may pass 2^31 bytes, and must not wrap)
 
 // Can this runtime compile WebAssembly from bytes? (Cloudflare Workers and
 // Vercel Edge can't: they only run modules bundled ahead of time.)
@@ -141,6 +141,8 @@ export class Engine {
   // WASM SIMD kernels; other shared arrays fall back to JS kernels.
   alloc(Type, n) {
     const size = align16(Math.max(16, n * Type.BYTES_PER_ELEMENT));
+    // too big for the 4GB memory (a huge join output, say): fail before touching the free list
+    if (!(size <= MAX_PAGES * PAGE - 64)) throw new RangeError('vectro: out of memory (4GB limit)');
     let ptr = -1;
     for (let i = 0; i < this.freeList.length; i++) {
       const blk = this.freeList[i];

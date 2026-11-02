@@ -162,7 +162,7 @@ CASES.push(
   ['SELECT c.cust, o.n FROM customers c LEFT JOIN (SELECT cust, qty, COUNT(*) AS n FROM orders GROUP BY cust, qty) o ON o.cust = c.cust AND o.qty = 5 ORDER BY c.cust LIMIT 8',
     () => C.slice(0, 8).map((c) => ({ cust: c.cust, n: O.filter((r) => r.cust === c.cust && r.qty === 5).length || NaN }))],
   ["SELECT FORMAT('%s-%s:%I', name, tier, 'My Col') AS f FROM customers ORDER BY cust LIMIT 3", () => C.slice(0, 3).map((c) => ({ f: `${c.name}-${c.tier}:"My Col"` }))],
-  ['SELECT name AS x FROM customers WHERE cust < 2 UNION ALL SELECT NULL ORDER BY x', () => [{ x: '' }, { x: 'c0' }, { x: 'c1' }]],
+  ['SELECT name AS x FROM customers WHERE cust < 2 UNION ALL SELECT NULL ORDER BY x', () => [{ x: 'c0' }, { x: 'c1' }, { x: '' }]], // (missing text sorts last, as in SQL)
   ["SELECT EXTRACT(EPOCH FROM ts) AS e, date_part('month', ts) AS m FROM orders ORDER BY ts LIMIT 3", () => [...O].sort((a, b) => a.ts - b.ts).slice(0, 3).map((r) => ({ e: r.ts.getTime() / 1000, m: r.ts.getUTCMonth() + 1 }))],
 );
 const norm = (v) => (v instanceof Date ? v.getTime() : typeof v === 'number' ? (v !== v ? 'NaN' : Number(v.toPrecision(12))) : v);

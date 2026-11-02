@@ -834,7 +834,12 @@ export function* runPlanG(plan, sink = null) {
     for (let n = plan; n.op !== 'scan' && n.op !== 'union'; ) { n = n.op === 'join' ? n.left : n.input; path.push(n); }
     const scan = path[path.length - 1];
     if (!scan.table?.isDataset) result = yield { run: plan };
-    else result = yield* runChunksG(plan, path, sink);
+    else {
+      try { result = yield* runChunksG(plan, path, sink); } catch (err) { // (chunks are read with only the columns used: name them all)
+        if (/^vectro: unknown column /.test(err?.message)) err.message = err.message.replace(/\(columns: [^)]*\)$/, `(columns: ${scan.table.columnNames.join(', ')})`);
+        throw err;
+      }
+    }
     if (sink && result) { // (the result itself was built in memory)
       if (result.cols) sink.append(result);
       else sink.append(Object.fromEntries(Object.entries(result).map(([k, v]) => [k, [v]])));

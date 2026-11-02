@@ -7,7 +7,7 @@
 
 import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
 import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
-import { parse, toSource, walk, analyze, isMask } from './fuse.mjs';
+import { parse, toSource, walk, analyze, isMask, fold } from './fuse.mjs';
 import { generateGroupBy, generateCompact, generateHashGroups, generateMarkPairs, generateStridedKeys } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
@@ -107,17 +107,18 @@ export class Table {
     for (const name of Object.keys(rows[0])) {
       checkName(name);
       const data = engine.alloc(type, n);
-      if (typeof rows[0][name] === 'string') {
+      const first = firstPresent(rows.map((r) => r[name]));
+      if (typeof first === 'string') {
         const codes = new Map(), dict = [];
         for (let i = 0; i < n; i++) {
-          const s = rows[i][name];
+          const s = rows[i][name] ?? ''; // (null / undefined: missing text)
           let c = codes.get(s);
           if (c === undefined) { c = dict.length; dict.push(s); codes.set(s, c); }
           data[i] = c;
         }
         cols.set(name, { data, dict, codes });
       } else {
-        const date = rows[0][name] instanceof Date;
+        const date = first instanceof Date;
         if (date && type === Float32Array) throw new Error(f32Dates(name));
         for (let i = 0; i < n; i++) { const v = rows[i][name]; data[i] = v === null || v === undefined ? NaN : date ? toMillis(v) : v; } // (null: missing)
         cols.set(name, { data, dict: null, codes: null, ...(date ? { date: true } : {}) });
@@ -314,7 +315,14 @@ export class Table {
   // Lazy filter: returns a view of the same columns with a condition attached.
   filter(expr, params = {}) {
     const merged = this.#mergeParams(params);
-    const { src } = this.#bind(expr, merged);
+    let { ast, src } = this.#bind(expr, merged);
+    walk(ast, (m) => { if (m.t === 'str') throw new SyntaxError(`vectro: text like ${JSON.stringify(m.v)} can only be compared with == or != to a text column, in "${expr}" (to compare dates, load the column as dates: { dates: ['name'] })`); });
+    const k = fold(ast);
+    if (k.t === 'num') { // no column in it (1 == 1, 0): every row, or none (a kernel needs a column to read)
+      if (k.v !== 0) return new Table(this.engine, this.cols, this.n, { pred: this.pred, params: merged, zones: this.zones });
+      const c = [...this.cols.keys()].find((x) => !this.cols.get(x).strings);
+      src = `${c} != ${c} && ${c} == ${c}`;
+    }
     const pred = this.pred ? `(${this.pred}) && (${src})` : src;
     return new Table(this.engine, this.cols, this.n, { pred, params: merged, zones: this.zones });
   }
@@ -1891,7 +1899,9 @@ function codedText(engine, type, { codes: src, labels }) {
 }
 
 const isDates = (values) => Array.isArray(values) && values.find((v) => v != null) instanceof Date;
-const isText = (values) => !ArrayBuffer.isView(values) && values.length > 0 && typeof values[0] === 'string';
+// the first value present decides (a column may start with null / undefined: missing)
+const firstPresent = (values) => { for (const v of values) if (v !== null && v !== undefined) return v; return undefined; };
+const isText = (values) => !ArrayBuffer.isView(values) && values.length > 0 && typeof firstPresent(values) === 'string';
 
 function copyNumbers(engine, type, values) {
   const data = engine.alloc(type, values.length);
@@ -1904,7 +1914,7 @@ function encodeText(engine, type, values) {
   const data = engine.alloc(type, values.length);
   const codes = new Map(), dict = [];
   for (let i = 0; i < values.length; i++) {
-    const s = values[i];
+    const s = values[i] ?? ''; // (null / undefined: missing text, as in JSON)
     let c = codes.get(s);
     if (c === undefined) { c = dict.length; dict.push(s); codes.set(s, c); }
     data[i] = c;
