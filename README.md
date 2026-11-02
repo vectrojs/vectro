@@ -30,18 +30,27 @@ orders.groupBy('region').agg({ revenue: 'sum(price * qty)' }).toRows();
 npm install vectrojs
 ```
 
+Save this as `try.mjs` (or set `"type": "module"` in package.json) and run `node try.mjs`:
+
 ```js
 import { Engine, sql } from 'vectrojs';
 
-const engine = new Engine();
-const orders = engine.readCSV('orders.csv');
-sql('SELECT region, COUNT(*) AS n, SUM(price) AS revenue FROM orders GROUP BY region ORDER BY revenue DESC', { orders }).toRows();
+const engine = new Engine();                         // uses every core
+const orders = engine.table({
+  region: ['EU', 'US', 'EU', 'APAC', 'US'],
+  price:  [120, 80, 300, 45, 99],
+});
+console.log(sql('SELECT region, COUNT(*) AS n, SUM(price) AS revenue FROM orders GROUP BY region ORDER BY revenue DESC', { orders }).toRows());
+// [ { region: 'EU', n: 2, revenue: 420 }, { region: 'US', n: 2, revenue: 179 }, { region: 'APAC', n: 1, revenue: 45 } ]
+await engine.close();
 ```
+
+For your own data, `engine.readCSV('orders.csv')` reads a CSV file on every core.
 
 Serve a folder of CSV / Arrow / `.vectro` files to BI tools, with no code:
 
 ```sh
-npx vectro serve --root ./data --pg 5433      # HTTP on 8787, PostgreSQL on 5433
+npx -y -p vectrojs vectro serve --root ./data --pg 5433      # HTTP on 8787, PostgreSQL on 5433
 psql -h 127.0.0.1 -p 5433 -U vectro vectro     # or Power BI, Tableau, Metabase, Grafana
 ```
 
@@ -408,8 +417,8 @@ there (1.4x at a billion rows, 1.5x at 100M).
 ## SQL over HTTP: Excel, Power BI, Google Sheets, pandas
 
 ```sh
-npx vectro serve --root ~/data        # every CSV, TSV, JSON-lines, Arrow / Feather and .vectro file is a table
-curl 'http://127.0.0.1:8787/sql?q=SELECT region, COUNT(*) AS n FROM orders GROUP BY 1&format=csv'
+npx -y -p vectrojs vectro serve --root ~/data        # every CSV, TSV, JSON-lines, Arrow / Feather and .vectro file is a table
+curl -G http://127.0.0.1:8787/sql --data-urlencode 'q=SELECT region, COUNT(*) AS n FROM orders GROUP BY 1' -d format=csv
 ```
 
 | Endpoint | Gives |
@@ -441,7 +450,7 @@ On 10M orders: a group by region answers in 9 ms over HTTP; 1M rows export in 0.
 ## The PostgreSQL protocol: Power BI, Tableau, Metabase, Grafana, psql
 
 ```sh
-npx vectro serve --root ~/data --pg 5433 --user me --password secret
+npx -y -p vectrojs vectro serve --root ~/data --pg 5433 --user me --password secret
 psql -h 127.0.0.1 -p 5433 -U me vectro
 ```
 
@@ -496,7 +505,7 @@ ODBC, and every driver. Queries arrive in each tool's own SQL and run on Vectro'
 ## Arrow Flight SQL: pandas, Polars, DuckDB
 
 ```sh
-npx vectro serve --root ~/data --flight 31337            # grpc://localhost:31337 (--user / --password, --tls-cert / --tls-key)
+npx -y -p vectrojs vectro serve --root ~/data --flight 31337            # grpc://localhost:31337 (--user / --password, --tls-cert / --tls-key)
 ```
 
 ```python
@@ -729,6 +738,7 @@ writeFileSync('eu.feather', sales.filter("region == 'EU'").toArrow({ file: true 
 // split tables: await engine.fromArrowAsync(bytes), await table.toArrowAsync()
 
 // streams: any Arrow IPC stream over TCP or WebSocket, e.g. from pyarrow
+const split = new SplitEngine();                                     // import { SplitEngine } from 'vectrojs'
 const orders = await split.streamAsync({ format: 'arrow', columns: { ts: 'number', region: 'category' } });
 // ...or Vectro's Emitter speaking Arrow: Emitter.listen({ columns, format: 'arrow' })
 ```
