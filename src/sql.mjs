@@ -32,6 +32,7 @@
 
 import { Query, namesOf, findDataset } from './plan.mjs';
 import { quoteText } from './fuse.mjs';
+import { decodeOne } from './pack.mjs';
 import { TEXT_FUNCTIONS, toText, isNull, textToNumber, textToDate } from './sqltext.mjs';
 
 const KEYWORDS = new Set(['SELECT', 'DISTINCT', 'FROM', 'AS', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'ON', 'USING', 'WHERE', 'GROUP', 'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'AND', 'OR', 'NOT', 'BETWEEN', 'IN', 'LIKE', 'IS', 'NULL', 'TRUE', 'FALSE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'NULLS', 'FIRST', 'LAST', 'CAST', 'DATE', 'TIMESTAMP', 'INTERVAL', 'EXTRACT', 'ALL', 'EXISTS', 'UNION', 'INTERSECT', 'EXCEPT', 'WITH']);
@@ -502,6 +503,13 @@ const andAll = (list) => (list.length ? list.reduce((a, b) => ({ k: 'bin', op: '
 // Tables may also be named "schema.table" (pg_catalog.pg_class): they are
 // found by that name; an unqualified name also finds pg_catalog's.
 export function sql(text, tables = {}, opts = {}) {
+  try { return compileSQL(text, tables, opts); } catch (err) {
+    // (a generated query nested thousands deep: say so, not "Maximum call stack size exceeded")
+    if (err instanceof RangeError && /call stack/i.test(err.message)) throw new SyntaxError('vectro SQL: the query is nested too deeply (expressions or brackets thousands of levels deep); split it up');
+    throw err;
+  }
+}
+function compileSQL(text, tables, opts) {
   const ast = parseStatement(String(text), !!opts.foldCase);
   const engine = Object.values(tables).find((t) => t?.engine)?.engine ?? null;
   const env = { tables, ctes: new Map(), engine, n: { hidden: 0 }, wantTypes: !!opts.types, pgNames: !!opts.foldCase, functions: opts.functions ?? null, session: opts.session ?? null, database: opts.database ?? null };
@@ -543,13 +551,29 @@ function columnType(t, name) {
     const enc = (t.meta?.chunks ?? []).map((ch) => ch.cols?.[name]);
     if (c.date) type = 'date';
     else type = enc.length && enc.every((z) => z && (z.missing === z.rows || (z.enc && !z.enc.div && Number.isInteger(z.enc.mul ?? 1) && Number.isInteger(z.enc.base ?? 0)))) ? 'int' : 'float';
-  } else if (c.date) type = t.length && t.agg({ n: `count(${name} == ${name} && ${name} != dayStart(${name}))` }).n === 0 ? 'day' : 'date';
+  } else if (t.engine?.busy) type = scanType(t, c); // (a sync agg() can't run now)
+  else if (c.date) type = t.length && t.agg({ n: `count(${name} == ${name} && ${name} != dayStart(${name}))` }).n === 0 ? 'day' : 'date';
   else {
     const a = t.agg({ frac: `count(${name} == ${name} && ${name} != floor(${name}))`, hi: `max(abs(${name}))` });
     type = a.frac === 0 && !(a.hi >= 2 ** 53) ? 'int' : 'float';
   }
   m.set(name, type);
   return type;
+}
+
+// columnType's answer worked out in JavaScript, one pass over the column, for
+// when an async query is running (a sync agg() can't run then).
+function scanType(t, c) {
+  const v = t.engine.live(c.data), n = t.length, f32 = t.type === Float32Array, DAY = 86_400_000;
+  if (c.date && !n) return 'date';
+  let hi = 0;
+  for (let i = 0; i < n; i++) {
+    const x = c.enc ? decodeOne(c.enc, v[i], f32) : v[i];
+    if (x !== x) continue; // (missing)
+    if (c.date ? x !== Math.floor(x / DAY) * DAY : x !== Math.floor(x)) return c.date ? 'date' : 'float';
+    hi = Math.max(hi, Math.abs(x));
+  }
+  return c.date ? 'day' : hi >= 2 ** 53 ? 'float' : 'int';
 }
 
 // A relation: { query, names, kinds (name -> 'text' | 'date' | 'number') }.

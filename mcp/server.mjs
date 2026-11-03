@@ -125,6 +125,13 @@ function release(name) {
 
 const safePath = (path) => safePathIn(ROOT, path);
 
+// limit and k: whole numbers from 1 (more than MAX_ROWS gives MAX_ROWS), as the
+// schema says; clients don't always check before calling
+function rowCount(name, v) {
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 1) throw new ToolError(`${name} must be a whole number from 1 to ${MAX_ROWS}, got ${JSON.stringify(v)}`);
+  return Math.min(MAX_ROWS, v);
+}
+
 function getTable(name) {
   const entry = tables.get(name);
   if (!entry) throw new ToolError(`no table "${name}" (loaded: ${[...tables.keys()].join(', ') || 'none'}; use load_file)`);
@@ -178,7 +185,10 @@ const handlers = {
   },
   query({ table: name, filter, group_by: groupBy, aggregates, sort, limit = DEFAULT_ROWS }) {
     const entry = getTable(name);
-    const lim = Math.max(1, Math.min(MAX_ROWS, Math.floor(limit)));
+    const lim = rowCount('limit', limit ?? DEFAULT_ROWS); // (null: not given)
+    if (aggregates != null && (typeof aggregates !== 'object' || Array.isArray(aggregates) || !Object.values(aggregates).every((v) => typeof v === 'string'))) {
+      throw new ToolError(`aggregates must be an object of names and expressions, e.g. { "revenue": "sum(price * qty)", "orders": "count()" }, got ${JSON.stringify(aggregates)}`);
+    }
     const ds = entry.table.isDataset; // (a dataset: a lazy query, read in chunks)
     const view = ds ? (filter ? entry.table.filter(filter) : entry.table.lazy()) : filter ? entry.table.filter(filter) : entry.table;
     const hasAgg = aggregates && Object.keys(aggregates).length;
@@ -214,7 +224,7 @@ const handlers = {
       if (!row) throw new ToolError(`no row where ${like.column} is ${JSON.stringify(like.value)}`);
       q = dims.map((d) => row[d]);
     }
-    const hits = await entry.index.searchAsync(q, { k: Math.max(1, Math.min(MAX_ROWS, Math.floor(k))), filter });
+    const hits = await entry.index.searchAsync(q, { k: rowCount('k', k ?? 10), filter });
     return { returned: hits.length, rows: clean(hits) };
   },
   add_column({ table: name, name: col, expression }) {

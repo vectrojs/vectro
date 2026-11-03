@@ -41,14 +41,15 @@ export async function loadFile(engine, real, { types } = {}) {
   if (ext === '.jsonl' || ext === '.ndjson') return loadJSONLines(engine, bytes, types);
   if (ext === '.csv' || ext === '.tsv' || ext === '.txt') {
     const delimiter = ext === '.tsv' ? '\t' : ',';
-    const table = engine.parseCSV(bytes, { types: types ?? {}, delimiter });
+    // (async: queries other clients are running on the engine go on meanwhile)
+    const table = await engine.parseCSVAsync(bytes, { types: types ?? {}, delimiter });
     // text that rarely repeats (names, titles) loads as free text, which can be
     // shown but not grouped, filtered or joined on: tools need that, so up to
     // FREE_TEXT_ROWS rows it is loaded again as categories
     const free = [...table.cols].filter(([n, c]) => c.strings && !(types && n in types)).map(([n]) => n);
     if (!free.length || table.length > FREE_TEXT_ROWS) return { table };
     table.dispose();
-    return { table: engine.parseCSV(bytes, { types: { ...types, ...Object.fromEntries(free.map((n) => [n, 'category'])) }, delimiter }) };
+    return { table: await engine.parseCSVAsync(bytes, { types: { ...types, ...Object.fromEntries(free.map((n) => [n, 'category'])) }, delimiter }) };
   }
   throw new LoadError(`can't load ${ext || 'files without an extension'} (CSV, TSV, JSON lines, Arrow / Feather or .vectro)`);
 }
@@ -117,37 +118,62 @@ function loadJSONLines(engine, bytes, types) {
 
 // The tables a server serves: given in code, or the files in a data folder
 // (reload() reads it again). Shared by the HTTP and PostgreSQL servers.
-//   { engine, entries: Map name -> { table, source, owned }, named(), reload(), version, close() }
+//   { engine, entries: Map name -> { table, source, owned }, named(), reload(), hold(), version, close() }
+// A server calls hold() before it reads the tables and the function it returns
+// once it's done with them: reload() frees the tables it replaces only when
+// every hold taken before it has ended, so queries running meanwhile finish
+// on the tables they started with.
 export async function openTables({ tables = {}, root = null, engine = null, log = () => {} } = {}) {
   const own = !engine && !Object.values(tables).some((t) => t?.engine);
   engine ??= Object.values(tables).find((t) => t?.engine)?.engine ?? new Engine();
   const entries = new Map();
   for (const [name, table] of Object.entries(tables)) entries.set(name, { table, source: 'given', owned: false });
   const rootPath = root ? realpathSync(resolve(String(root).replace(/^~(?=\/|$)/, process.env.HOME ?? '~'))) : null;
+  // holds since the last reload; old: the tables a reload replaced, freed when its holds end
+  let gen = { holds: 0, old: [] }, reloading = Promise.resolve();
+  const waiting = new Set(); // earlier ones with holds still running
+  const retire = (g) => { for (const t of g.old) release(t); g.old = []; waiting.delete(g); };
   const self = {
     engine, entries, root: rootPath, version: 0,
     named: () => Object.fromEntries([...entries].map(([n, e]) => [n, e.table])),
-    async reload() {
-      if (!rootPath) throw new LoadError('this server has no data folder to reload');
-      for (const [name, e] of entries) if (e.owned) { release(e.table); entries.delete(name); }
-      const loaded = [], failed = [];
-      for (const { name, path } of filesIn(rootPath)) {
-        if (entries.has(name)) continue; // (tables given in code win)
-        try {
-          const { table } = await loadFile(engine, path);
-          entries.set(name, { table, source: path, owned: true });
-          loaded.push(name);
-        } catch (err) { failed.push({ file: path, error: err.message }); log(`skipped ${path}: ${err.message}`); }
-      }
-      self.version++;
-      return { loaded, failed };
+    hold() {
+      const g = gen;
+      g.holds++;
+      let done = false;
+      return () => { if (!done && (done = true) && --g.holds === 0 && g !== gen) retire(g); };
+    },
+    reload() { // (one at a time)
+      const r = reloading.then(() => readFolder());
+      reloading = r.catch(() => {});
+      return r;
     },
     async close() {
       for (const e of entries.values()) if (e.owned) release(e.table);
       entries.clear();
+      for (const g of waiting) retire(g);
       if (own) await engine.close();
     },
   };
+  // the files loaded first, then swapped in for the old tables
+  async function readFolder() {
+    if (!rootPath) throw new LoadError('this server has no data folder to reload');
+    const fresh = new Map(), loaded = [], failed = [];
+    for (const { name, path } of filesIn(rootPath)) {
+      if (entries.has(name) && !entries.get(name).owned) continue; // (tables given in code win)
+      try {
+        const { table } = await loadFile(engine, path);
+        fresh.set(name, { table, source: path, owned: true });
+        loaded.push(name);
+      } catch (err) { failed.push({ file: path, error: err.message }); log(`skipped ${path}: ${err.message}`); }
+    }
+    const was = gen;
+    for (const [name, e] of entries) if (e.owned) { was.old.push(e.table); entries.delete(name); }
+    for (const [name, e] of fresh) entries.set(name, e);
+    gen = { holds: 0, old: [] };
+    if (was.holds === 0) retire(was); else waiting.add(was);
+    self.version++;
+    return { loaded, failed };
+  }
   if (rootPath) await self.reload();
   return self;
 }

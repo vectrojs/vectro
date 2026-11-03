@@ -237,7 +237,7 @@ function cell(type, v) {
 export async function odata({ path, params, named, base, headers = {}, pageSize = PAGE }) {
   const H = { 'OData-Version': '4.0' };
   const json = (o, status = 200) => ({ status, headers: { ...H, 'content-type': 'application/json;odata.metadata=minimal' }, body: [JSON.stringify(o)] });
-  const parts = path.split('/').filter(Boolean).map(decodeURIComponent); // ['odata', ...]
+  const parts = path.split('/').filter(Boolean).map((p) => { try { return decodeURIComponent(p); } catch { return bad(`the path has a malformed %-escape: ${p}`); } }); // ['odata', ...]
   const tables = Object.fromEntries(Object.entries(named).filter(([n]) => !n.includes('.') && odataName(n)));
   if (parts.length === 1) return json({ '@odata.context': `${base}/$metadata`, value: Object.keys(tables).map((n) => ({ name: n, kind: 'EntitySet', url: n })) });
   if (parts[1] === '$metadata') return { status: 200, headers: { ...H, 'content-type': 'application/xml' }, body: [metadataXml(tables)] };
