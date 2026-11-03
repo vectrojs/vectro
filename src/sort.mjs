@@ -24,10 +24,24 @@ export function parseKeys(by, cols) {
 // Ranks for a category column's codes: code -> position of its label A..Z.
 // Missing text ('') ranks NaN, so it comes last either way, as a missing number does.
 export function labelRanks(dict, desc) {
-  const order = dict.map((_, i) => i).sort((a, b) => (dict[a] < dict[b] ? -1 : dict[a] > dict[b] ? 1 : 0));
+  const order = dict.map((_, i) => i).sort((a, b) => byCodePoint(dict[a], dict[b]));
   const rank = new Float64Array(dict.length);
   order.forEach((code, r) => { rank[code] = dict[code] === '' || dict[code] == null ? NaN : desc ? -r : r; });
   return rank;
+}
+
+// Text in code point order, as DuckDB sorts it (JavaScript's < compares UTF-16 units, which
+// puts 'ﬁ' and full-width letters after emoji): a surrogate unit is part of a code point
+// above every unit that isn't one, so it sorts after them.
+function byCodePoint(a, b) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a.charCodeAt(i), y = b.charCodeAt(i);
+    if (x === y) continue;
+    const sx = x >= 0xd800 && x <= 0xdfff, sy = y >= 0xd800 && y <= 0xdfff;
+    return sx !== sy ? (sx ? 1 : -1) : x < y ? -1 : 1;
+  }
+  return a.length - b.length;
 }
 
 // Stable sort of row indices 0..n-1 by several Float64Array keys (first key
@@ -62,6 +76,7 @@ export function sortIndex(keys, n) {
       else {
         h = bits[2 * r + 1]; l = bits[2 * r];
         if (f[r] !== f[r]) { h = 0xffffffff; l = 0xffffffff; } // NaN: after everything
+        else if (f[r] === 0) { h = 0x80000000; l = 0; }          // -0 as 0: equal keys, the next key decides
         else if (h & 0x80000000) { h = ~h >>> 0; l = ~l >>> 0; } // negative: flip all
         else h = (h | 0x80000000) >>> 0;                         // positive: flip the sign
       }

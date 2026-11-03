@@ -182,7 +182,9 @@ function csvEnd(bytes, from, end, delim) {
 //   fieldMap[f] = output column for field f (-1 = skip)
 //   kinds[o] = 0 number, 1 category (dictionary codes), 2 free text (byte refs)
 //   check[o] = 1: a guessed number column; set to 2 where a value isn't a number
-//     (text after the sampled rows), so the caller can load it as text instead
+//     (text after the sampled rows), so the caller can load it as text instead;
+//     a guessed free-text column: set to 2 at a value too long for a byte ref
+//     (the caller loads it as a category instead)
 // sc = [delimiter, number of fields]
 // Text columns get chunk-local codes; emit() reports each chunk's dictionary
 // so the caller can renumber them into one shared dictionary.
@@ -227,8 +229,11 @@ export function csvParse(u, A, sc, emit) {
         }
         else if (kind === 1) cols[o][row] = dicts[o].code(s, e, escaped);
         else {
-          if (e - s > STR_MAX_LEN) throw new RangeError(`vectro: a text value in row ${row + 1} is longer than ${STR_MAX_LEN} bytes`);
-          cols[o][row] = s * STR_SHIFT + (e - s) + (escaped ? STR_ESCAPED : 0);
+          if (e - s > STR_MAX_LEN) {
+            if (check[o] !== 1) throw new RangeError(`vectro: a text value in row ${row + 1} is longer than ${STR_MAX_LEN} bytes (load the column as a category)`);
+            check[o] = 2;
+            cols[o][row] = NaN;
+          } else cols[o][row] = s * STR_SHIFT + (e - s) + (escaped ? STR_ESCAPED : 0);
         }
       }
       f++;

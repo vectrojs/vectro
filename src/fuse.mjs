@@ -106,7 +106,7 @@ export function quoteText(v) {
 // Turn an AST back into source (fully parenthesized), e.g. after rewriting it.
 export function toSource(n) {
   switch (n.t) {
-    case 'num': return Number.isNaN(n.v) ? 'NaN' : n.v === Infinity ? 'Infinity' : n.v === -Infinity ? '(-Infinity)' : n.v < 0 ? `(${n.v})` : String(n.v);
+    case 'num': return Number.isNaN(n.v) ? 'NaN' : n.v === Infinity ? 'Infinity' : n.v === -Infinity ? '(-Infinity)' : Object.is(n.v, -0) ? '(-0)' : n.v < 0 ? `(${n.v})` : String(n.v);
     case 'str': return quoteText(n.v);
     case 'var': return n.name;
     case 'un': return `${n.op}(${toSource(n.x)})`;
@@ -382,17 +382,18 @@ export function generate(analysis, t, arrayNames, scalarNames, shared = true, en
   const n = nPtr;
 
   // Values reused across the loop live in locals: constants, scalars, loaded vectors.
-  const consts = new Map();
+  const consts = new Map(); // (keyed so -0 and 0 get their own local: a Map takes them as one key)
   const env = {
     arrays: new Map(arrayNames.map((name, i) => [name, { ptr: i, vec: [], sca: 0, enc: encs[i] ?? null }])),
     scalars: new Map(),
     constVec: (v) => {
-      if (!consts.has(v)) {
+      const key = Object.is(v, -0) ? '-0' : v;
+      if (!consts.has(key)) {
         const l = f.local(V128);
         f.emit(ty.cnst(v), ty.vsplat, set(l));
-        consts.set(v, l);
+        consts.set(key, l);
       }
-      return consts.get(v);
+      return consts.get(key);
     },
   };
   for (const a of env.arrays.values()) {

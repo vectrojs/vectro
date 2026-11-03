@@ -241,7 +241,7 @@ export class DatasetWriter {
         chunk.cols[name] = { min: jsonNumber(min), max: jsonNumber(max), missing };
         if (n > BLOCK) { const z = computeZones(engine.live(c.data), n, BLOCK); chunk.cols[name].blocks = { min: Array.from(z.mins, jsonNumber), max: Array.from(z.maxs, jsonNumber) }; }
       }
-      if (n) ct.compress();
+      if (n && cols.size) ct.compress(); // (no number or category columns: nothing to pack)
       for (const [name, c] of cols) {
         const d = engine.live(c.data);
         const seq = c.enc && !chunk.cols[name].missing ? sequence(d, n) : null;

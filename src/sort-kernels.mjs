@@ -5,7 +5,7 @@
 //
 // Keys become two uint32 words (lo, hi) that sort as unsigned numbers:
 // whole-number keys as their offset from the minimum, others as float bits
-// with the sign flipped (negatives: every bit flipped; NaN last). Digits are
+// with the sign flipped (negatives: every bit flipped; -0 as 0; NaN last). Digits are
 // 11 bits: lo 0-10, 11-21, 22-31, then hi the same.
 
 import { I32, F64, Fn, buildModule, get, set, i32c, block, loop, end, br, brIf, i32add, i32mul, i32and, i32geu } from './wasm.mjs';
@@ -46,7 +46,7 @@ export function prepModule(t, shared) {
   f.emit(get(o), f64c(4294967296), [0xa3], [0x9c], set(hf));                    // hf = floor(o / 2^32)
   f.emit(get(hf), [0xfc, 0x03], set(h), get(o), get(hf), f64c(4294967296), [0xa2], [0xa1], [0xfc, 0x03], set(l));
   f.emit(ELSE);
-  f.emit(get(v), [0xbd], set(b));                                               // b = bits(v)
+  f.emit(get(v), f64c(0), [0xa0], [0xbd], set(b));                             // b = bits(v + 0): -0 as 0, so they tie
   f.emit(get(b), i64c(-1n), [0x85], get(b), i64c(-0x8000000000000000n), [0x84], get(b), i64c(0n), [0x53], SELECT, set(b)); // b < 0 ? ~b : b | sign
   f.emit(get(v), get(v), [0x62], IF, i64c(-1n), set(b), end);                   // NaN: all ones (last)
   f.emit(get(b), i64c(32n), [0x88], [0xa7], set(h), get(b), [0xa7], set(l));
