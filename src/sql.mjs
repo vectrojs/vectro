@@ -410,14 +410,19 @@ function parseStatement(src, fold = false) {
         ctes.push({ name, cols, q });
       } while (eatOp(','));
     }
-    let body = setTerm();
+    // INTERSECT binds tighter than UNION and EXCEPT (standard SQL): a UNION b INTERSECT c is a UNION (b INTERSECT c)
+    const intersectTerm = () => {
+      let t = setTerm();
+      while (eatKw('INTERSECT')) { if (eatKw('ALL')) fail('INTERSECT ALL is not supported (INTERSECT is)'); eatKw('DISTINCT'); t = { k: 'setop', op: 'intersect', left: t, right: setTerm() }; }
+      return t;
+    };
+    let body = intersectTerm();
     for (;;) {
       let op = null;
       if (eatKw('UNION')) op = eatKw('ALL') ? 'union all' : (eatKw('DISTINCT'), 'union');
-      else if (eatKw('INTERSECT')) { if (eatKw('ALL')) fail('INTERSECT ALL is not supported (INTERSECT is)'); eatKw('DISTINCT'); op = 'intersect'; }
       else if (eatKw('EXCEPT')) { if (eatKw('ALL')) fail('EXCEPT ALL is not supported (EXCEPT is)'); eatKw('DISTINCT'); op = 'except'; }
       if (!op) break;
-      body = { k: 'setop', op, left: body, right: setTerm() };
+      body = { k: 'setop', op, left: body, right: intersectTerm() };
     }
     const orderBy = eatKw('ORDER') ? (needKw('BY'), orderItems()) : [];
     let limit = null, offset = 0;
@@ -487,6 +492,7 @@ function has(e, test, intoWindows = false) {
 }
 const hasAgg = (e) => has(e, isAgg);
 const hasWindow = (e) => has(e, (x) => x.k === 'window');
+const hasInterval = (e) => has(e, (x) => x.k === 'interval');
 const colRefs = (e) => { const out = []; has(e, (x) => { if (x.k === 'col') out.push(x); return false; }); return out; };
 const conjuncts = (e) => (!e ? [] : e.k === 'bin' && e.op === 'AND' ? [...conjuncts(e.l), ...conjuncts(e.r)] : [e]);
 const andAll = (list) => (list.length ? list.reduce((a, b) => ({ k: 'bin', op: 'AND', l: a, r: b })) : null);
@@ -586,7 +592,7 @@ function compileQuery(q, env, outer) {
       if (o.e.k === 'num') name = rel.names[o.e.v - 1] ?? fail(`ORDER BY ${o.e.v}: there is no column ${o.e.v}`);
       else if (o.e.k === 'col' && !o.e.table) name = rel.names.find((n) => n.toLowerCase() === o.e.name.toLowerCase() || n === encodeName(o.e.name)) ?? fail(`ORDER BY ${o.e.name}: a UNION is ordered by its columns`);
       else fail('a UNION / INTERSECT / EXCEPT is ordered by its column names or numbers');
-      if (o.nullsFirst) { const h = `__nf${env.n.hidden++}`; out = out.derive(h, `${name} == ${name} ? 1 : 0`); by.push(h); }
+      if (o.nullsFirst) { const h = `__nf${env.n.hidden++}`; out = out.derive(h, rel.kinds.get(name) === 'text' ? `${name} == '' ? 0 : 1` : `${name} == ${name} ? 1 : 0`); by.push(h); }
       by.push(o.desc ? `-${name}` : name);
     }
     out = out.sort(by);
@@ -626,13 +632,17 @@ function compileSet(body, env, outer) {
   const names = L.names;
   const kindsOut = new Map(L.names.map((n, k) => [n, L.kinds.get(n) === 'null' ? R.kinds.get(R.names[k]) : L.kinds.get(n)]));
   const right = Rr.query; // (columns by position; named as the left's)
-  L = Lr.names === L.names ? L : { ...L, query: Lr.query.derive(L.names[Lr.names.findIndex((x, j) => x !== L.names[j])], Lr.names[Lr.names.findIndex((x, j) => x !== L.names[j])]).select(...L.names) };
+  if (Lr.names !== L.names) { // (each NULL column made text: back under its name)
+    let lq = Lr.query;
+    Lr.names.forEach((x, j) => { if (x !== L.names[j]) lq = lq.derive(L.names[j], x); });
+    L = { ...L, query: lq.select(...L.names) };
+  }
   const typeOf = (nm) => { const k = names.indexOf(nm); return merge([L.typeOf?.(nm) ?? 'float', R.typeOf?.(R.names[k]) ?? 'float']); };
   if (body.op === 'union all') return { query: Query.union([L.query, right]), names, kinds: kindsOut, typeOf };
   if (body.op === 'union') return { query: Query.union([L.query, right]).groupBy(names).agg({ __u: 'count()' }).select(...names), names, kinds: kindsOut, typeOf };
   // INTERSECT / EXCEPT: both sides marked, grouped by every column
   const mark = (rel, m) => rel.query.derive('__src', String(m)).select(...rel.names, '__src');
-  const grouped = Query.union([mark(L, 1), mark(R, 2)]).groupBy(names).agg({ __mn: 'min(__src)', __mx: 'max(__src)' });
+  const grouped = Query.union([mark(L, 1), mark(Rr, 2)]).groupBy(names).agg({ __mn: 'min(__src)', __mx: 'max(__src)' });
   const kept = body.op === 'intersect' ? grouped.filter('__mn == 1 && __mx == 2') : grouped.filter('__mx == 1');
   return { query: kept.select(...names), names, kinds: kindsOut, typeOf };
 }
@@ -967,10 +977,13 @@ function compileSelect(ast, env, outer, tail) {
       case 'str': return 'text';
       case 'window': return ctx.windowKind?.(e) ?? 'number';
       case 'cast': return TEXT_TYPES.has(e.type) ? 'text' : DATE_TYPES.has(e.type) ? 'date' : 'number';
+      case 'bin': return (e.op === '+' || e.op === '-') && (kindOf(e.l, ctx) === 'date') !== (kindOf(e.r, ctx) === 'date') ? 'date' : 'number'; // (a date plus or minus days or an interval)
       case 'case': return mostKind([...e.whens.map((w) => kindOf(w.v, ctx)), kindOf(e.otherwise, ctx)]);
       case 'call':
         if (TEXT_FUNCTIONS[e.fn] && !isAgg(e)) return TEXT_FUNCTIONS[e.fn].out === 'text' ? 'text' : 'number';
         if (['COALESCE', 'IFNULL', 'NVL', 'NULLIF'].includes(e.fn)) return mostKind(e.args.map((a) => kindOf(a, ctx)));
+        if (['MIN', 'MAX', 'MEDIAN', 'QUANTILE', 'QUANTILE_CONT', 'QUANTILE_DISC'].includes(e.fn) && e.args[0] && kindOf(e.args[0], ctx) === 'date') return 'date';
+        if ((e.fn === 'PERCENTILE_CONT' || e.fn === 'PERCENTILE_DISC') && e.within && kindOf(e.within.e, ctx) === 'date') return 'date';
         if (e.fn === 'DATE_TRUNC') return 'date';
         if (sessionFn(e)) return sessionFn(e).kind;
         if (extraFn(e)) return extraFn(e).out === 'text' ? 'text' : 'number';
@@ -1016,6 +1029,8 @@ function compileSelect(ast, env, outer, tail) {
       case 'bin':
         if (['AND', 'OR', 'IS', '=', '<>', '!=', '<', '<=', '>', '>=', '~', '~*', '!~', '!~*'].includes(e.op)) return 'bool';
         if (e.op === '/') return 'float';
+        if (kind === 'date') { const [d, x] = kindOf(e.l, ctx) === 'date' ? [e.l, e.r] : [e.r, e.l]; return T(d) === 'day' && !hasInterval(x) && T(x) === 'int' ? 'day' : 'date'; }
+        if ((e.op === '-') && kindOf(e.l, ctx) === 'date' && kindOf(e.r, ctx) === 'date') return isDay(e.l, ctx) && isDay(e.r, ctx) ? 'int' : 'float';
         return merge([T(e.l), T(e.r)]) === 'int' ? 'int' : 'float';
       case 'case': return merge([...e.whens.map((w) => T(w.v)), e.otherwise.k === 'null' ? null : T(e.otherwise)]);
       case 'cast': return TEXT_TYPES.has(e.type) ? 'text' : INT_TYPES.has(e.type) ? 'int' : BOOL_TYPES.has(e.type) ? 'bool' : e.type === 'DATE' ? 'day' : DATE_TYPES.has(e.type) ? 'date' : 'float';
@@ -1033,7 +1048,7 @@ function compileSelect(ast, env, outer, tail) {
           if (e.fn === 'COUNT' || e.fn === 'APPROX_COUNT_DISTINCT') return 'int';
           if (e.fn === 'SUM') return arg && merge([T(arg)]) === 'int' || (arg && T(arg) === 'bool') ? 'int' : 'float';
           if (e.fn === 'MIN' || e.fn === 'MAX') return arg ? T(arg) : 'float';
-          if (e.fn === 'PERCENTILE_DISC' || e.fn === 'QUANTILE_DISC') return T(e.within?.e ?? arg);
+          if (e.fn === 'PERCENTILE_DISC' || e.fn === 'QUANTILE_DISC' || e.fn === 'QUANTILE') return T(e.within?.e ?? arg);
           return kind === 'date' ? 'date' : 'float';
         }
         const sv = sessionFn(e);
@@ -1052,6 +1067,9 @@ function compileSelect(ast, env, outer, tail) {
       default: return kind === 'text' ? 'text' : kind === 'date' ? 'date' : 'float';
     }
   }
+
+  // a date without a time (a DATE): from the column's values, as opts.types has it
+  function isDay(e, ctx) { try { return typeOfExpr(e, ctx) === 'day'; } catch { return false; } }
 
   // ---- text: columns computed once per distinct value (Table._textmap) ------------------
   // a column for an AST (an expression becomes a hidden derived column)
@@ -1094,8 +1112,9 @@ function compileSelect(ast, env, outer, tail) {
     if (LABEL_TESTS[e.fn] && e.args.length === 2 && e.args[0].k === 'col' && e.args[1].k === 'str' && kindOf(e.args[0], ctx) === 'text')
     { const x = translate(e.args[0], ctx); return cond(bin('==', x, { t: 'str', v: '' }), num(NaN), cond(call(LABEL_TESTS[e.fn], x, { t: 'str', v: e.args[1].v }), num(1), num(0))); } // (a column: label by label, in the fused pass; missing stays missing)
     if (e.fn === 'STRFTIME' && e.args.length === 2 && e.args[1].k === 'str') { // times rounded to what the format shows: fewer distinct values to format
-      const f = e.args[1].v.replace(/%%/g, '');
-      const unit = /%[MSfTcXsz]/.test(f) ? null : /%[HIpk]/.test(f) ? 'hourStart' : /%[dejaAwuUWVGgFDx]/.test(f) ? 'dayStart' : /%[mbBh]/.test(f) ? 'monthStart' : /%[Yy]/.test(f) ? 'yearStart' : null;
+      spec.f(0, e.args[1].v); // (a specifier it doesn't know: an error now)
+      const f = e.args[1].v.replace(/%%/g, '').replace(/%-/g, '%');
+      const unit = /%[MSfgTcX]/.test(f) ? null : /%[HIp]/.test(f) ? 'hourStart' : /%[dejaAwuUWVGFx]/.test(f) ? 'dayStart' : /%[mbBh]/.test(f) ? 'monthStart' : /%[Yy]/.test(f) ? 'yearStart' : null;
       if (unit && kindOf(e.args[0], ctx) !== 'text') {
         const t = call(unit, translate(e.args[0], ctx));
         return valueColumn(ctx, [{ col: materialize(t, ctx), kind: 'date' }, { value: e.args[1].v, kind: 'text' }], ([x, fmt]) => spec.f(x, fmt), { label: 'strftime' });
@@ -1136,6 +1155,7 @@ function compileSelect(ast, env, outer, tail) {
   // NOT x with SQL's three values: where x is unknown (a missing value), so is NOT x, and the
   // row is dropped. Comparisons become their opposites (false on missing values already).
   const FLIP = { '=': '<>', '<>': '=', '!=': '=', '<': '>=', '<=': '>', '>': '<=', '>=': '<' };
+  const REGEX_FLIP = { '~': '!~', '!~': '~', '~*': '!~*', '!~*': '~*' };
   function negated(x, ctx) {
     const T = (y) => translate(y, ctx);
     switch (x.k) {
@@ -1144,7 +1164,8 @@ function compileSelect(ast, env, outer, tail) {
         if (x.op === 'AND') return bin('||', negated(x.l, ctx), negated(x.r, ctx));
         if (x.op === 'OR') return bin('&&', negated(x.l, ctx), negated(x.r, ctx));
         if (FLIP[x.op]) return T({ ...x, op: FLIP[x.op] });
-        return { t: 'un', op: '!', x: T(x) }; // (IS, regular expressions: true or false, never unknown)
+        if (REGEX_FLIP[x.op]) return T({ ...x, op: REGEX_FLIP[x.op] }); // (missing text: unknown either way)
+        return { t: 'un', op: '!', x: T(x) }; // (IS: true or false, never unknown)
       case 'between': return T({ k: 'bin', op: 'OR', l: { k: 'bin', op: '<', l: x.x, r: x.lo }, r: { k: 'bin', op: '>', l: x.x, r: x.hi } });
       case 'in':
         if (kindOf(x.x, ctx) === 'text') return bin('&&', { t: 'un', op: '!', x: T(x) }, present(x.x, ctx));
@@ -1212,6 +1233,7 @@ function compileSelect(ast, env, outer, tail) {
             return bin('==', compareValues(op, e, ctx), num(1));
           }
         }
+        if ((op === '+' || op === '-') && (kindOf(e.l, ctx) === 'date' || kindOf(e.r, ctx) === 'date')) return dateArith(e, op, ctx);
         if (op === '!=') return bin('&&', bin('!=', T(e.l), T(e.r)), bin('&&', present(e.l, ctx), present(e.r, ctx))); // (missing on either side: unknown, so not kept)
         if (op === '%') { // SQL: the sign of the dividend (truncate the quotient toward 0)
           const a = T(e.l), b = T(e.r), qt = bin('/', a, b);
@@ -1240,7 +1262,9 @@ function compileSelect(ast, env, outer, tail) {
         if (e.ci) return bin('&&', T({ k: 'like', x: { k: 'call', fn: 'LOWER', args: [e.x] }, pattern: { k: 'str', v: e.pattern.v.toLowerCase() } }), there);
         return bin('&&', call('like', T(e.x), { t: 'str', v: e.pattern.v }), there);
       }
-      case 'isnull': return kindOf(e.x, ctx) === 'text' ? bin('==', T(e.x), { t: 'str', v: '' }) : call('isMissing', T(e.x));
+      case 'isnull':
+        if (e.x.k === 'str') return num(e.x.v === '' ? 1 : 0); // ('' is missing text)
+        return kindOf(e.x, ctx) === 'text' ? bin('==', T(e.x), { t: 'str', v: '' }) : call('isMissing', T(e.x));
       case 'case': {
         if (kindOf(e, ctx) === 'text') { // which branch (a number), then that branch's value as text
           const branches = [...e.whens.map((w) => w.v), e.otherwise];
@@ -1342,6 +1366,22 @@ function compileSelect(ast, env, outer, tail) {
     fail(`can't use ${e.k} here`);
   }
   const src = (a) => toSourceAst(a);
+  // dates and numbers, as DuckDB and PostgreSQL have them: date ± n is n days later or earlier
+  // (an INTERVAL: its milliseconds), a date again; DATE - DATE is a number of days (dates with
+  // a time: the milliseconds between them, an interval)
+  function dateArith(e, op, ctx) {
+    const T = (x) => translate(x, ctx), ld = kindOf(e.l, ctx) === 'date', rd = kindOf(e.r, ctx) === 'date';
+    if (ld && rd) {
+      if (op === '+') fail('a date plus a date has no meaning (add a number of days or an INTERVAL)');
+      const ms = bin('-', T(e.l), T(e.r));
+      return isDay(e.l, ctx) && isDay(e.r, ctx) ? bin('/', ms, num(86_400_000)) : ms;
+    }
+    if (rd && op === '-') fail('a number minus a date has no meaning (write date - number)');
+    const [d, x] = ld ? [e.l, e.r] : [e.r, e.l];
+    const by = hasInterval(x) ? T(x) : bin('*', T(x), num(86_400_000));
+    const t = bin(op, T(d), by);
+    return valueColumn(ctx, [{ col: materialize(t, ctx), kind: 'date' }], ([ms]) => ms, { text: false, date: true, label: 'date' }); // (a date column)
+  }
 
   for (const j of ast.joins) addJoin(j);
 
@@ -1406,7 +1446,7 @@ function compileSelect(ast, env, outer, tail) {
       const c = w.call, fn = WINDOW_FNS[c.fn] ?? (PERCENTILE.has(c.fn) ? null : null);
       if (!fn) fail(`${c.fn}() can't be used with OVER (window functions: ${Object.keys(WINDOW_FNS).join(', ')})`);
       if (c.distinct) fail(`${c.fn}(DISTINCT ...) OVER (...) is not supported`);
-      const partition = w.partition.map(tr), order = w.order.map((o) => ({ ast: tr(o.e), desc: o.desc, nullsFirst: o.nullsFirst }));
+      const partition = w.partition.map(tr), order = w.order.map((o) => ({ ast: tr(o.e), desc: o.desc, nullsFirst: o.nullsFirst, text: o.nullsFirst && kindCtx(o.e) === 'text' }));
       const sk = key({ p: partition, o: order });
       if (!specs.has(sk)) specs.set(sk, { partition, order, items: [] });
       const constArg = (i, what) => { const x = c.args[i]; if (!x) return undefined; const k = constNum(tr(x)); if (k === null) fail(`${c.fn}(): the ${what} must be a number`); return k; };
@@ -1414,8 +1454,13 @@ function compileSelect(ast, env, outer, tail) {
       if (['lag', 'lead'].includes(fn)) { item.arg = tr(c.args[0] ?? fail(`${c.fn}() needs a value`)); item.offset = constArg(1, 'offset') ?? 1; item.def = constArg(2, 'default'); }
       else if (fn === 'ntile') { item.k = constArg(0, 'number of tiles'); if (!(item.k >= 1)) fail('NTILE(n) needs n >= 1'); }
       else if (fn === 'nth_value') { item.arg = tr(c.args[0]); item.k = constArg(1, 'position'); }
-      else if (['first_value', 'last_value', 'sum', 'avg', 'min', 'max'].includes(fn)) item.arg = tr(c.args[0] ?? fail(`${c.fn}() needs a value`));
-      else if (fn === 'count') item.arg = c.star || !c.args.length ? null : tr(c.args[0]);
+      else if (['first_value', 'last_value', 'sum', 'avg', 'min', 'max'].includes(fn)) {
+        if ((fn === 'sum' || fn === 'avg') && kindCtx(c.args[0] ?? fail(`${c.fn}() needs a value`)) === 'text') fail(`${c.fn}() of text is not supported`);
+        item.arg = tr(c.args[0] ?? fail(`${c.fn}() needs a value`));
+      } else if (fn === 'count') { // (text: counts the values there, missing text '' left out)
+        item.arg = c.star || !c.args.length ? null : tr(c.args[0]);
+        if (item.arg && kindCtx(c.args[0]) === 'text') item.arg = cond(bin('&&', bin('!=', item.arg, { t: 'str', v: '' }), bin('==', item.arg, item.arg)), num(1), num(NaN));
+      }
       if (w.frame) {
         const bound = (b) => (b.x === undefined ? { kind: b.kind } : { kind: b.kind, n: (() => { const t = tr(b.x); if (t.t !== 'num' || !(t.v >= 0)) fail('a window frame needs a number of rows (or a distance) like 3 PRECEDING'); return t.v; })() });
         item.frame = { unit: w.frame.unit, start: bound(w.frame.start), end: bound(w.frame.end) };
@@ -1434,7 +1479,7 @@ function compileSelect(ast, env, outer, tail) {
       const order = [];
       for (const o of spec.order) {
         const name = hide(o.ast, '__wo');
-        if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, `${name} == ${name} ? 1 : 0`); order.push({ name: h }); }
+        if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, o.text ? `${name} == '' ? 0 : 1` : `${name} == ${name} ? 1 : 0`); order.push({ name: h }); }
         order.push({ name, desc: o.desc });
       }
       const its = spec.items.map((it) => ({ name: it.name, fn: it.fn, arg: it.arg ? hide(it.arg, '__wa') : null, frame: it.frame, offset: it.offset, def: it.def, k: it.k }));
@@ -1458,7 +1503,7 @@ function compileSelect(ast, env, outer, tail) {
       if (t.t !== 'num' || !(t.v >= 0 && t.v <= 1)) fail(`${e.fn}(x, p): p must be a number from 0 to 1`);
       p = t.v; arg = e.args[0];
     }
-    const disc = e.fn === 'PERCENTILE_DISC' || e.fn === 'QUANTILE_DISC';
+    const disc = e.fn === 'PERCENTILE_DISC' || e.fn === 'QUANTILE_DISC' || e.fn === 'QUANTILE'; // (DuckDB's QUANTILE is QUANTILE_DISC)
     const argName = hide(tr(arg), '__qa');
     const name = `__q${n.hidden++}`;
     q = q.window({ partition: groupKeyNames, order: [{ name: argName }], items: [{ name, fn: disc ? 'percentile_disc' : 'percentile_cont', arg: argName, p }] });
@@ -1499,7 +1544,7 @@ function compileSelect(ast, env, outer, tail) {
         const arg = e.fn === 'MEDIAN' || e.fn.startsWith('QUANTILE') ? e.args[0] : e.within.e;
         if (kindOf(arg, plain) === 'text') { extraKeys.push(qn); aggs.set(k, qn); return v(qn); } // (one value per group: a key, so it stays text)
         spec[name] = `min(${qn})`;
-        return v(name);
+        return kindOf(arg, plain) === 'date' ? asDate(name) : v(name);
       }
       if ((e.fn === 'MIN' || e.fn === 'MAX' || e.fn === 'SUM' || e.fn === 'AVG' || e.fn === 'MEAN') && e.args[0] && kindOf(e.args[0], plain) === 'text') fail(`${e.fn}() of text is not supported yet (COUNT and COUNT(DISTINCT) are)`);
       const fn = e.fn === 'COUNT' && e.star ? 'count' : e.fn === 'COUNT' && e.distinct ? 'countDistinct' : AGG[e.fn];
@@ -1508,8 +1553,11 @@ function compileSelect(ast, env, outer, tail) {
       const arg = e.star ? null : src(translate(e.args[0], plain));
       spec[name] = e.star ? 'count()' : `${fn}(${arg})`;
       if (fn === 'sum') { spec[`${name}_n`] = `count(${arg})`; return cond(bin('>', v(`${name}_n`), num(0)), v(name), num(NaN)); } // (SUM of no values: NULL)
+      if ((fn === 'min' || fn === 'max') && kindOf(e.args[0], plain) === 'date') return asDate(name);
       return v(name);
     };
+    // an aggregate of dates (MIN, MAX, a percentile) as a date column again, after grouping
+    const asDate = (name) => valueColumn(post, [{ col: name, kind: 'date' }], ([x]) => x, { text: false, date: true, label: 'date' });
     // after grouping: aggregates and keys by name; other columns must be keys
     const deferred = []; // columns made from grouped values: after grouping
     const post = windowCtx({
@@ -1549,7 +1597,11 @@ function compileSelect(ast, env, outer, tail) {
   const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, (e) => (e.k === 'col' ? colOf(e) : translate(e, pre))) }));
   for (const o of outs) if (o.ast.t !== 'var') q = q.derive(o.col, src(o.ast));
   for (const o of orderAsts) sortKey(o, orderKind(o, outs, pre));
-  if (ast.distinct) q = q.groupBy([...new Set(outs.map((o) => o.col))]).agg({ __distinct_rows: 'count()' });
+  if (ast.distinct) { // (the sort's own columns, NULLS FIRST marks and such, made from the selected ones: kept as keys too)
+    const cols = new Set(outs.map((o) => o.col));
+    for (const o of orderAsts) if (!(o.ast.t === 'var' && cols.has(o.ast.name)) && !colRefs(o.e).every((ref) => outs.some((x) => (!ref.table && x.name === ref.name) || x.col === resolveSafe(ref)))) fail('SELECT DISTINCT ... ORDER BY: order by the selected columns (or expressions of them)');
+    q = q.groupBy([...new Set([...cols, ...sortKeys.map((k) => k.replace(/^-/, ''))])]).agg({ __distinct_rows: 'count()' });
+  }
   return finish(outs, (o) => (o.e.k === 'col' ? (sessionRef(o.e)?.kind ?? kinds.get(o.e.resolved ? o.e.name : resolve(o.e))) : kindOf(o.e, pre)), pre);
 
   // a text literal as an answer column: a column of that text
