@@ -43,7 +43,6 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
     const a = Buffer.from(given), b = Buffer.from(token);
     return a.length === b.length && timingSafeEqual(a, b);
   };
-  const named = () => catalog.named();
   const describe = (name, { table, source }) => ({ name, rows: table.length, columns: columnsOf(table), ...(table.isDataset ? { on_disk: true } : {}), ...(source === 'given' ? {} : { file: relative(rootPath, source) }) });
 
   async function body(req) {
@@ -98,7 +97,7 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
 
   const json = (res, status, o) => { res.writeHead(status, { 'content-type': FORMATS.json }); res.end(JSON.stringify(o)); };
 
-  async function route(req, res) {
+  async function route(tables, req, res) {
     const url = new URL(req.url, 'http://localhost');
     if (cors) {
       res.setHeader('access-control-allow-origin', '*');
@@ -113,7 +112,7 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
       params.delete('token');
       const host = req.headers['x-forwarded-host'] ?? req.headers.host ?? 'localhost';
       let r;
-      try { r = await odata({ path, params, named: named(), base: `http://${host}/odata`, headers: req.headers, pageSize: odataPage }); } catch (err) {
+      try { r = await odata({ path, params, named: tables, base: `http://${host}/odata`, headers: req.headers, pageSize: odataPage }); } catch (err) {
         if (err instanceof ODataError || /^vectro/.test(err.message)) { res.writeHead(err.status ?? 400, { 'content-type': 'application/json', 'OData-Version': '4.0' }); return res.end(JSON.stringify({ error: { code: String(err.status ?? 400), message: err.message.replace(/^vectro( SQL)?:\s*/, '') } })); }
         throw err;
       }
@@ -125,9 +124,10 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
     const parts = path.split('/').filter(Boolean).map((p) => { try { return decodeURIComponent(p); } catch { throw new HttpError(400, `the path has a malformed %-escape: ${p}`); } });
     if (path === '/sql') {
       if (req.method !== 'GET' && req.method !== 'POST') throw new HttpError(405, 'use GET or POST');
+      // (the tables held when the request came in: a reload while its body arrives doesn't change them)
       const text = await sqlOf(req, url), format = formatOf(url), limit = limitOf(url);
       let q;
-      try { q = sql(text, named()); } catch (err) { throw new HttpError(400, err.message); }
+      try { q = sql(text, tables); } catch (err) { throw new HttpError(400, err.message); }
       if (limit !== null) q = q.limit(limit);
       log(`sql ${text.replace(/\s+/g, ' ').slice(0, 200)}`);
       return answer(res, q, format, {}, 'result');
@@ -155,8 +155,8 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
   }
 
   const server = createServer((req, res) => {
-    const done = catalog.hold(); // (a reload meanwhile frees the tables this request reads only after it)
-    route(req, res).finally(done).catch((err) => {
+    const done = catalog.hold(), tables = catalog.named(); // (a reload meanwhile frees these tables only after this request)
+    route(tables, req, res).finally(done).catch((err) => {
       const status = err.status ?? (err instanceof LoadError || /^vectro/.test(err.message) ? 400 : 500);
       if (status === 500) log(`error: ${err.stack}`);
       if (res.headersSent) { res.destroy(err); return; } // (mid-stream: the client sees a cut answer)

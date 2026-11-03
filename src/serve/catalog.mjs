@@ -118,7 +118,7 @@ function loadJSONLines(engine, bytes, types) {
 
 // The tables a server serves: given in code, or the files in a data folder
 // (reload() reads it again). Shared by the HTTP and PostgreSQL servers.
-//   { engine, entries: Map name -> { table, source, owned }, named(), reload(), hold(), version, close() }
+//   { engine, entries: Map name -> { table, source, owned }, named(), reload(), hold(), whenFree(fn), version, close() }
 // A server calls hold() before it reads the tables and the function it returns
 // once it's done with them: reload() frees the tables it replaces only when
 // every hold taken before it has ended, so queries running meanwhile finish
@@ -130,7 +130,7 @@ export async function openTables({ tables = {}, root = null, engine = null, log 
   for (const [name, table] of Object.entries(tables)) entries.set(name, { table, source: 'given', owned: false });
   const rootPath = root ? realpathSync(resolve(String(root).replace(/^~(?=\/|$)/, process.env.HOME ?? '~'))) : null;
   // holds since the last reload; old: the tables a reload replaced, freed when its holds end
-  let gen = { holds: 0, old: [] }, reloading = Promise.resolve();
+  let gen = { holds: 0, old: [], after: [] }, reloading = Promise.resolve();
   const waiting = new Set(); // earlier ones with holds still running
   const retire = (g) => { for (const t of g.old) release(t); g.old = []; waiting.delete(g); };
   const self = {
@@ -140,7 +140,19 @@ export async function openTables({ tables = {}, root = null, engine = null, log 
       const g = gen;
       g.holds++;
       let done = false;
-      return () => { if (!done && (done = true) && --g.holds === 0 && g !== gen) retire(g); };
+      return () => {
+        if (done || (done = true, --g.holds > 0)) return;
+        for (const fn of g.after.splice(0)) fn();
+        if (g !== gen) retire(g);
+      };
+    },
+    // fn() once every hold taken so far has ended (now, if none is running): for things
+    // queries may still read, such as a server's own tables made from the old ones
+    whenFree(fn) {
+      const busy = [...waiting, gen].filter((g) => g.holds > 0);
+      if (!busy.length) return fn();
+      let left = busy.length;
+      for (const g of busy) g.after.push(() => { if (--left === 0) fn(); });
     },
     reload() { // (one at a time)
       const r = reloading.then(() => readFolder());
@@ -150,6 +162,7 @@ export async function openTables({ tables = {}, root = null, engine = null, log 
     async close() {
       for (const e of entries.values()) if (e.owned) release(e.table);
       entries.clear();
+      for (const g of [...waiting, gen]) for (const fn of g.after.splice(0)) fn();
       for (const g of waiting) retire(g);
       if (own) await engine.close();
     },
@@ -169,7 +182,7 @@ export async function openTables({ tables = {}, root = null, engine = null, log 
     const was = gen;
     for (const [name, e] of entries) if (e.owned) { was.old.push(e.table); entries.delete(name); }
     for (const [name, e] of fresh) entries.set(name, e);
-    gen = { holds: 0, old: [] };
+    gen = { holds: 0, old: [], after: [] };
     if (was.holds === 0) retire(was); else waiting.add(was);
     self.version++;
     return { loaded, failed };

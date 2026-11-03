@@ -37,6 +37,7 @@ import { parse, toSource, isMask } from './fuse.mjs';
 import { KINDS, decodeOne } from './pack.mjs';
 import { conditions, mayMatch, computeZones } from './zones.mjs';
 import { STR_SHIFT, STR_ESCAPED, csvRowEnds } from './csv-kernel.mjs';
+import { trackAsyncMethods } from './engine.mjs';
 import { inspectCSV, loadBytes, loadBytesAsync } from './csv.mjs';
 import { freeBuild } from './join.mjs';
 import { copyRows, plainInto, remapCodes, textLength } from './rows.mjs';
@@ -1781,3 +1782,6 @@ export async function writeDatasetAsync(engine, target, source, opts) {
   }
   return writer.closeAsync();
 }
+
+trackAsyncMethods(Dataset, (d) => d.engine);
+trackAsyncMethods(DatasetWriter, (w) => w.engine);

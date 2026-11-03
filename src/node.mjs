@@ -4,7 +4,7 @@ import { Worker, MessageChannel, receiveMessageOnPort } from 'node:worker_thread
 import { availableParallelism } from 'node:os';
 import { openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { open } from 'node:fs/promises';
-import { Engine as CoreEngine } from './engine.mjs';
+import { Engine as CoreEngine, trackAsyncMethods } from './engine.mjs';
 import { loadBytes, loadBytesAsync } from './csv.mjs';
 import { Dataset, DatasetWriter, writeDataset, csvToDataset, csvToDatasetAsync, openDatasetAsync, writeDatasetAsync, createDatasetAsync, setFiles } from './dataset.mjs';
 import { nodeFiles } from './files-node.mjs';
@@ -118,3 +118,5 @@ export { BatchEncoder, FrameReader, encodeSchema, encodeEnd } from './frames.mjs
 export { readArrow, writeArrow, ArrowReader, ArrowEncoder } from './arrow.mjs';
 export { DistinctSketch } from './sketch.mjs';
 export { sql } from './sql.mjs';
+
+trackAsyncMethods(Engine, (e) => e);

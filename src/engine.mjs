@@ -469,6 +469,18 @@ export class Engine {
     return p;
   }
 
+  // A promise made outside _driveAsync (an async wrapper such as readCSVAsync)
+  // as one close() can mark handled: settles as `inner` does, and until then
+  // is kept with the queries close() stops.
+  _track(inner) {
+    if (!inner || typeof inner.then !== 'function') return inner;
+    let q;
+    q = new Promise((resolve, reject) => inner.then((v) => { this.#running.delete(q); resolve(v); }, (e) => { this.#running.delete(q); reject(e); }));
+    this.#running.add(q);
+    if (this.#closed) q.catch(() => {});
+    return q;
+  }
+
   async #driveSteps(gen) {
     let step = gen.next();
     while (!step.done) {
@@ -790,6 +802,23 @@ export class Engine {
 
 const closedError = () => new Error('vectro: this engine is closed (close() was called); create a new Engine');
 
+// Every ...Async method of `cls` returns a promise the engine (`engineOf(this)`) tracks, so a
+// script that awaits it only after close() gets the rejection instead of a crash (see _track).
+// (also: `extra` names, such as an async dispose)
+export function trackAsyncMethods(cls, engineOf, extra = []) {
+  for (const name of Object.getOwnPropertyNames(cls.prototype)) {
+    const d = Object.getOwnPropertyDescriptor(cls.prototype, name);
+    if (!(name.endsWith('Async') || extra.includes(name)) || typeof d.value !== 'function') continue;
+    const f = d.value;
+    cls.prototype[name] = function (...args) {
+      const engine = engineOf(this);
+      let out;
+      try { out = f.apply(this, args); } catch (err) { if (!engine?._track) throw err; out = Promise.reject(err); }
+      return engine?._track ? engine._track(out) : out;
+    };
+  }
+}
+
 const COMBINE = { sum: (x, y) => x + y, count: (x, y) => x + y, mean: (x, y) => x + y, min: Math.min, max: Math.max };
 const IDENTITY = { sum: 0, count: 0, mean: 0, min: Infinity, max: -Infinity };
 
@@ -912,3 +941,5 @@ function reduce(parts, f, init) {
   for (let i = 0; i < parts.length; i++) r = f(r, parts[i]);
   return r;
 }
+
+trackAsyncMethods(Engine, (e) => e); // (close() and ...Async calls: see _track)

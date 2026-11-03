@@ -6,6 +6,7 @@
 // sum(p ? e : 0). No filtered copy is made unless you ask with collect().
 
 import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
+import { trackAsyncMethods } from './engine.mjs';
 import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
 import { parse, toSource, walk, analyze, isMask, fold, checkSpec } from './fuse.mjs';
 import { generateGroupBy, generateCompact, generateHashGroups, generateMarkPairs, generateStridedKeys } from './table-kernels.mjs';
@@ -2375,3 +2376,5 @@ function select(a, lo, hi, k) {
   }
   return a[k];
 }
+
+trackAsyncMethods(Table, (t) => t.engine);
