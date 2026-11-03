@@ -561,4 +561,10 @@ function describe(node, depth = 0) {
 }
 
 // (a query's engine: the one its scanned table belongs to)
-trackAsyncMethods(Query, (q) => { let n = q.node; while (n && n.op !== 'scan') n = n.input ?? n.left; return n?.table?.engine; });
+trackAsyncMethods(Query, (q) => engineOfNode(q.node));
+function engineOfNode(n) { // (any scan's: UNION / INTERSECT / EXCEPT branches and both sides of a join too)
+  if (!n) return undefined;
+  if (n.op === 'scan') return n.table?.engine;
+  for (const c of [n.input, n.left, n.right, ...(n.inputs ?? [])]) { const e = engineOfNode(c); if (e) return e; }
+  return undefined;
+}
