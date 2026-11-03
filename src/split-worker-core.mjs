@@ -2,7 +2,7 @@
 // and owns slices of tables (no shared memory). The page sends requests
 // { rid, op, args } and gets back { rid, ok, value | error }.
 import { Engine } from './engine.mjs';
-import { Table } from './table.mjs';
+import { Table, disposeView } from './table.mjs';
 import { parse } from './fuse.mjs';
 import { createStreams } from './stream-worker.mjs';
 import { parseKeys } from './sort.mjs';
@@ -15,8 +15,9 @@ export function serveSplitWorker(post, listen) {
   const tables = new Map(); // table id -> Table (this worker's slice)
   const streams = createStreams(() => engine); // live streams (see stream-worker.mjs)
 
+  let views = []; // stream views made for the current message (freed after it, see listen)
   const table = (id) => {
-    const t = tables.get(id) ?? streams.view(id);
+    const t = tables.get(id) ?? (views[views.length] = streams.view(id));
     if (!t) throw new Error(`vectro: no table ${id} in this worker`);
     return t;
   };
@@ -228,7 +229,9 @@ export function serveSplitWorker(post, listen) {
 
   listen(async ({ rid, op, args }) => {
     try {
-      const value = await handlers[op](args);
+      let value;
+      try { value = handlers[op](args); } finally { for (const v of views.splice(0)) if (v) disposeView(v); } // (query handlers are synchronous: these views are this message's)
+      value = await value;
       post({ rid, ok: true, value }, transferList(value));
     } catch (err) {
       post({ rid, ok: false, error: (globalThis.process?.env?.VECTRO_DEBUG ? err?.stack : err?.message) ?? String(err) });

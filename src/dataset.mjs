@@ -1696,15 +1696,21 @@ function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = tru
       pos += want;
       const last = pos >= size;
       let start = 0;
-      if (!kinds && !last && !hasRows(buf, header ? 2 : 1, delimiter)) { carry = buf; continue; } // the first piece needs the header and a row: read on
-      if (!kinds) { // the first piece: column names and types
-        const info = inspectCSV(buf, { delimiter, header, types, sampleRows });
+      // the first piece needs the header and the rows types are guessed from (as readCSV guesses them): read on
+      if (!kinds && !last && !hasRows(buf, (header ? 1 : 0) + (sampleRows ?? 1000), delimiter)) { carry = buf; continue; }
+      if (!kinds) { // the first piece: column names and types, from its complete rows
+        const info = inspectCSV(last ? buf : buf.subarray(0, rowsEnd(buf, 0, delimiter)), { delimiter, header, types, sampleRows, trimEnd: last });
         // (a guessed free-text column in a Float32Array table: a category, as readCSV loads it)
         kinds = Object.fromEntries(info.names.map((n, i) => [n, info.kinds[i] === 'string' && rest.type === Float32Array && !(n in types) ? 'category' : info.kinds[i]]));
         head = header ? buf.slice(0, info.start) : new Uint8Array(0);
         start = info.start;
       }
-      const end = last ? buf.length : rowsEnd(buf, start, delimiter);
+      let end = last ? buf.length : rowsEnd(buf, start, delimiter);
+      if (!last) { // (blank lines at a piece's end may be the file's end, which has no rows: they go with the next piece)
+        let t = end;
+        while (t > start && (buf[t - 1] === 10 || buf[t - 1] === 13)) t--;
+        if (t < end) end = t === start ? start : t + (buf[t] === 13 && buf[t + 1] === 10 ? 2 : 1);
+      }
       if (end > start || (!writer.meta && last)) { // (a header and no rows: still the columns)
         const rows = end > start ? buf.subarray(start, end) : new Uint8Array(0);
         const bytes = engine.alloc(Uint8Array, head.length + rows.length);
