@@ -25,7 +25,7 @@
 //     parts of an expression once per row).
 // explain() prints the optimized plan.
 
-import { parse, toSource, walk, isMask } from './fuse.mjs';
+import { parse, toSource, walk, isMask, checkSpec } from './fuse.mjs';
 import { DATE_RESULT } from './dates.mjs';
 
 export const vars = (ast) => { const out = new Set(); walk(ast, (n) => { if (n.t === 'var') out.add(n.name); }); return out; };
@@ -127,6 +127,7 @@ export class Query {
   // (on a dataset, only the rows asked for are read)
   #limited(limit) { return Number.isFinite(limit) && findDataset(this.node) ? this.limit(limit) : this; }
   #aggNode(spec, params) {
+    checkSpec(spec);
     return new Query({ op: 'total', input: this.node, spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) });
   }
 }
