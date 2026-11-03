@@ -148,6 +148,25 @@ export function csvRowEnds(bytes, from, end, delim, at) {
     st = csvStep(st, c, delim);
   }
 }
+// For text that arrives in pieces cut anywhere (streams): scan [from, end)
+// starting in quote state `state` (CSV_FIELD_START at a row start), by the
+// same rules. -> { last: the byte after the last row end (-1: none), rows:
+// row ends seen, state: the state at `end`, to pass with the next piece }.
+export function csvTail(bytes, from, end, delim, state) {
+  let last = -1, rows = 0;
+  if (state !== 2 && bytes.subarray(from, end).indexOf(QUOTE) === -1) { // no quotes: newlines are row ends
+    rows = countByte(bytes, NL, from, end);
+    if (rows) last = bytes.subarray(from, end).lastIndexOf(NL) + from + 1;
+    if (end > from) state = bytes[end - 1] === NL || bytes[end - 1] === delim ? 0 : 1;
+    return { last, rows, state };
+  }
+  for (let i = from; i < end; i++) {
+    const c = bytes[i];
+    if (c === NL && ROW_END[state]) { state = 0; rows++; last = i + 1; continue; }
+    state = csvStep(state, c, delim);
+  }
+  return { last, rows, state };
+}
 // the state at `end`, starting at a field start at `from`
 function csvEnd(bytes, from, end, delim) {
   let st = 0;

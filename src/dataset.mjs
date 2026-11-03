@@ -99,7 +99,8 @@ export class DatasetWriter {
     this.bitPack = bitPack;
     this.path = typeof path === 'string' ? path : path.name;
     this.rowsPerChunk = Math.max(1, Math.floor(rowsPerChunk));
-    this.pending = null; // rows waiting for a full chunk (a table this writer owns)
+    this.parts = []; // rows waiting for a full chunk (tables this writer owns), copied together once
+    this.pendingRows = 0; // (copying the waiting rows on every append made many small appends quadratic)
     this.meta = null;
     this.labels = new Map(); // category column -> { dict, codes }: one dictionary for the dataset
     this.file = typeof path === 'string' ? need('writing a dataset').openWrite(path, { append }) : path;
@@ -132,17 +133,19 @@ export class DatasetWriter {
       if (t.pred) { t = t.collect(); temps.push(t); }
       this.#schema(t);
       hi = Math.min(hi, t.n);
-      if (this.pending) {
-        const all = copyRows(engine, [[this.pending, 0, this.pending.n], [t, lo, hi]]);
-        this.pending.dispose();
-        this.pending = null;
-        temps.push(all);
-        t = all;
-        lo = 0;
-        hi = all.n;
+      while (this.pendingRows + hi - lo >= this.rowsPerChunk) { // a full chunk: the waiting rows and the first of these
+        const take = this.rowsPerChunk - this.pendingRows;
+        if (!this.parts.length) this.#writeChunk(t, lo, lo + take);
+        else {
+          const all = copyRows(engine, [...this.parts.map((p) => [p, 0, p.n]), [t, lo, lo + take]]);
+          try { this.#writeChunk(all, 0, all.n); } finally { all.dispose(); this.#dropParts(); }
+        }
+        lo += take;
       }
-      for (; hi - lo >= this.rowsPerChunk; lo += this.rowsPerChunk) this.#writeChunk(t, lo, lo + this.rowsPerChunk);
-      if (lo < hi || !this.meta.chunks.length) this.pending = copyRows(engine, [[t, lo, hi]]);
+      if (lo < hi || (!this.meta.chunks.length && !this.parts.length)) {
+        this.parts.push(copyRows(engine, [[t, lo, hi]]));
+        this.pendingRows += hi - lo;
+      }
     } finally {
       for (const x of temps) x.dispose();
     }
@@ -155,7 +158,10 @@ export class DatasetWriter {
     if (this.aborted) throw new Error('vectro: this dataset writer was aborted');
     try {
       if (!this.meta) throw new Error('vectro: append at least one table to a dataset (it can have no rows)');
-      if (this.pending && (this.pending.n || !this.meta.chunks.length)) this.#writeChunk(this.pending, 0, this.pending.n);
+      if (this.parts.length && (this.pendingRows || !this.meta.chunks.length)) {
+        const all = this.parts.length === 1 ? this.parts[0] : copyRows(this.engine, this.parts.map((p) => [p, 0, p.n]));
+        try { this.#writeChunk(all, 0, all.n); } finally { if (all !== this.parts[0]) all.dispose(); }
+      }
       for (const c of this.meta.columns) if (c.kind === 'category') c.dict = this.labels.get(c.name).dict;
       const json = new TextEncoder().encode(JSON.stringify(this.meta));
       const { off } = this.#write(json);
@@ -169,8 +175,7 @@ export class DatasetWriter {
       this.summary = { path: this.path, rows: this.meta.rows, chunks: this.meta.chunks.length, bytes: this.pos };
       return this.summary;
     } finally {
-      this.pending?.dispose();
-      this.pending = null;
+      this.#dropParts();
       this.file.close();
     }
   }
@@ -180,8 +185,7 @@ export class DatasetWriter {
   abort() {
     if (this.summary || this.aborted) return;
     this.aborted = true;
-    this.pending?.dispose();
-    this.pending = null;
+    this.#dropParts();
     if (this.file.abort) this.file.abort(); else this.file.close();
   }
 
@@ -189,6 +193,12 @@ export class DatasetWriter {
   // (browser files write in the background; in Node they already are).
   async appendAsync(source, lo, hi) { this.append(source, lo, hi); await this.file.flush?.(); return this; }
   async closeAsync() { const summary = this.close(); await this.file.done?.(); return summary; }
+
+  #dropParts() {
+    for (const p of this.parts) p.dispose();
+    this.parts = [];
+    this.pendingRows = 0;
+  }
 
   #schema(t) {
     const kindOf = (c) => (c.strings ? 'text' : c.dict ? 'category' : c.date ? 'date' : 'number');
@@ -1685,6 +1695,7 @@ function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = tru
       pos += want;
       const last = pos >= size;
       let start = 0;
+      if (!kinds && !last && !hasRows(buf, header ? 2 : 1, delimiter)) { carry = buf; continue; } // the first piece needs the header and a row: read on
       if (!kinds) { // the first piece: column names and types
         const info = inspectCSV(buf, { delimiter, header, types, sampleRows });
         kinds = Object.fromEntries(info.names.map((n, i) => [n, info.kinds[i]]));
@@ -1700,7 +1711,7 @@ function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = tru
         const t = yield { parse: bytes, opts: { delimiter, header, types: kinds, ...rest, checkTypes: Object.keys(kinds).filter((nm) => !(nm in types)), badType: 'throw' } };
         try { writer.append(t); } finally { t.dispose(); }
         yield { flush: writer };
-        onProgress?.({ bytes: pos, size, rows: writer.meta.rows + (writer.pending?.n ?? 0) });
+        onProgress?.({ bytes: pos, size, rows: writer.meta.rows + writer.pendingRows });
       }
       if (last) break;
       carry = buf.slice(Math.max(start, end));
@@ -1709,6 +1720,13 @@ function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = tru
     writer.abort();
     throw err;
   }
+}
+
+// Whether buf holds at least k complete rows.
+function hasRows(buf, k, delimiter) {
+  let n = 0;
+  csvRowEnds(buf, 0, buf.length, delimiter.charCodeAt(0), () => ++n < k);
+  return n >= k;
 }
 
 // Where the last complete row of buf[start..] ends (quotes may hold newlines;

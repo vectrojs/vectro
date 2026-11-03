@@ -12,6 +12,7 @@ import { FrameReader } from './frames.mjs';
 import { ArrowReader } from './arrow.mjs';
 import { parse, isMask } from './fuse.mjs';
 import { SKETCH_SIZE, sketchAdd, sketchMerge, hashNumber, hashText } from './sketch.mjs';
+import { csvTail, CSV_FIELD_START } from './csv-kernel.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
@@ -23,14 +24,16 @@ const nextTurn = globalThis.setImmediate ?? ((fn) => setTimeout(fn, 0));
 // and push replies wait, until the backlog is down to LOW. TCP then slows the
 // sender, instead of unparsed data piling up in memory.
 const HIGH = 4 << 20, LOW = 1 << 20;
-const NL = 10;
+const NL = 10, COMMA = 44;
 const textEncoder = new TextEncoder();
 const KINDS = { number: 'number', category: 'category', date: 'date' }; // date: ms (ISO text in CSV / JSON lines)
 
 export function createStreams(getEngine) {
   const streams = new Map(); // id -> stream state
 
-  function open({ id, columns, format = 'csv', keepRows = Infinity, keepMs = null, timeColumn = null }) {
+  // share: this worker's share of keepRows, for rows from connections (pushed
+  // rows are kept by their place in push order over the whole stream, see trim).
+  function open({ id, columns, format = 'csv', share = Infinity, keepMs = null, timeColumn = null }) {
     if (!['csv', 'ndjson', 'vectro', 'arrow'].includes(format)) throw new Error(`vectro: stream format must be 'csv', 'ndjson', 'vectro' or 'arrow', got "${format}"`);
     const engine = getEngine();
     const names = Object.keys(columns);
@@ -48,8 +51,9 @@ export function createStreams(getEngine) {
       id, names, format, badLines: 0, windows: new Map(),
       types: columns, header: new TextEncoder().encode(`${names.join(',')}\n`),
       zones: new Map(names.map((name) => [name, { mins: [], maxs: [] }])), // per block of ZONE_ROWS buffer rows
-      cols, cap: 1 << 16, n: 0, start: 0, keepRows, keepMs, timeColumn, maxTime: -Infinity,
-      pending: [], pendingBytes: 0, partial: null, timer: null, scheduled: false, sockets: [], waiters: [], paused: false,
+      cols, cap: 1 << 16, n: 0, start: 0, share, keepMs, timeColumn, maxTime: -Infinity,
+      pos: new Float64Array(1 << 16), cut: -Infinity, newest: -Infinity, connected: false, // see trim
+      pending: [], marks: [], pendingBytes: 0, partial: null, quote: CSV_FIELD_START, timer: null, scheduled: false, sockets: [], waiters: [], paused: false,
       rowsIn: 0, bytesIn: 0, batches: 0, error: null,
     });
     return true;
@@ -67,6 +71,7 @@ export function createStreams(getEngine) {
     if (need <= s.cap) return;
     if (s.start > 0) { // move the kept rows to the front
       for (const c of s.cols.values()) { const d = engine.live(c.data); d.copyWithin(0, s.start, s.n); }
+      s.pos.copyWithin(0, s.start, s.n);
       s.n -= s.start; need -= s.start; s.start = 0;
       for (const z of s.zones.values()) { z.mins.length = 0; z.maxs.length = 0; }
       updateZones(s, 0, s.n); // rows moved: rebuild the zone maps
@@ -81,16 +86,20 @@ export function createStreams(getEngine) {
       engine.free(c.data);
       c.data = bigger;
     }
+    const pos = new Float64Array(cap);
+    pos.set(s.pos.subarray(0, s.n));
+    s.pos = pos;
     s.cap = cap;
   }
 
-  // Parse complete lines (CSV or JSON lines) and append them.
-  function ingest(s, bytes) {
+  // Parse complete lines (CSV or JSON lines) and append them. marks: per
+  // pushed chunk in `bytes`, [place of its first row in push order, rows].
+  function ingest(s, bytes, marks) {
     if (!bytes.length) return;
     if (s.format === 'ndjson') {
       const r = parseNDJSON(bytes, 0, bytes.length, s.names, s.names.map((n) => s.types[n]));
       s.badLines += r.bad;
-      append(s, r.rows, (k) => ({ data: r.cols[k], dict: r.dicts[k] }), bytes.length);
+      append(s, r.rows, (k) => ({ data: r.cols[k], dict: r.dicts[k] }), bytes.length, marks);
       return;
     }
     const engine = getEngine();
@@ -99,7 +108,7 @@ export function createStreams(getEngine) {
     buf.set(bytes, s.header.length);
     const t = engine.parseCSV(buf, { types: s.types, sampleRows: 1, compress: false }); // types are known; a batch is copied in at once
     try {
-      append(s, t.length, (k) => { const f = t.cols.get(s.names[k]); return { data: engine.live(f.data), dict: f.dict }; }, bytes.length);
+      append(s, t.length, (k) => { const f = t.cols.get(s.names[k]); return { data: engine.live(f.data), dict: f.dict }; }, bytes.length, marks);
     } finally {
       t.dispose();
     }
@@ -108,7 +117,7 @@ export function createStreams(getEngine) {
   // Append m parsed rows. part(k) gives column k's values (and, for
   // categories, the batch's own dictionary); it is called after growing,
   // because growing can move engine memory.
-  function append(s, m, part, nbytes) {
+  function append(s, m, part, nbytes, marks = null) {
     const engine = getEngine();
     reserve(s, s.n + m);
     s.names.forEach((name, k) => {
@@ -128,14 +137,40 @@ export function createStreams(getEngine) {
     }
     for (const w of s.windows.values()) updateWindow(s, w, s.n, m);
     updateZones(s, s.n, m);
+    place(s, m, marks);
     s.n += m;
     s.rowsIn += m;
     s.bytesIn += nbytes;
     s.batches++;
-    // what is kept: the last keepRows rows, and rows newer than maxTime - keepMs
-    if (s.n - s.start > s.keepRows) s.start = s.n - s.keepRows;
+    trim(s);
+  }
+
+  // Each new row's place in push order over the whole stream, from the
+  // chunks' marks (Infinity for rows from connections). If the parser made
+  // fewer rows than the page counted (blank or bad lines), the last rows get
+  // the last places.
+  function place(s, m, marks) {
+    const pos = s.pos, from = s.n;
+    let i = from + m;
+    for (let k = (marks?.length ?? 0) - 1; k >= 0 && i > from; k--) {
+      if (!marks[k]) continue;
+      const [p, rows] = marks[k];
+      for (let j = rows - 1; j >= 0 && i > from; j--) pos[--i] = p + j;
+    }
+    const rest = marks?.find(Boolean)?.[0] ?? Infinity;
+    while (i > from) pos[--i] = rest;
+  }
+
+  // What is kept: pushed rows at or after place s.cut (the newest keepRows of
+  // the whole stream; the page sends the cut with pushes and before queries),
+  // this worker's share of keepRows from connections, and rows newer than the
+  // stream's newest time minus keepMs (the newest over all workers, also from
+  // the page, or this worker's own if that is newer).
+  function trim(s) {
+    while (s.start < s.n && s.pos[s.start] < s.cut) s.start++;
+    if (s.connected && s.n - s.start > s.share) s.start = s.n - s.share;
     if (s.keepMs != null) {
-      const ts = engine.live(s.cols.get(s.timeColumn).data), oldest = s.maxTime - s.keepMs;
+      const ts = getEngine().live(s.cols.get(s.timeColumn).data), oldest = Math.max(s.maxTime, s.newest) - s.keepMs;
       while (s.start < s.n && ts[s.start] < oldest) s.start++;
     }
   }
@@ -147,10 +182,10 @@ export function createStreams(getEngine) {
     while (s.pendingBytes && limit > 0) {
       let take = 0, bytes = 0;
       while (take < s.pending.length && (take === 0 || bytes + s.pending[take].length <= Math.min(limit, BATCH_BYTES))) bytes += s.pending[take++].length;
-      const part = s.pending.splice(0, take);
+      const part = s.pending.splice(0, take), marks = s.marks.splice(0, take);
       s.pendingBytes -= bytes;
       limit -= bytes;
-      try { ingest(s, part.length === 1 ? part[0] : concat(part, bytes)); } catch (err) { s.error ??= err.message; }
+      try { ingest(s, part.length === 1 ? part[0] : concat(part, bytes), marks); } catch (err) { s.error ??= err.message; }
     }
     drained(s);
   }
@@ -179,17 +214,21 @@ export function createStreams(getEngine) {
   }
 
   // Queue complete lines; they are parsed in later turns (see nextTurn).
-  function queue(s, lines) {
+  // mark: [place in push order, rows] for pushed chunks (see place).
+  function queue(s, lines, mark = null) {
     if (!lines.length) return;
     s.pending.push(lines);
+    s.marks.push(mark);
     s.pendingBytes += lines.length;
     schedule(s);
     if (s.pendingBytes > HIGH && !s.paused && s.sockets.length) { s.paused = true; for (const socket of s.sockets) socket.pause(); }
   }
 
-  // Bytes cut anywhere: keep what follows the last newline for next time.
+  // Bytes cut anywhere: keep what follows the last row end for next time
+  // (CSV: the last newline outside quotes, with the quote state carried on).
   function receive(s, chunk) {
-    const last = chunk.lastIndexOf(NL);
+    let last = chunk.lastIndexOf(NL);
+    if (s.format === 'csv') { const r = csvTail(chunk, 0, chunk.length, COMMA, s.quote); s.quote = r.state; last = r.last === -1 ? -1 : r.last - 1; }
     if (last === -1) { s.partial = s.partial ? concat([s.partial, chunk]) : Uint8Array.from(chunk); return; }
     let lines = chunk.subarray(0, last + 1);
     if (s.partial) { lines = concat([s.partial, lines]); s.partial = null; }
@@ -406,10 +445,12 @@ export function createStreams(getEngine) {
     streamWindowClose({ id, wid }) { return get(id).windows.delete(wid); },
     // Complete lines from the page (it cuts at newlines before routing).
     // The reply waits while the backlog is high, so the page slows down too.
-    streamPush({ id, bytes }) {
+    // pos, rows, cut: see place and trim.
+    streamPush({ id, bytes, pos = 0, rows = 0, cut = -Infinity }) {
       const s = get(id);
       if (s.format === 'vectro' || s.format === 'arrow') throw new Error("vectro: binary streams take frames over connections: connect each worker to the sender (push() is for 'csv' and 'ndjson')");
-      queue(s, bytes);
+      if (cut > s.cut) s.cut = cut;
+      queue(s, bytes, [pos, rows]);
       return s.pendingBytes > HIGH ? new Promise((resolve) => s.waiters.push(resolve)) : true;
     },
     // This worker reads its own connection; nothing passes through the page.
@@ -417,13 +458,14 @@ export function createStreams(getEngine) {
     // whole lines. host + port: raw TCP (Node only), cut anywhere.
     async streamConnect({ id, url, host = '127.0.0.1', port }) {
       const s = get(id);
+      s.connected = true;
       if (url) return connectWebSocket(s, url);
       const net = await import('node:net');
       return new Promise((resolve, reject) => {
         const socket = net.connect({ host, port }, () => resolve(true));
         if (s.format === 'vectro' || s.format === 'arrow') { const reader = frameReceiver(s); socket.on('data', (chunk) => receiveFrames(s, reader, chunk)); } else
         socket.on('data', (chunk) => receive(s, chunk));
-        socket.on('end', () => { if (s.partial) { queue(s, concat([s.partial, Uint8Array.of(NL)])); s.partial = null; } flush(s); });
+        socket.on('end', () => { if (s.partial) { queue(s, concat([s.partial, Uint8Array.of(NL)])); s.partial = null; s.quote = CSV_FIELD_START; } flush(s); });
         socket.on('error', (err) => { s.error ??= err.message; reject(err); });
         s.sockets.push(socket);
       });
@@ -435,6 +477,15 @@ export function createStreams(getEngine) {
       return stats(s);
     },
     streamStats({ id }) { return stats(get(id)); },
+    // What the whole stream keeps, from the page (see trim): the keepRows cut
+    // and the newest time over all workers.
+    streamKeep({ id, cut, newest }) {
+      const s = get(id);
+      if (cut > s.cut) s.cut = cut;
+      if (newest > s.newest) s.newest = newest;
+      trim(s);
+      return true;
+    },
     // A copy of the rows kept right now, as a normal table `newId`.
     streamSnapshot({ id, newId, tables }) {
       const engine = getEngine(), s = get(id);
@@ -515,7 +566,7 @@ export function createStreams(getEngine) {
     });
   }
 
-  const stats = (s) => ({ rows: s.n - s.start, rowsIn: s.rowsIn, badLines: s.badLines, bytesIn: s.bytesIn, batches: s.batches, unparsedBytes: s.pendingBytes + (s.partial?.length ?? 0), error: s.error });
+  const stats = (s) => ({ rows: s.n - s.start, rowsIn: s.rowsIn, badLines: s.badLines, bytesIn: s.bytesIn, batches: s.batches, unparsedBytes: s.pendingBytes + (s.partial?.length ?? 0), error: s.error, maxTime: s.maxTime });
 
   return {
     handlers,
