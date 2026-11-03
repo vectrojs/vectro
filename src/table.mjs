@@ -164,15 +164,18 @@ export class Table {
     walk(ast, (m) => {
       if (m.t !== 'var' || !m.lut) return;
       const c = this.cols.get(m.lut.column);
-      if (!MASKS.has(c.data)) MASKS.set(c.data, new Map());
-      const masks = MASKS.get(c.data);
+      // (data that is a slice of another array, such as a stream's rows in a query's view, isn't
+      // cached by it: the array belongs to the view and its filters, freed by disposeView)
+      const own = !this.engine.allocInfo?.has(c.data);
+      if (!own && !MASKS.has(c.data)) MASKS.set(c.data, new Map());
+      const masks = own ? new Map([[m.name, this.cols.get(m.name)?.data]].filter(([, a]) => a)) : MASKS.get(c.data);
       let mask = masks.get(m.name);
       if (!mask || mask.length < this.n) {
         mask = this.engine.alloc(this.type === Float32Array ? Float32Array : Float64Array, this.n);
         const codes = this.engine.live(c.data), { match, values } = m.lut, f32 = this.type === Float32Array;
         if (values) for (let i = 0; i < this.n; i++) mask[i] = values[c.enc ? decodeOne(c.enc, codes[i], f32) : codes[i]]; // (a text column's codes in another one's dictionary)
         else for (let i = 0; i < this.n; i++) mask[i] = match[c.enc ? decodeOne(c.enc, codes[i], f32) : codes[i]] ? 1 : 0;
-        masks.set(m.name, mask);
+        if (own) { if (!VIEW_MASKS.has(this.cols)) VIEW_MASKS.set(this.cols, []); VIEW_MASKS.get(this.cols).push(mask); } else masks.set(m.name, mask);
       }
       if (this.cols.get(m.name)?.data !== mask) this.cols.set(m.name, { data: mask, dict: null, codes: null, hidden: true }); // (views sharing these columns have the same rows)
     });
@@ -1951,6 +1954,13 @@ export class Table {
   }
 }
 
+// A view over slices (a stream's rows for one query): free the filter masks made for it and
+// for its filters, which share its column map.
+export function disposeView(t) {
+  for (const m of VIEW_MASKS.get(t.cols) ?? []) t.engine.free(m);
+  VIEW_MASKS.delete(t.cols);
+}
+
 // ---- helpers ---------------------------------------------------------------------
 
 // A column as a hidden one (select's: a column only the filter reads). It reads and writes the
@@ -2110,6 +2120,7 @@ const lowerAll = (s) => s.replace(/[\u0130\u03a3]/g, (c) => (c === '\u0130' ? 'i
 const MAX_RANGES = 256;
 const LUT_NAMES = new Map(); // column|function|args -> the name of its per-row 0 / 1 array
 const MASKS = new WeakMap(); // a column's data array -> those arrays made for it (freed with it)
+const VIEW_MASKS = new WeakMap(); // a view's column map -> masks for data it doesn't own (see disposeView)
 
 // startsWith(region, 'E') -> (region >= 0 && region <= 1) || region == 5
 function textCall(n, cols, src) {
