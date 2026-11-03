@@ -80,32 +80,29 @@ for (const workers of [1, 3, 8]) {
     for (const t of [snap, d, eu, s]) await t.dispose();
   }
 
-  // keepRows: each worker keeps its newest rows
+  // keepRows: the newest rows of the whole stream (push() deals whole chunks
+  // round-robin, but keepRows counts rows over all workers)
   {
     const s = await split.streamAsync({ columns: COLUMNS, keepRows: 9_000 });
     const rs = rows(50_000);
-    const perWorker = Math.ceil(9_000 / workers);
     const chunks = [];
     for (let i = 0; i < rs.length; i += 1000) chunks.push(rs.slice(i, i + 1000));
-    const byWorker = Array.from({ length: workers }, () => []);
-    chunks.forEach((c, k) => byWorker[k % workers].push(...c)); // push() deals whole chunks round-robin
     for (const c of chunks) await s.push(csv(c));
     await s.flushAsync();
-    await compare(`w=${workers} keepRows`, s, byWorker.flatMap((list) => list.slice(-perWorker)));
+    await compare(`w=${workers} keepRows`, s, rs.slice(-9_000));
     await s.dispose();
   }
 
-  // keepMs: rows newer than (newest time - keepMs), per worker
+  // keepMs: rows newer than (the stream's newest time - keepMs)
   {
     const s = await split.streamAsync({ columns: COLUMNS, keepMs: 2_000, timeColumn: 'ts' });
     const rs = rows(30_000);
     const chunks = [];
     for (let i = 0; i < rs.length; i += 700) chunks.push(rs.slice(i, i + 700));
-    const byWorker = Array.from({ length: workers }, () => []);
-    chunks.forEach((c, k) => byWorker[k % workers].push(...c));
     for (const c of chunks) await s.push(csv(c));
     await s.flushAsync();
-    const kept = byWorker.flatMap((list) => { const newest = Math.max(...list.map((r) => r.ts)); return list.filter((r) => r.ts >= newest - 2_000); });
+    const newest = Math.max(...rs.map((r) => r.ts));
+    const kept = rs.filter((r) => r.ts >= newest - 2_000);
     await compare(`w=${workers} keepMs`, s, kept);
     await s.dispose();
   }

@@ -17,8 +17,8 @@
 // The page remembers rows per block ("segments") to put rows back in order.
 import { Engine as LocalEngine } from './engine.mjs';
 import { inspectCSV } from './csv.mjs';
-import { encode } from './bytes.mjs';
-import { csvRowEnds } from './csv-kernel.mjs';
+import { encode, countByte } from './bytes.mjs';
+import { csvRowEnds, csvTail, CSV_FIELD_START } from './csv-kernel.mjs';
 import { parse, toSource } from './fuse.mjs';
 import { mergeHits } from './vectors.mjs';
 import { isCoded } from './table.mjs';
@@ -26,7 +26,7 @@ import { readArrow, writeArrow } from './arrow.mjs';
 import { SKETCH_SIZE, sketchMerge, sketchEstimate } from './sketch.mjs';
 import { toMillis } from './dates.mjs';
 
-const NL = 10, QUOTE = 34;
+const NL = 10, QUOTE = 34, COMMA = 44;
 const BLOCK_ROWS = 4096; // rows per block when dealing out arrays
 const CSV_PIECE_BYTES = 64 * 1024, MAX_CSV_PIECES_PER_WORKER = 64;
 const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count', 'countDistinct', 'approxDistinct']);
@@ -43,6 +43,7 @@ export class SplitEngine {
     this.rid = 0;
     this.nextTable = 0;
     this.localEngine = null;
+    this.keepers = new Map(); // stream id -> StreamTable, for streams with keepRows / keepMs
     for (let i = 0; i < this.size; i++) {
       const w = spawn();
       w.onMessage((m) => {
@@ -66,6 +67,14 @@ export class SplitEngine {
   }
 
   _call(i, op, args, transfer = []) {
+    // a query on a stream with keepRows / keepMs first tells every worker
+    // what the whole stream keeps (see StreamTable.keep)
+    const stream = this.keepers.size && !op.startsWith('stream') ? this.keepers.get(args?.id) : null;
+    if (stream) return stream.keep().then(() => this.#post(i, op, args, transfer));
+    return this.#post(i, op, args, transfer);
+  }
+
+  #post(i, op, args, transfer) {
     if (this.failed[i]) return Promise.reject(this.failed[i]);
     const rid = ++this.rid;
     return new Promise((resolve, reject) => {
@@ -224,15 +233,20 @@ export class SplitEngine {
   // columns: { name: 'number' | 'category' }. keepRows: rows kept in total (the oldest are
   // dropped); keepMs + timeColumn: keep rows newer than the newest time minus
   // keepMs. Feed it with push() from here, or connect() each worker to its own
-  // TCP stream (Node), so the data never passes through this thread.
+  // TCP stream (Node), so the data never passes through this thread. Rows from
+  // connections have no order across workers: there each worker keeps its
+  // share of keepRows (keepRows / workers).
   async streamAsync({ columns, format = 'csv', keepRows = Infinity, keepMs = null, timeColumn = null } = {}) {
     await this.ready;
     if (!columns || !Object.keys(columns).length) throw new Error('vectro: streamAsync needs columns, e.g. { ts: "number", region: "category" }');
     const id = ++this.nextTable;
-    const perWorker = Number.isFinite(keepRows) ? Math.ceil(keepRows / this.size) : Infinity;
-    await Promise.all(this.workers.map((_, w) => this._call(w, 'streamOpen', { id, columns, format, keepRows: perWorker, keepMs, timeColumn })));
+    const share = Number.isFinite(keepRows) ? Math.ceil(keepRows / this.size) : Infinity;
+    await Promise.all(this.workers.map((_, w) => this._call(w, 'streamOpen', { id, columns, format, share, keepMs, timeColumn })));
     const t = new StreamTable(this, id, Object.keys(columns), [], {}, true, Object.keys(columns).filter((n) => columns[n] === 'date'));
     t.format = format;
+    t.keepRows = keepRows;
+    t.keepMs = keepMs;
+    if (Number.isFinite(keepRows) || keepMs != null) this.keepers.set(id, t);
     return t;
   }
 
@@ -583,7 +597,13 @@ export class StreamTable extends SplitTable {
   constructor(engine, id, names, preds = [], params = {}, owned = true, dates = []) {
     super(engine, id, engine.workers.map(() => Float64Array.of(Infinity)), { names, dicts: {}, strings: new Set(), dates }, preds, params, owned);
     this.partial = null;
+    this.quote = CSV_FIELD_START; // CSV: the quote state at the end of `partial`
     this.next = 0; // worker for the next pushed chunk
+    this.pushed = 0; // rows pushed so far (each row's place in push order, for keepRows)
+    this.keepRows = Infinity;
+    this.keepMs = null;
+    this.sent = null; // the keepRows cut the workers were last told about
+    this.keeping = null;
   }
 
   get length() { return NaN; } // changes all the time: use countAsync()
@@ -601,16 +621,53 @@ export class StreamTable extends SplitTable {
 
   // Bytes of CSV lines (no header), cut anywhere. Whole lines go to the
   // workers in turn; the promise resolves once the worker has queued them.
+  // A CSV row ends at a newline outside quotes (a quoted field can hold
+  // newlines), by the parser's quote rules; the quote state at the end of the
+  // unfinished row is kept for the next chunk.
   push(chunk) {
     if (this.format === 'vectro' || this.format === 'arrow') return Promise.reject(new Error("vectro: binary streams take frames over connections: connect each worker to the sender (push() is for 'csv' and 'ndjson')"));
     const bytes = typeof chunk === 'string' ? encode(chunk) : chunk;
-    const last = bytes.lastIndexOf(NL);
+    let last, rows = 0; // last: the last row's newline
+    if (this.format === 'csv') {
+      const r = csvTail(bytes, 0, bytes.length, COMMA, this.quote);
+      this.quote = r.state;
+      last = r.last === -1 ? -1 : r.last - 1;
+      rows = r.rows;
+    } else {
+      last = bytes.lastIndexOf(NL);
+      if (Number.isFinite(this.keepRows) && last !== -1) rows = countByte(bytes, NL, 0, last + 1);
+    }
     if (last === -1) { this.partial = this.partial ? join(this.partial, bytes) : Uint8Array.prototype.slice.call(bytes); return Promise.resolve(); }
     const lines = this.partial ? join(this.partial, bytes.subarray(0, last + 1)) : Uint8Array.prototype.slice.call(bytes, 0, last + 1);
     this.partial = last + 1 < bytes.length ? Uint8Array.prototype.slice.call(bytes, last + 1) : null;
     const w = this.next;
     this.next = (this.next + 1) % this.counts.length;
-    return this.engine._call(w, 'streamPush', { id: this.id, bytes: lines }, [lines.buffer]);
+    // pos: the place of the chunk's first row in push order; cut: rows placed
+    // before it are no longer kept (keepRows counts rows over the whole stream)
+    const pos = this.pushed;
+    this.pushed += rows;
+    return this.engine._call(w, 'streamPush', { id: this.id, bytes: lines, pos, rows, cut: this.pushed - this.keepRows }, [lines.buffer]);
+  }
+
+  // Each worker sees only its own rows, so before a query (and in flushAsync)
+  // the page tells all of them what the whole stream keeps: keepRows, the
+  // place in push order rows must be at or after; keepMs, the newest time
+  // over all workers (each worker drops rows older than that minus keepMs).
+  // Calls made while one is under way share it.
+  keep() {
+    if (this.engine.keepers.get(this.id) !== this) return this.engine.keepers.get(this.id)?.keep() ?? Promise.resolve(); // (a filtered view)
+    return (this.keeping ??= this.#keep().finally(() => { this.keeping = null; }));
+  }
+
+  async #keep() {
+    const { engine, id } = this, cut = this.pushed - this.keepRows;
+    let newest = -Infinity;
+    if (this.keepMs != null) {
+      const stats = await Promise.all(this.counts.map((_, w) => engine._call(w, 'streamStats', { id })));
+      newest = Math.max(-Infinity, ...stats.map((s) => s.maxTime));
+    } else if (this.sent === cut) return;
+    this.sent = cut;
+    await Promise.all(this.counts.map((_, w) => engine._call(w, 'streamKeep', { id, cut, newest })));
   }
 
   // Worker `worker` opens its own connection and reads lines from it:
@@ -621,12 +678,15 @@ export class StreamTable extends SplitTable {
   }
 
   // Parse whatever every worker has received; returns totals.
+  // (A CSV row still inside quotes waits for the rest of its field.)
   async flushAsync() {
-    if (this.partial) { const p = join(this.partial, Uint8Array.of(NL)); this.partial = null; await this.push(p); }
-    return total(await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamFlush', { id: this.id }))));
+    if (this.partial && this.quote !== 2) await this.push(Uint8Array.of(NL)); // ends the last row
+    const list = await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamFlush', { id: this.id })));
+    return this.engine.keepers.has(this.id) ? this.statsAsync() : total(list);
   }
 
   async statsAsync() {
+    await this.keep();
     return total(await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamStats', { id: this.id }))));
   }
 
@@ -634,12 +694,18 @@ export class StreamTable extends SplitTable {
   // as a normal split table.
   async snapshotAsync() {
     if (this.preds.length) return super.collectAsync();
+    await this.keep();
     const newId = ++this.engine.nextTable;
     const counts = await Promise.all(this.counts.map((_, w) => this.engine._call(w, 'streamSnapshot', { id: this.id, newId })));
     return new SplitTable(this.engine, newId, counts.map((n) => Float64Array.of(n)), this.meta, [], {}, true);
   }
 
   async collectAsync() { return this.snapshotAsync(); }
+
+  async dispose() {
+    if (this.owned) this.engine.keepers.delete(this.id);
+    return super.dispose();
+  }
 
   async toColumnsAsync() {
     const snap = await this.snapshotAsync();
