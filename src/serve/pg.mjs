@@ -82,12 +82,17 @@ export async function servePg({ tables = {}, root = null, engine = null, catalog
   let nextPid = 1000;
 
   // catalog tables per database name and user, made again when the served
-  // tables change (the old ones are kept: a query may still be reading them)
+  // tables change (the old ones are freed once the queries running now are done)
   const builtFor = new Map();
-  let builtVersion = null, old = [];
+  let builtVersion = null;
+  const disposeBuilt = (list) => { for (const b of list) for (const t of Object.values(b.tables)) t.dispose(); };
   const catalogFor = (db, who) => {
     const version = `${catalog.version}|${[...catalog.entries.keys()].join(',')}`;
-    if (version !== builtVersion) { for (const b of builtFor.values()) old.push(b); builtFor.clear(); builtVersion = version; }
+    if (version !== builtVersion) {
+      const old = [...builtFor.values()];
+      builtFor.clear(); builtVersion = version;
+      if (old.length) catalog.whenFree(() => disposeBuilt(old));
+    }
     const key = `${db}|${who}`;
     let b = builtFor.get(key);
     if (!b) {
@@ -97,7 +102,7 @@ export async function servePg({ tables = {}, root = null, engine = null, catalog
     }
     return b;
   };
-  const disposeCatalogs = () => { for (const b of [...builtFor.values(), ...old]) for (const t of Object.values(b.tables)) t.dispose(); builtFor.clear(); old = []; };
+  const disposeCatalogs = () => { disposeBuilt(builtFor.values()); builtFor.clear(); };
 
   const server = createServer((socket) => {
     const s = new Session(socket);

@@ -338,6 +338,56 @@ const dir = mkdtempSync(join(tmpdir(), 'vectro-audit-server-'));
   await new Promise((done) => server.on('close', done));
 }
 
+// round 3: close() during async wrappers and split calls never crashes the process (strict unhandled rejections)
+{
+  const node = JSON.stringify(pathToFileURL(fileURLToPath(new URL('../src/node.mjs', import.meta.url))).href);
+  const src = `
+    import { Engine, SplitEngine, sql } from ${node};
+    import { writeFileSync } from 'node:fs';
+    const csv = ${JSON.stringify(join(dir, 'r3.csv'))};
+    writeFileSync(csv, 'k,v\\n' + Array.from({ length: 200_000 }, (_, i) => i + ',' + i).join('\\n') + '\\n');
+    const out = [];
+    for (const op of ['readCSVAsync', 'parseCSVAsync', 'sqlAsync', 'countAsync']) {
+      const e = new Engine(), t = e.table({ g: Float64Array.from({ length: 300_000 }, (_, i) => i % 7) });
+      const p = op === 'readCSVAsync' ? e.readCSVAsync(csv) : op === 'parseCSVAsync' ? e.parseCSVAsync('a,b\\n' + '1,2\\n'.repeat(200_000))
+        : op === 'sqlAsync' ? sql('SELECT g, COUNT(*) AS n FROM t GROUP BY g', { t }).toRowsAsync() : t.lazy().countAsync();
+      await e.close();
+      out.push(await p.then(() => 'resolved', (err) => /this engine is closed/.test(err.message) ? 'closed' : err.message));
+    }
+    const s = new SplitEngine({ workers: 2 }); const st = await s.tableAsync({ a: [1, 2, 3] });
+    st.dispose(); await s.close(); out.push('split ok');
+    console.log(JSON.stringify(out));`;
+  writeFileSync(join(dir, 'close-r3.mjs'), src);
+  const r = await run(process.execPath, ['--unhandled-rejections=strict', join(dir, 'close-r3.mjs')], { timeout: 120_000 });
+  let out = null;
+  try { out = JSON.parse(r.stdout.trim().split('\n').pop()); } catch { /* reported below */ }
+  check(r.code === 0 && out?.length === 5 && out.slice(0, 4).every((x) => x === 'closed' || x === 'resolved'), `close() during async calls, strict: code ${r.code} ${JSON.stringify(out)} ${r.stderr.slice(0, 300)}`);
+}
+
+// round 3: whenFree runs once the holds taken before it end; keepMs right after a push never shows more than the window
+{
+  const cat = await openTables({ tables: { t: new Engine().table({ a: [1] }) } });
+  const release = cat.hold();
+  let ran = 0;
+  cat.whenFree(() => ran++);
+  check(ran === 0, 'whenFree waits for a running hold');
+  release();
+  check(ran === 1, 'whenFree runs when that hold ends');
+  cat.whenFree(() => ran++);
+  check(ran === 2, 'whenFree with no hold runs at once');
+  await cat.engine.close();
+  const s = new SplitEngine({ workers: 3 });
+  const st = await s.streamAsync({ format: 'csv', columns: { ts: 'number', v: 'number' }, keepMs: 100, timeColumn: 'ts' });
+  let worst = 0;
+  for (let k = 0; k < 20; k++) {
+    await st.push(Array.from({ length: 50 }, (_, i) => `${k * 50 + i},1`).join('\n') + '\n');
+    const n = (await st.aggAsync({ n: 'count()' })).n;
+    worst = Math.max(worst, n); // (the window over what was pushed: ts within 100 of the newest)
+  }
+  check(worst <= 101, `keepMs before a flush never keeps more than the window: up to ${worst} rows`);
+  await s.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} server and engine-life checks passed`);
 process.exit(failures ? 1 : 0);

@@ -27,6 +27,7 @@
 
 import { parse, toSource, walk, isMask, checkSpec } from './fuse.mjs';
 import { DATE_RESULT } from './dates.mjs';
+import { trackAsyncMethods } from './engine.mjs';
 
 export const vars = (ast) => { const out = new Set(); walk(ast, (n) => { if (n.t === 'var') out.add(n.name); }); return out; };
 const and = (a, b) => (a ? { t: 'bin', op: '&&', l: a, r: b } : b);
@@ -558,3 +559,6 @@ function describe(node, depth = 0) {
   }
   return `${pad}${node.op}`;
 }
+
+// (a query's engine: the one its scanned table belongs to)
+trackAsyncMethods(Query, (q) => { let n = q.node; while (n && n.op !== 'scan') n = n.input ?? n.left; return n?.table?.engine; });

@@ -15,7 +15,7 @@
 // in a few blocks on every worker instead of all in the last worker, so the
 // filtered table that collect() makes is still spread over every worker.
 // The page remembers rows per block ("segments") to put rows back in order.
-import { Engine as LocalEngine } from './engine.mjs';
+import { Engine as LocalEngine, trackAsyncMethods } from './engine.mjs';
 import { inspectCSV } from './csv.mjs';
 import { encode, countByte } from './bytes.mjs';
 import { csvRowEnds, csvTail, CSV_FIELD_START } from './csv-kernel.mjs';
@@ -257,9 +257,21 @@ export class SplitEngine {
   }
 
   // Calls still waiting reject with "this engine is closed", as does every later call.
+  // a promise of this engine's that close() can mark handled (see Engine _track)
+  _track(inner) {
+    if (!inner || typeof inner.then !== 'function') return inner;
+    this.running ??= new Set();
+    let q;
+    q = new Promise((resolve, reject) => inner.then((v) => { this.running.delete(q); resolve(v); }, (e) => { this.running.delete(q); reject(e); }));
+    this.running.add(q);
+    if (this.closed) q.catch(() => {});
+    return q;
+  }
+
   async close() {
     this.closed = true;
     this.ready.catch(() => {}); // (closed before it was ready: nobody may be waiting)
+    for (const q of this.running ?? []) q.catch(() => {}); // (a call close() stops: no crash for a script that awaits it later, or never)
     for (const w of this.workers) w.terminate();
     this.workers = [];
     for (const p of this.pending.values()) p.reject(closedError());
@@ -673,8 +685,8 @@ export class StreamTable extends SplitTable {
   async #keep() {
     const { engine, id } = this, cut = this.pushed - this.keepRows;
     let newest = -Infinity;
-    if (this.keepMs != null) {
-      const stats = await Promise.all(this.counts.map((_, w) => engine._call(w, 'streamStats', { id })));
+    if (this.keepMs != null) { // (rows received are parsed first: the newest time is then exact, so no query sees rows outside the window)
+      const stats = await Promise.all(this.counts.map((_, w) => engine._call(w, 'streamFlush', { id })));
       newest = Math.max(-Infinity, ...stats.map((s) => s.maxTime));
     } else if (this.sent === cut) return;
     this.sent = cut;
@@ -815,3 +827,8 @@ function total(list) {
   for (const s of list) for (const k of ['rows', 'rowsIn', 'badLines', 'bytesIn', 'batches', 'unparsedBytes']) out[k] += s[k];
   return out;
 }
+
+// (close() while calls are pending: see SplitEngine _track)
+trackAsyncMethods(SplitEngine, (e) => e);
+trackAsyncMethods(SplitTable, (t) => t.engine, ['dispose']);
+trackAsyncMethods(StreamTable, (t) => t.engine, ['dispose', 'push']);

@@ -11,7 +11,7 @@
 //   const engine = new Engine();
 //   const orders = await engine.loadCSV('/orders.csv');
 //   await orders.filter("region == 'EU'").sumAsync('price * qty');
-import { Engine as CoreEngine } from './engine.mjs';
+import { Engine as CoreEngine, trackAsyncMethods } from './engine.mjs';
 import { openDatasetAsync, writeDatasetAsync, csvToDatasetAsync, createDatasetAsync } from './dataset.mjs';
 import { writableFile, storedFiles, storedFile, removeStored, storageAvailable, opfsTemp } from './files-browser.mjs';
 import { setTempStorage } from './dataset.mjs';
@@ -127,3 +127,5 @@ export { DistinctSketch } from './sketch.mjs';
 export { sql } from './sql.mjs';
 export { Dataset, openDatasetAsync, blobFile, urlFile, writeDatasetAsync, csvToDatasetAsync, createDatasetAsync } from './dataset.mjs';
 export { memoryFile, writableFile, storageAvailable } from './files-browser.mjs';
+
+trackAsyncMethods(Engine, (e) => e);
