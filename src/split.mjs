@@ -206,7 +206,8 @@ export class SplitEngine {
     await this.ready;
     const bytes = typeof text === 'string' ? encode(text) : text;
     const info = inspectCSV(bytes, opts);
-    const types = Object.fromEntries(info.names.map((nm, f) => [nm, info.kinds[f]]));
+    const f32 = opts.type === Float32Array; // (a guessed free-text column: a category there, as readCSV loads it)
+    const types = Object.fromEntries(info.names.map((nm, f) => [nm, f32 && info.kinds[f] === 'string' ? 'category' : info.kinds[f]]));
     const head = bytes.subarray(info.headerStart, info.start);
     // Small pieces, dealt round-robin like array blocks. Each worker gets the
     // header plus its pieces back to back (every piece ends at a row end, and
@@ -224,7 +225,7 @@ export class SplitEngine {
       let at = head.length;
       for (const [s, e] of list) { buf.set(bytes.subarray(s, e), at); at += e - s; }
       const sizes = list.map(([s, e]) => e - s);
-      return this._call(w, 'loadCSV', { id, bytes: buf, pieces: sizes, opts: { ...opts, types: { ...types, ...(opts.types ?? {}) }, checkTypes: info.names.filter((nm) => !(nm in (opts.types ?? {}))), badType: 'throw' } }, [buf.buffer]);
+      return this._call(w, 'loadCSV', { id, bytes: buf, pieces: sizes, opts: { ...opts, type: opts.type?.name, types: { ...types, ...(opts.types ?? {}) }, checkTypes: info.names.filter((nm) => !(nm in (opts.types ?? {}))), badType: 'throw' } }, [buf.buffer]);
     }));
     const dicts = await this.#shareDictionaries(id, loaded);
     const segs = loaded.map((r) => Float64Array.from(r.segs));

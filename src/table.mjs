@@ -160,6 +160,7 @@ export class Table {
     const ast = rewriteText(parsed, this.cols, src);
     // a text function matching labels scattered over many codes: one 0 / 1 per row, made from its
     // per-label answers (once per column's data), added as a hidden column the kernels read
+    // (and the same for a text column compared with another: its codes in the other's dictionary)
     walk(ast, (m) => {
       if (m.t !== 'var' || !m.lut) return;
       const c = this.cols.get(m.lut.column);
@@ -168,8 +169,9 @@ export class Table {
       let mask = masks.get(m.name);
       if (!mask || mask.length < this.n) {
         mask = this.engine.alloc(this.type === Float32Array ? Float32Array : Float64Array, this.n);
-        const codes = this.engine.live(c.data), match = m.lut.match, f32 = this.type === Float32Array;
-        for (let i = 0; i < this.n; i++) mask[i] = match[c.enc ? decodeOne(c.enc, codes[i], f32) : codes[i]] ? 1 : 0;
+        const codes = this.engine.live(c.data), { match, values } = m.lut, f32 = this.type === Float32Array;
+        if (values) for (let i = 0; i < this.n; i++) mask[i] = values[c.enc ? decodeOne(c.enc, codes[i], f32) : codes[i]]; // (a text column's codes in another one's dictionary)
+        else for (let i = 0; i < this.n; i++) mask[i] = match[c.enc ? decodeOne(c.enc, codes[i], f32) : codes[i]] ? 1 : 0;
         masks.set(m.name, mask);
       }
       if (this.cols.get(m.name)?.data !== mask) this.cols.set(m.name, { data: mask, dict: null, codes: null, hidden: true }); // (views sharing these columns have the same rows)
@@ -204,7 +206,7 @@ export class Table {
     const { engine } = this;
     const f32 = this.type === Float32Array;
     for (const c of new Set(this.cols.values())) {
-      if (c.enc || c.strings) continue;
+      if (c.enc || c.strings || c.hidden) continue; // (hidden: a text filter's 0 / 1, cached in MASKS, or a column of another table's, see select)
       const values = engine.live(c.data);
       const n = values.length;
       const enc = engine.jit ? yield* this.#chooseEncodingG(c.data, n, f32) : chooseEncoding(values, n, f32);
@@ -214,6 +216,7 @@ export class Table {
       c.enc = enc;
       c.plainType = plainType;
       c.rows = n;
+      if (MASKS.has(old)) { MASKS.set(c.data, MASKS.get(old)); MASKS.delete(old); } // (a text filter's 0 / 1 per row: still right, freed with the packed column)
       engine.free(old);
     }
     for (const c of this.cols.values()) c.data = engine.live(c.data);
@@ -371,7 +374,8 @@ export class Table {
     yield* this.engine.evalG(src, this.#vars(merged), out);
     const top = parse(expr);
     const date = (top.t === 'call' && DATE_RESULT.has(top.fn)) || (top.t === 'var' && !!this.cols.get(top.name)?.date); // dayStart(ts), monthStart(ts)...: still dates
-    const same = top.t === 'var' ? this.cols.get(top.name) : null; // a copy of a text column stays text
+    const kinds = valueKinds(top, this.cols), dict = kinds.size === 1 ? kinds.values().next().value : 'number';
+    const same = dict === 'number' ? null : [...this.cols.values()].find((c) => c.dict === dict); // a copy of a text column stays text (through ? : and coalesce too)
     const cols = new Map(this.cols).set(name, { data: out, dict: same?.dict ?? null, codes: same?.dict ? same.codes : null, date });
     return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params, owned: [name] });
   }
@@ -482,7 +486,7 @@ export class Table {
     const a0 = ast.args[0], text = a0.t === 'var' && this.cols.get(a0.name)?.dict;
     if (text && ast.fn === 'count') return missingRules('count', this.#bind(`${a0.name} != ''`, params).src);
     if (text && !DISTINCT.has(ast.fn)) textAsNumber(a0.name, src); // sum(city), min(city): of its codes
-    if (text && DISTINCT.has(ast.fn)) return { fn: ast.fn, arg: this.#bind(`${a0.name} != '' ? ${a0.name} : 0 / 0`, params).src };
+    if (text && DISTINCT.has(ast.fn)) return { fn: ast.fn, arg: this.#bind(`${a0.name} != '' ? ${a0.name} : 0 / 0`, params, true).src };
     if (!DISTINCT.has(ast.fn)) return missingRules(ast.fn, this.#bind(toSource(ast.args[0]), params).src);
     if (DISTINCT.has(ast.fn) && ast.args[0].t === 'var' && this.cols.get(ast.args[0].name)?.strings) {
       throw new Error(`vectro: ${ast.fn} can't count a free-text column ("${ast.args[0].name}"); load it as a category`);
@@ -1322,10 +1326,23 @@ export class Table {
     const keep = new Set(names.flat());
     for (const nm of keep) if (!this.cols.has(nm) || this.cols.get(nm).hidden) throw new Error(`vectro: no column "${nm}"`);
     const cols = new Map([...keep].map((nm) => [nm, this.cols.get(nm)])); // in the order asked
-    if (this.pred) walk(parse(this.pred), (m) => { // the filter's other columns: kept for it, hidden
-      if (m.t === 'var' && this.cols.has(m.name) && !cols.has(m.name)) cols.set(m.name, { ...this.cols.get(m.name), hidden: true });
+    if (!this.pred) return new Table(this.engine, cols, this.n, { params: this.params, zones: this.zones });
+    // the filter's other columns: kept for it, hidden, under internal names (the user's names stay free)
+    const ast = parse(this.pred), renamed = new Map();
+    let k = 0;
+    walk(ast, (m) => {
+      if (m.t !== 'var' || !this.cols.has(m.name) || keep.has(m.name)) return;
+      const c = this.cols.get(m.name);
+      if (c.hidden) { cols.set(m.name, c); return; } // (already internal: a text filter's 0 / 1, an earlier select's)
+      if (!renamed.has(m.name)) {
+        let nm;
+        do nm = `__vectro_kept_${k++}`; while (this.cols.has(nm) || cols.has(nm));
+        renamed.set(m.name, nm);
+        cols.set(nm, hiddenView(c));
+      }
+      m.name = renamed.get(m.name);
     });
-    return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params, zones: this.zones });
+    return new Table(this.engine, cols, this.n, { pred: renamed.size ? toSource(ast) : this.pred, params: this.params, zones: this.zones });
   }
 
   // ---- sorting ---------------------------------------------------------------
@@ -1936,6 +1953,15 @@ export class Table {
 
 // ---- helpers ---------------------------------------------------------------------
 
+// A column as a hidden one (select's: a column only the filter reads). It reads and writes the
+// column itself, so it follows compress() of the table it came from (packed, the old array freed).
+const COLUMN_FIELDS = ['data', 'dict', 'codes', 'date', 'strings', 'enc', 'plainType', 'rows', 'zones'];
+function hiddenView(c) {
+  const v = { hidden: true };
+  for (const k of COLUMN_FIELDS) Object.defineProperty(v, k, { get: () => c[k], set: (x) => { c[k] = x; }, enumerable: true, configurable: true });
+  return v;
+}
+
 const RESERVED = new Set(['Infinity', 'NaN']); // (function names are fine: sum(...) is a call, sum a column)
 function checkName(name) {
   if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _)`);
@@ -1948,16 +1974,55 @@ function checkName(name) {
 function textAsNumber(name, src) {
   throw new TypeError(`vectro: ${name} is a text column; compare it with == or != to text in quotes (${name} == 'Paris') or use a text function such as startsWith(${name}, 'P'), but it can't be used as a number, in "${src}"`);
 }
+// Also an error: text compared with a number (city == 1, city == p), and ? : or coalesce() mixing a
+// text column with numbers or with another text column (each has its own codes).
 function checkTextUse(ast, cols, src) {
   const PASS = new Set([...Object.keys(TEXT_FNS), 'isMissing', 'coalesce', 'sum', 'count', 'mean', 'min', 'max']); // (reductions: from datasets, see #groupIntoG)
-  const asNumber = (n) => { if (n.t === 'var' && cols.get(n.name)?.dict) textAsNumber(n.name, src); visit(n); };
+  const textVar = (n) => n.t === 'var' && cols.get(n.name)?.dict;
+  const asNumber = (n) => { if (textVar(n)) textAsNumber(n.name, src); visit(n); };
+  const mixed = (n) => {
+    const kinds = valueKinds(n, cols);
+    if (kinds.size > 1 && [...kinds].some((k) => k !== 'number')) {
+      throw new TypeError(`vectro: ${n.t === 'cond' ? '? :' : 'coalesce()'} mixes ${kinds.has('number') ? 'a text column and numbers' : 'two text columns'}, in "${src}"; its values must all come from one text column, or all be numbers`);
+    }
+  };
   const visit = (n) => {
-    if (n.t === 'bin') { const f = n.op === '==' || n.op === '!=' || n.l.t === 'str' || n.r.t === 'str' ? visit : asNumber; f(n.l); f(n.r); } // (ts >= '2024-06-01': its own error, about dates)
+    if (n.t === 'bin' && (n.op === '==' || n.op === '!=')) {
+      for (const [a, b] of [[n.l, n.r], [n.r, n.l]]) {
+        if (b.t !== 'str' && !textVar(b) && [...valueKinds(a, cols)].some((k) => k !== 'number')) {
+          const name = textVar(a) ? a.name : 'text';
+          throw new TypeError(`vectro: ${name} is text, compared with ${b.t === 'num' ? `the number ${toSource(b)}` : b.t === 'var' ? `"${b.name}", a number` : 'a number'}, in "${src}" (compare it with text in quotes, ${textVar(a) ? a.name : 'city'} == 'Paris', or with another text column)`);
+        }
+      }
+      visit(n.l); visit(n.r);
+    } else if (n.t === 'bin') { const f = n.l.t === 'str' || n.r.t === 'str' ? visit : asNumber; f(n.l); f(n.r); } // (ts >= '2024-06-01': its own error, about dates)
     else if (n.t === 'un') asNumber(n.x);
-    else if (n.t === 'cond') { asNumber(n.c); visit(n.x); visit(n.y); }
-    else if (n.t === 'call') n.args.forEach(PASS.has(n.fn) && (n.args.length === 1 || !(n.fn === 'min' || n.fn === 'max')) ? visit : asNumber);
+    else if (n.t === 'cond') { mixed(n); asNumber(n.c); visit(n.x); visit(n.y); }
+    else if (n.t === 'call') { if (n.fn === 'coalesce') mixed(n); n.args.forEach(PASS.has(n.fn) && (n.args.length === 1 || !(n.fn === 'min' || n.fn === 'max')) ? visit : asNumber); }
   };
   visit(ast);
+}
+
+// What an expression's values are, as ? : and coalesce() pass them through: a text column's
+// dictionary, or 'number'.
+function valueKinds(n, cols, out = new Set()) {
+  if (n.t === 'var' && cols.get(n.name)?.dict) out.add(cols.get(n.name).dict);
+  else if (n.t === 'cond') { valueKinds(n.x, cols, out); valueKinds(n.y, cols, out); }
+  else if (n.t === 'call' && n.fn === 'coalesce') for (const a of n.args) valueKinds(a, cols, out);
+  else out.add('number');
+  return out;
+}
+
+// One text column's codes in another's dictionary (-1: a label it doesn't have), for ship == bill.
+const DICT_IDS = new WeakMap();
+let dictIds = 0;
+const dictId = (dict) => { if (!DICT_IDS.has(dict)) DICT_IDS.set(dict, dictIds++); return DICT_IDS.get(dict); };
+function codesIn(colNode, into, cols) {
+  const from = cols.get(colNode.name), to = cols.get(into.name);
+  const key = `${colNode.name}|in|${into.name}|${dictId(to.dict)}`;
+  if (!LUT_NAMES.has(key)) LUT_NAMES.set(key, `__vectro_text_codes_${LUT_NAMES.size}`);
+  const values = Float64Array.from(from.dict, (label) => to.codes.get(label) ?? -1);
+  return { t: 'var', name: LUT_NAMES.get(key), lut: { column: colNode.name, values } };
 }
 
 // The expression with params written in as numbers (for folding: on == 1 with { on: 1 } reads no column).
@@ -2107,7 +2172,8 @@ export function rewriteText(ast, cols, src) {
     }
     if (n.t === 'call' && n.fn === 'coalesce') { // first value that isn't missing
       if (n.args.length < 2) throw new SyntaxError(`vectro: coalesce() needs two values or more, in "${src}"`);
-      return n.args.map(fix).reduceRight((rest, x) => ({ t: 'cond', c: { t: 'bin', op: '==', l: x, r: x }, x, y: rest }));
+      const present = (x) => (textCol(x) ? { t: 'bin', op: '!=', l: x, r: { t: 'num', v: cols.get(x.name).codes.get('') ?? -1 } } : { t: 'bin', op: '==', l: x, r: x }); // (missing text is '')
+      return n.args.map(fix).reduceRight((rest, x) => ({ t: 'cond', c: present(x), x, y: rest }));
     }
     if (n.t === 'bin' && (n.l.t === 'str' || n.r.t === 'str') && (dateCol(n.l) || dateCol(n.r))) { // ts >= '2024-03-01'
       const [colNode, strNode] = n.l.t === 'str' ? [n.r, n.l] : [n.l, n.r];
@@ -2125,6 +2191,9 @@ export function rewriteText(ast, cols, src) {
         if (!textCol(colNode)) throw new SyntaxError(`vectro: ${JSON.stringify(strNode.v)} can only be compared with a text column, in "${src}"`);
         const code = cols.get(colNode.name).codes.get(strNode.v) ?? -1;
         return { ...n, l: colNode, r: { t: 'num', v: code } };
+      }
+      if ((n.op === '==' || n.op === '!=') && textCol(n.l) && textCol(n.r) && cols.get(n.l.name).dict !== cols.get(n.r.name).dict) { // ship == bill: by label
+        return { ...n, l: codesIn(n.l, n.r, cols), r: n.r };
       }
       return { ...n, l: fix(n.l), r: fix(n.r) };
     }

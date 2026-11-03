@@ -66,12 +66,12 @@ export function release(table) { if (table?.isDataset) table.close(); else table
 
 // Every object is a row of the table; the ones with a vector (`field`, `dim` numbers) also go
 // into the vector index, with their columns.
-async function loadWithEmbeddings(engine, bytes, field, dim, kinds) {
+async function loadWithEmbeddings(engine, bytes, field, dim, kinds, types) {
   const names = [...kinds].filter(([k, v]) => v && k !== field).map(([k]) => k);
   const clean = cleanNames(names);
   const cols = Object.fromEntries(clean.map((n) => [n, []])), withVector = Object.fromEntries(clean.map((n) => [n, []]));
   const vectors = [];
-  let skipped = 0;
+  let skipped = 0, late = false;
   for (const line of new TextDecoder().decode(bytes).split('\n')) {
     if (!line.trim()) continue;
     let o;
@@ -79,6 +79,12 @@ async function loadWithEmbeddings(engine, bytes, field, dim, kinds) {
     if (!o || typeof o !== 'object' || Array.isArray(o)) { skipped++; continue; }
     const v = o[field], hasVector = Array.isArray(v) && v.length === dim && v.every((x) => typeof x === 'number');
     if (hasVector) vectors.push(v);
+    for (const [n, x] of Object.entries(o)) { // after the first lines: text in a number column, new keys (loaded again with them)
+      if (n === field || (types && n in types) || x === null || typeof x === 'object') continue;
+      const kind = typeof x === 'number' || typeof x === 'boolean' ? 'number' : 'category';
+      if (!kinds.get(n) || (kinds.get(n) === 'number' && kind === 'category' && x.trim() && Number.isNaN(Number(x)))) { kinds.set(n, kinds.get(n) ? 'category' : kind); late = true; }
+    }
+    if (late) continue;
     names.forEach((n, k) => {
       const x = o[n];
       const value = kinds.get(n) === 'number' ? (typeof x === 'number' ? x : typeof x === 'boolean' ? +x : typeof x === 'string' && x.trim() ? Number(x) : NaN) : x == null || typeof x === 'object' ? '' : String(x);
@@ -86,6 +92,7 @@ async function loadWithEmbeddings(engine, bytes, field, dim, kinds) {
       if (hasVector) withVector[clean[k]].push(value);
     });
   }
+  if (late) return loadWithEmbeddings(engine, bytes, field, dim, kinds, types);
   const table = engine.table(cols);
   const index = await VectorIndex.create(engine, { vectors, dim, metric: 'cosine', columns: withVector });
   return { table, index, skipped, embedding: { field, dim } };
@@ -107,10 +114,20 @@ function loadJSONLines(engine, bytes, types) {
     }
   }
   for (const [k, v] of Object.entries(types ?? {})) kinds.set(k, v === 'number' ? 'number' : 'category');
-  if (arrays.size) { const [field, dim] = arrays.entries().next().value; return loadWithEmbeddings(engine, bytes, field, dim, kinds); }
-  const names = [...kinds].filter(([, v]) => v).map(([k]) => k);
+  if (arrays.size) { const [field, dim] = arrays.entries().next().value; return loadWithEmbeddings(engine, bytes, field, dim, kinds, types); }
+  let names = [...kinds].filter(([, v]) => v).map(([k]) => k);
   if (!names.length) throw new LoadError('no JSON objects with plain values found in the first lines');
-  const r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)));
+  const seen = {};
+  let r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)), seen);
+  // after the first lines: text in a number column (loaded as text, as CSV does) and new keys
+  const given = (n) => types && n in types;
+  const late = names.filter((n, k) => seen.text[k] && !given(n));
+  for (const n of late) kinds.set(n, 'category');
+  for (const [n, kind] of seen.extra) if (!kinds.get(n)) { late.push(n); kinds.set(n, kind); }
+  if (late.length) {
+    names = [...kinds].filter(([, v]) => v).map(([k]) => k);
+    r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)));
+  }
   const clean = cleanNames(names); // ("@timestamp", "user-agent": names that work in expressions, as CSV headers get)
   const cols = Object.fromEntries(names.map((n, k) => [clean[k], r.dicts[k] ? Array.from(r.cols[k], (code) => r.dicts[k][code]) : r.cols[k]]));
   return { table: engine.table(cols), skipped: r.bad };

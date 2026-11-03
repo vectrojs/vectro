@@ -1699,7 +1699,8 @@ function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = tru
       if (!kinds && !last && !hasRows(buf, header ? 2 : 1, delimiter)) { carry = buf; continue; } // the first piece needs the header and a row: read on
       if (!kinds) { // the first piece: column names and types
         const info = inspectCSV(buf, { delimiter, header, types, sampleRows });
-        kinds = Object.fromEntries(info.names.map((n, i) => [n, info.kinds[i]]));
+        // (a guessed free-text column in a Float32Array table: a category, as readCSV loads it)
+        kinds = Object.fromEntries(info.names.map((n, i) => [n, info.kinds[i] === 'string' && rest.type === Float32Array && !(n in types) ? 'category' : info.kinds[i]]));
         head = header ? buf.slice(0, info.start) : new Uint8Array(0);
         start = info.start;
       }
@@ -1709,7 +1710,7 @@ function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = tru
         const bytes = engine.alloc(Uint8Array, head.length + rows.length);
         bytes.set(head, 0);
         bytes.set(rows, head.length);
-        const t = yield { parse: bytes, opts: { delimiter, header, types: kinds, ...rest, checkTypes: Object.keys(kinds).filter((nm) => !(nm in types)), badType: 'throw' } };
+        const t = yield { parse: bytes, opts: { delimiter, header, types: kinds, ...rest, checkTypes: Object.keys(kinds).filter((nm) => !(nm in types)), badType: 'throw', trimEnd: last } };
         try { writer.append(t); } finally { t.dispose(); }
         yield { flush: writer };
         onProgress?.({ bytes: pos, size, rows: writer.meta.rows + writer.pendingRows });

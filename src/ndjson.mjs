@@ -17,7 +17,10 @@ const unescapeJSON = (raw) => JSON.parse(`"${raw}"`);
 // names: column names; kinds: 'number' | 'category' | 'date' for each
 // (dates: ISO text or ms numbers, as ms).
 // Returns { rows, cols: Float64Array[], dicts: (string[] | null)[], bad }.
-export function parseNDJSON(bytes, start, end, names, kinds) {
+// report (optional, an object): filled with text (a Uint8Array, 1 for a number column that got
+// text that isn't a number) and extra (a Map: each other key with plain values -> 'number' or
+// 'category', as its values look), so a caller can load the lines again with those kinds.
+export function parseNDJSON(bytes, start, end, names, kinds, report = null) {
   const k = names.length;
   const keyBytes = names.map((n) => encode(n));
   let cap = 1;
@@ -29,6 +32,16 @@ export function parseNDJSON(bytes, start, end, names, kinds) {
   const seen = new Uint8Array(k);
   let guess = new Int32Array(64).fill(-1); // column of the j-th key on the previous line
   let rows = 0, bad = 0;
+  const text = report ? (report.text = new Uint8Array(k)) : null, extra = report ? (report.extra = new Map()) : null;
+  const extraKeys = []; // [key bytes, name] of the other keys met so far
+  const extraName = (s, e, esc) => {
+    if (esc) return unescapeJSON(decodeLatin(bytes, s, e));
+    for (const [kb, name] of extraKeys) if (same(kb, s, e)) return name;
+    const name = decodeLatin(bytes, s, e);
+    extraKeys.push([bytes.slice(s, e), name]);
+    return name;
+  };
+  const noteExtra = (name, kind) => { if (extra.get(name) !== 'category') extra.set(name, kind); };
 
   // Which column does the key in bytes[s, e) name? (-1: not wanted)
   const columnOf = (s, e, j) => {
@@ -68,6 +81,7 @@ export function parseNDJSON(bytes, start, end, names, kinds) {
       while (p < eol && bytes[p] !== QUOTE) { if (bytes[p] === BACKSLASH) { kEsc = true; p++; } p++; }
       if (p >= eol) { ok = false; break; }
       const c = kEsc ? columnOfText(unescapeJSON(decodeLatin(bytes, ks, p)), names) : columnOf(ks, p, j);
+      const kEnd = p;
       p++;
       while (p < eol && isSpace(bytes[p])) p++;
       if (bytes[p] !== COLON) { ok = false; break; }
@@ -83,9 +97,12 @@ export function parseNDJSON(bytes, start, end, names, kinds) {
         if (c >= 0) {
           if (dicts[c]) cols[c][row] = dicts[c].code(vs, p, esc);
           else if (isDate[c]) cols[c][row] = parseDateBytes(bytes, vs, p);
-          else cols[c][row] = esc ? Number(unescapeJSON(decodeLatin(bytes, vs, p))) || NaN : parseNumber(bytes, vs, p);
+          else {
+            cols[c][row] = esc ? Number(unescapeJSON(decodeLatin(bytes, vs, p))) || NaN : parseNumber(bytes, vs, p);
+            if (text && p > vs && cols[c][row] !== cols[c][row]) text[c] = 1; // (text that isn't a number)
+          }
           seen[c] = 1;
-        }
+        } else if (extra) noteExtra(extraName(ks, kEnd, kEsc), 'category');
         p++;
       } else if (b === LBRACE || b === LBRACKET) { // nested: skip it
         p = skipNested(bytes, p, eol);
@@ -98,7 +115,7 @@ export function parseNDJSON(bytes, start, end, names, kinds) {
           if (first === 110) { /* null: leave empty */ }
           else if (dicts[c]) { cols[c][row] = dicts[c].code(vs, p, false); seen[c] = 1; }
           else { cols[c][row] = first === 116 ? 1 : first === 102 ? 0 : parseNumber(bytes, vs, p); seen[c] = 1; }
-        }
+        } else if (extra && bytes[vs] !== 110) noteExtra(extraName(ks, kEnd, kEsc), 'number');
       }
       j++;
     }

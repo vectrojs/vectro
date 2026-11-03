@@ -96,7 +96,8 @@ export function serveSplitWorker(post, listen) {
     // `pieces` are their byte lengths; returns the rows in each piece.
     loadCSV({ id, bytes, opts, pieces }) {
       let segs = null;
-      const t = engine.parseCSV(bytes, { ...opts, pieces, onPieceRows: (rows) => { segs = rows; } });
+      const type = opts.type === 'Float32Array' ? Float32Array : opts.type === undefined ? undefined : Float64Array; // (sent by name)
+      const t = engine.parseCSV(bytes, { ...opts, type, pieces, onPieceRows: (rows) => { segs = rows; } });
       tables.set(id, t);
       return { n: t.length, segs, dicts: dictsOf(t), names: t.columnNames, strings: [...t.cols].filter(([, c]) => c.strings).map(([n]) => n), dates: [...t.cols].filter(([, c]) => c.date).map(([n]) => n) };
     },

@@ -32,7 +32,15 @@ export class ByteDict {
     this.lens = [];
     this.strings = [];
   }
+  // A field's code, by its text: a field with escapes ("" in CSV, \" in JSON) is looked up by its
+  // decoded text, so  5""  unquoted and  "5"""  quoted (5") are two labels, and  "5"  and 5 one.
   code(s, e, escaped) {
+    if (escaped) {
+      const str = this.unescape(decode(this.bytes, s, e)), byText = this.#byText();
+      let c = byText.get(str);
+      if (c === undefined) { c = this.strings.length; this.strings.push(str); this.starts.push(-1); this.lens.push(-1); byText.set(str, c); } // (not in the byte table)
+      return c;
+    }
     const b = this.bytes;
     let h = 2166136261;
     for (let i = s; i < e; i++) h = Math.imul(h ^ b[i], 16777619);
@@ -40,19 +48,26 @@ export class ByteDict {
     const mask = this.cap - 1;
     for (let slot = h & mask; ; slot = (slot + 1) & mask) {
       const c = this.slots[slot];
-      if (c === -1) return this.#insert(slot, h, s, e, escaped);
+      if (c === -1) return this.#insert(slot, h, s, e);
       if (this.hashes[slot] === h && this.lens[c] === e - s && this.#same(this.starts[c], s, e - s)) return c;
     }
+  }
+  #byText() { // (made at the first field with escapes)
+    if (!this.byText) { this.byText = new Map(); this.strings.forEach((str, c) => { if (!this.byText.has(str)) this.byText.set(str, c); }); }
+    return this.byText;
   }
   #same(a, b, len) {
     const x = this.bytes;
     for (let i = 0; i < len; i++) if (x[a + i] !== x[b + i]) return false;
     return true;
   }
-  #insert(slot, h, s, e, escaped) {
-    const code = this.strings.length;
+  #insert(slot, h, s, e) {
     const str = decode(this.bytes, s, e);
-    this.strings.push(escaped ? this.unescape(str) : str);
+    const known = this.byText?.get(str); // (the text of a field with escapes met before)
+    if (known !== undefined) return known;
+    const code = this.strings.length;
+    this.strings.push(str);
+    this.byText?.set(str, code);
     this.starts.push(s);
     this.lens.push(e - s);
     this.slots[slot] = code;
