@@ -140,6 +140,7 @@ export class Engine {
   // Allocate a typed array in the engine's memory. These arrays get the
   // WASM SIMD kernels; other shared arrays fall back to JS kernels.
   alloc(Type, n) {
+    this.#assertOpen();
     const size = align16(Math.max(16, n * Type.BYTES_PER_ELEMENT));
     // too big for the 4GB memory (a huge join output, say): fail before touching the free list
     if (!(size <= MAX_PAGES * PAGE - 64)) throw new RangeError('vectro: out of memory (4GB limit)');
@@ -286,6 +287,7 @@ export class Engine {
 
   // Run `op` on all threads and block until done; returns the per-unit results.
   #run(op, n, arrays, W = null, F = null) {
+    this.#assertOpen();
     this.#assertIdle();
     arrays = arrays.map((a) => a && this.live(a));
     if (this.W && !this.canBlock) return this.#runHere(op, n, arrays, W, F);
@@ -341,6 +343,7 @@ export class Engine {
     try {
       let d = Atomics.load(ctrl, C.DONE);
       while (d < units) {
+        this.#assertOpen(); // (close() wakes this wait: the stopped workers will never finish)
         if (typeof Atomics.waitAsync === 'function') {
           const w = Atomics.waitAsync(ctrl, C.DONE, d);
           if (w.async) await w.value;
@@ -380,6 +383,8 @@ export class Engine {
 
   #inFlight = false; // an async run is on the workers right now
   #queue = Promise.resolve();
+  #closed = false;
+  #running = new Set(); // async queries not settled yet (see _driveAsync)
 
   // True while an async query is running on the worker threads.
   get busy() { return this.#inFlight; }
@@ -390,6 +395,11 @@ export class Engine {
     if (this.#inFlight) {
       throw new Error('vectro: an async query is running on this engine; await it, or use the async API (e.g. aggAsync) for this call too');
     }
+  }
+
+  // After close(): the workers are gone, so every call fails plainly.
+  #assertOpen() {
+    if (this.#closed) throw closedError();
   }
 
   #exec1(req, parts) {
@@ -408,6 +418,7 @@ export class Engine {
   }
 
   _execSync(req) {
+    this.#assertOpen();
     this.#assertIdle(); // before setup(), which writes the shared control block
     this.#beginWrite();
     req.setup?.();
@@ -420,6 +431,7 @@ export class Engine {
     this.#queue = new Promise((r) => { release = r; });
     await before;
     try {
+      this.#assertOpen(); // (queued behind a query that close() stopped)
       this.#beginWrite();
       req.setup?.();
       return await this.#exec1(req, await this.#runAsync(req.op, req.n, req.arrays, req.W ?? null, req.F ?? null));
@@ -429,6 +441,7 @@ export class Engine {
   }
 
   _drive(gen) {
+    this.#assertOpen();
     let step = gen.next();
     while (!step.done) {
       let out;
@@ -443,10 +456,20 @@ export class Engine {
     return step.value;
   }
 
-  async _driveAsync(gen) {
+  _driveAsync(gen) {
+    if (this.#closed) return Promise.reject(closedError());
     // One thread: nothing runs in the background, so run the whole operation
     // at once (other operations can't slip in between its steps).
-    if (this.W === 0) return this._drive(gen);
+    if (this.W === 0) { try { return Promise.resolve(this._drive(gen)); } catch (err) { return Promise.reject(err); } }
+    // (kept until it settles: close() marks it handled, so a query close()
+    // stops doesn't crash a script that awaits it only after close())
+    let p;
+    p = (async () => { try { return await this.#driveSteps(gen); } finally { this.#running.delete(p); } })();
+    this.#running.add(p);
+    return p;
+  }
+
+  async #driveSteps(gen) {
     let step = gen.next();
     while (!step.done) {
       let out;
@@ -748,9 +771,15 @@ export class Engine {
   // (Reading files is in node.mjs: engine.readCSV(path).)
   // opts.compress: pack the columns afterwards (see Table.compress).
   parseCSV(text, opts) { const t = parseCSV(this, text, opts); return opts?.compress ?? COMPRESS_ALL ? t.compress() : t; }
-  async parseCSVAsync(text, opts) { const t = await parseCSVAsync(this, text, opts); return opts?.compress ?? COMPRESS_ALL ? t.compress() : t; }
+  async parseCSVAsync(text, opts) { const t = await parseCSVAsync(this, text, opts); return opts?.compress ?? COMPRESS_ALL ? t.compressAsync() : t; }
 
+  // Stops the workers. Queries still running or queued reject with "this
+  // engine is closed", as does every later call (freeing tables still works).
   async close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const p of this.#running) p.catch(() => {});
+    Atomics.notify(this.ctrl, C.DONE); // wake a running async query, to reject
     this.ctrl[C.OP] = OP.EXIT;
     Atomics.store(this.ctrl, C.SEQ, ++this.seq);
     Atomics.notify(this.ctrl, C.SEQ);
@@ -758,6 +787,8 @@ export class Engine {
     for (const p of this.ports) p.close?.();
   }
 }
+
+const closedError = () => new Error('vectro: this engine is closed (close() was called); create a new Engine');
 
 const COMBINE = { sum: (x, y) => x + y, count: (x, y) => x + y, mean: (x, y) => x + y, min: Math.min, max: Math.max };
 const IDENTITY = { sum: 0, count: 0, mean: 0, min: Infinity, max: -Infinity };

@@ -18,7 +18,7 @@ import { once } from 'node:events';
 import { sql, displayName } from '../sql.mjs';
 import { openTables } from './catalog.mjs';
 import { OID, TYPE_OF, typeLength, typeName, BINARY, paramLiteral, bindParams, dataRows, PgError } from './pgtypes.mjs';
-import { describeTables, catalogTables, driverAnswer, readsCatalog, selectNames } from './pgcatalog.mjs';
+import { describeTables, catalogTables, driverAnswer, readsCatalog, selectNames, plainOperators } from './pgcatalog.mjs';
 
 const VERSION = '16.0';
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -399,7 +399,7 @@ export async function servePg({ tables = {}, root = null, engine = null, catalog
       const known = driverAnswer(text, described, this.database);
       if (known) return known.columns.map((c) => ({ name: c.name, type: c.type }));
       try {
-        const q = sql(t, tables, this.sqlOpts());
+        const q = sql(readsCatalog(t) ? plainOperators(t) : t, tables, this.sqlOpts());
         return q.columns.map((c) => ({ name: displayName(c.name), type: TYPE_OF[c.type] ?? 'float8' }));
       } catch (err) {
         if (readsCatalog(t)) return selectNames(t).map((name) => ({ name, type: 'text' }));
@@ -443,11 +443,15 @@ export async function servePg({ tables = {}, root = null, engine = null, catalog
       }
     }
     async query(t) {
+      const done = catalog.hold(); // (a reload meanwhile frees the tables this query reads only after it)
+      try { return await this.#query(t); } finally { done(); }
+    }
+    async #query(t) {
       const { tables, described } = this.tablesFor();
       const known = driverAnswer(t, described, this.database) ?? specialAnswer(t, this);
       if (known) return rowsOf(known.columns, known.rows);
       let q;
-      try { q = sql(t, tables, this.sqlOpts()); } catch (err) {
+      try { q = sql(readsCatalog(t) ? plainOperators(t) : t, tables, this.sqlOpts()); } catch (err) {
         if (readsCatalog(t)) { // a catalog query beyond Vectro's SQL: nothing to report (no keys, indexes, comments...)
           if (logQueries) log(`[pg] answered empty: ${err.message}`);
           return rowsOf(selectNames(t).map((name) => ({ name, type: 'text' })), []);

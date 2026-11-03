@@ -27,9 +27,15 @@ function tokenize(src) {
 const BIN_PREC = { '||': 2, '&&': 3, '==': 4, '!=': 4, '<': 5, '>': 5, '<=': 5, '>=': 5, '+': 6, '-': 6, '*': 7, '/': 7 };
 const UNARY_PREC = 8;
 
+// Expressions nested deeper than this are refused: compiling them would
+// overflow the call stack (they are generated, never written by hand).
+export const MAX_DEPTH = 1000;
+const tooDeep = () => new SyntaxError(`vectro: expression too deep (more than ${MAX_DEPTH} levels of nesting or terms in a chain); split it up`);
+
 export function parse(src) {
+  if (typeof src !== 'string') throw new TypeError(`vectro: an expression must be text, like "price > 10", got ${src === null ? 'null' : typeof src}`);
   const toks = tokenize(src);
-  let i = 0;
+  let i = 0, level = 0;
   const err = (msg) => new SyntaxError(`vectro: ${msg} in "${src}"`);
   const peek = () => toks[i];
   const expect = (v) => { const t = toks[i++]; if (!t || t.v !== v) throw err(`expected "${v}"`); };
@@ -60,6 +66,7 @@ export function parse(src) {
   }
 
   function expr(minPrec) {
+    if (++level > 3 * MAX_DEPTH) throw tooDeep(); // (brackets count here, not below: the stack has room for them)
     let left = primary();
     for (;;) {
       const t = peek();
@@ -76,12 +83,24 @@ export function parse(src) {
       i++;
       left = { t: 'bin', op: t.v, l: left, r: expr(p) };
     }
+    level--;
     return left;
   }
 
   const ast = expr(0);
   if (i < toks.length) throw err(`unexpected "${toks[i].v}"`);
+  // (a + b + c + ...: parsed in a loop, but deep for everything after)
+  for (const stack = [[ast, 1]]; stack.length;) {
+    const [n, d] = stack.pop();
+    if (d > MAX_DEPTH) throw tooDeep();
+    for (const c of [n.l, n.r, n.x, n.c, n.y, ...(n.args ?? [])]) if (c) stack.push([c, d + 1]);
+  }
   return ast;
+}
+
+// agg()'s spec: { name: 'sum(x)', ... }
+export function checkSpec(spec) {
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) throw new TypeError(`vectro: agg() needs an object of aggregations, like { total: 'sum(price)', n: 'count()' }, got ${spec === null ? 'null' : Array.isArray(spec) ? 'an array' : typeof spec}`);
 }
 
 // ---- analysis ----------------------------------------------------------------

@@ -165,13 +165,16 @@ export async function serveFlight({ tables = {}, root = null, engine = null, cat
     let fields, columns, n, table = null;
     if (t.type === 'TicketStatementQuery') {
       const text = Buffer.from(bytesOf(t.value, 1) ?? []).toString();
-      const c = compile(text);
-      fields = c.fields;
-      table = await c.q.collectAsync();
-      const data = await table.toColumnsAsync();
-      columns = fields.map((f) => data[f.col]);
-      n = table.length;
-      table.dispose();
+      const done = catalog.hold(); // (a reload meanwhile frees the tables this query reads only after it)
+      try {
+        const c = compile(text);
+        fields = c.fields;
+        table = await c.q.collectAsync();
+        const data = await table.toColumnsAsync();
+        columns = fields.map((f) => data[f.col]);
+        n = table.length;
+        table.dispose();
+      } finally { done(); }
     } else if (CATALOG.has(t.type)) ({ fields, columns, n } = catalogAnswer(t.type, t.value));
     else fail(STATUS.invalid, 'unknown ticket');
     yield flightData(typedSchema(fields));

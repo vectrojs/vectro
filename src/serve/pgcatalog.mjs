@@ -180,6 +180,25 @@ export function driverAnswer(text, described, database = 'vectro') {
     }
     return result('nspname:name relname:name attname:name atttypid:oid attnotnull:bool atttypmod:int4 attlen:int2 typtypmod:int4 attnum:int8 attidentity:char attgenerated:char adsrc:text description:text typbasetype:oid typtype:char', rows);
   }
+  // psql's \d name and \d+ name: the table's columns (its columns differ between psql versions:
+  // each item is answered by what it reads; defaults, collations, comments... are empty)
+  const att = /^\s*SELECT a\.attname,\s*pg_catalog\.format_type\(a\.atttypid,\s*a\.atttypmod\)[\s\S]*\bFROM pg_catalog\.pg_attribute a\s+WHERE a\.attrelid = '(\d+)'/i.exec(text);
+  if (att) {
+    const items = selectItems(text), names = selectNames(text), d = described.find((x) => x.oid === Number(att[1]));
+    const value = (item, c) => (item === 'a.attname' ? c.name : /format_type/.test(item) ? SQL_NAMES[c.type] ?? c.type
+      : item === 'a.attnotnull' ? false : item === 'a.attstorage' ? (c.type === 'text' ? 'x' : 'p') : null);
+    return result(items.map((item, k) => `${names[k]}:${item === 'a.attnotnull' ? 'bool' : 'text'}`).join(' '), (d?.columns ?? []).map((c) => items.map((item) => value(item, c))));
+  }
+  // psql's \d name, \d+ name: about the table (a plain table: no checks, rules, options...)
+  const rel = /^\s*SELECT c\.relchecks, c\.relkind, c\.relhasindex[\s\S]*\bWHERE c\.oid = '(\d+)'\s*$/i.exec(text);
+  if (rel) {
+    const items = selectItems(text), names = selectNames(text);
+    const value = (item) => (/relchecks|reltablespace/.test(item) ? 0 : /relhas|rowsecurity|relispartition/.test(item) ? false
+      : item === 'c.relkind' ? 'r' : item === 'c.relpersistence' ? 'p' : item === 'c.relreplident' ? 'd' : item === 'am.amname' ? 'heap' : '');
+    const type = (v) => (typeof v === 'number' ? 'int4' : typeof v === 'boolean' ? 'bool' : 'text');
+    const row = items.map(value);
+    return result(names.map((n, k) => `${n}:${type(row[k])}`).join(' '), described.some((d) => d.oid === Number(rel[1])) ? [row] : []);
+  }
   if (/SELECT t\.typname,\s*t\.oid FROM pg_catalog\.pg_type t\s+JOIN pg_catalog\.pg_namespace n/i.test(text)) {
     return result('typname:name oid:oid', TYPES.map((t) => [t.name, t.oid]));
   }
@@ -194,8 +213,23 @@ export function driverAnswer(text, described, database = 'vectro') {
 // Does a query read the catalog (pg_catalog, information_schema, pg_* tables)?
 export const readsCatalog = (text) => /\b(pg_catalog|information_schema)\s*\.|\bpg_[a-z_]+\b/i.test(text);
 
+// psql's way of writing operators and collations in catalog queries (\d name):
+// OPERATOR(pg_catalog.~) is plain ~, and COLLATE pg_catalog.default changes nothing.
+export const plainOperators = (text) => text
+  .replace(/\bOPERATOR\s*\(\s*(?:pg_catalog\s*\.\s*)?([~!=<>*]+)\s*\)/gi, ' $1 ')
+  .replace(/\s+COLLATE\s+(?:pg_catalog\s*\.\s*)?"?default"?/gi, '');
+
 // The names of a SELECT's columns, read roughly from its text (for an empty answer).
 export function selectNames(text) {
+  return selectItems(text).map((s) => {
+    const as = /\bas\s+("?)([^"\s]+)\1\s*$/i.exec(s) ?? /("?)([A-Za-z_][\w$]*)\1\s*$/.exec(s);
+    if (!as) return '?column?';
+    return as[1] ? as[2] : as[2].toLowerCase();
+  });
+}
+
+// A SELECT's items, as text.
+function selectItems(text) {
   const t = text.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ');
   const start = /\bselect\b/i.exec(t);
   if (!start) return [];
@@ -212,9 +246,5 @@ export function selectNames(text) {
     item += c;
   }
   if (end <= t.length) items.push(item);
-  return items.map((s) => s.trim()).filter(Boolean).map((s) => {
-    const as = /\bas\s+("?)([^"\s]+)\1\s*$/i.exec(s) ?? /("?)([A-Za-z_][\w$]*)\1\s*$/.exec(s);
-    if (!as) return '?column?';
-    return as[1] ? as[2] : as[2].toLowerCase();
-  });
+  return items.map((s) => s.trim()).filter(Boolean);
 }

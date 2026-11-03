@@ -107,7 +107,6 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
     }
     if (!allowed(req, url)) { res.setHeader('WWW-Authenticate', 'Basic realm="vectro"'); throw new HttpError(401, 'this server needs a token: send "Authorization: Bearer <token>", Basic with the token as the password, or add ?token='); }
     const path = url.pathname.replace(/\/+$/, '') || '/';
-    const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
     if (path === '/odata' || path.startsWith('/odata/')) {
       if (req.method !== 'GET') throw new HttpError(405, 'OData here is read only: use GET');
       const params = new URLSearchParams(url.search);
@@ -123,6 +122,7 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
       for (const chunk of r.body) if (!res.write(chunk)) await once(res, 'drain');
       return res.end();
     }
+    const parts = path.split('/').filter(Boolean).map((p) => { try { return decodeURIComponent(p); } catch { throw new HttpError(400, `the path has a malformed %-escape: ${p}`); } });
     if (path === '/sql') {
       if (req.method !== 'GET' && req.method !== 'POST') throw new HttpError(405, 'use GET or POST');
       const text = await sqlOf(req, url), format = formatOf(url), limit = limitOf(url);
@@ -155,7 +155,8 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
   }
 
   const server = createServer((req, res) => {
-    route(req, res).catch((err) => {
+    const done = catalog.hold(); // (a reload meanwhile frees the tables this request reads only after it)
+    route(req, res).finally(done).catch((err) => {
       const status = err.status ?? (err instanceof LoadError || /^vectro/.test(err.message) ? 400 : 500);
       if (status === 500) log(`error: ${err.stack}`);
       if (res.headersSent) { res.destroy(err); return; } // (mid-stream: the client sees a cut answer)

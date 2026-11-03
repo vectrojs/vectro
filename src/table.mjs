@@ -7,7 +7,7 @@
 
 import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
 import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
-import { parse, toSource, walk, analyze, isMask, fold } from './fuse.mjs';
+import { parse, toSource, walk, analyze, isMask, fold, checkSpec } from './fuse.mjs';
 import { generateGroupBy, generateCompact, generateHashGroups, generateMarkPairs, generateStridedKeys } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
@@ -88,12 +88,19 @@ export class Table {
     if (!entries.length) throw new TypeError('vectro: a table needs at least one column');
     const len = (v) => (isCoded(v) ? v.codes.length : v.dates ? v.dates.length : v.length);
     const n = len(entries[0][1]);
-    const cols = new Map();
-    for (const [name, values] of entries) {
+    for (const [name, values] of entries) { // (checked before anything is copied)
       checkName(name);
       if (len(values) !== n) throw new RangeError(`vectro: column "${name}" has ${len(values)} rows, expected ${n}`);
-      cols.set(name, values.dates ? { data: copyNumbers(engine, type, values.dates), dict: null, codes: null, date: true }
-        : isCoded(values) ? codedText(engine, type, values) : isText(values) ? encodeText(engine, type, values) : { data: copyNumbers(engine, type, values), dict: null, codes: null });
+    }
+    const cols = new Map();
+    try {
+      for (const [name, values] of entries) {
+        cols.set(name, values.dates ? { data: copyNumbers(engine, type, values.dates), dict: null, codes: null, date: true }
+          : isCoded(values) ? codedText(engine, type, values) : isText(values) ? encodeText(engine, type, values) : { data: copyNumbers(engine, type, values), dict: null, codes: null });
+      }
+    } catch (err) { // (a bad code, out of memory: the columns copied so far go back)
+      for (const c of cols.values()) engine.free(c.data);
+      throw err;
     }
     const t = new Table(engine, cols, n, { owned: [...cols.keys()] });
     return compress ? t.compress() : t;
@@ -104,26 +111,28 @@ export class Table {
     if (!rows.length) throw new TypeError('vectro: no rows');
     const n = rows.length;
     const cols = new Map();
-    for (const name of Object.keys(rows[0])) {
-      checkName(name);
-      const data = engine.alloc(type, n);
-      const first = firstPresent(rows.map((r) => r[name]));
-      if (typeof first === 'string') {
-        const codes = new Map(), dict = [];
-        for (let i = 0; i < n; i++) {
-          const s = rows[i][name] ?? ''; // (null / undefined: missing text)
-          let c = codes.get(s);
-          if (c === undefined) { c = dict.length; dict.push(s); codes.set(s, c); }
-          data[i] = c;
+    for (const name of Object.keys(rows[0])) checkName(name); // (checked before anything is copied)
+    try {
+      for (const name of Object.keys(rows[0])) {
+        const data = engine.alloc(type, n);
+        const first = firstPresent(rows.map((r) => r[name]));
+        if (typeof first === 'string') {
+          const codes = new Map(), dict = [];
+          for (let i = 0; i < n; i++) {
+            const s = rows[i][name] ?? ''; // (null / undefined: missing text)
+            let c = codes.get(s);
+            if (c === undefined) { c = dict.length; dict.push(s); codes.set(s, c); }
+            data[i] = c;
+          }
+          cols.set(name, { data, dict, codes });
+        } else {
+          const date = first instanceof Date;
+          if (date && type === Float32Array) { engine.free(data); throw new Error(f32Dates(name)); }
+          for (let i = 0; i < n; i++) { const v = rows[i][name]; data[i] = v === null || v === undefined ? NaN : date ? toMillis(v) : v; } // (null: missing)
+          cols.set(name, { data, dict: null, codes: null, ...(date ? { date: true } : {}) });
         }
-        cols.set(name, { data, dict, codes });
-      } else {
-        const date = first instanceof Date;
-        if (date && type === Float32Array) throw new Error(f32Dates(name));
-        for (let i = 0; i < n; i++) { const v = rows[i][name]; data[i] = v === null || v === undefined ? NaN : date ? toMillis(v) : v; } // (null: missing)
-        cols.set(name, { data, dict: null, codes: null, ...(date ? { date: true } : {}) });
       }
-    }
+    } catch (err) { for (const c of cols.values()) engine.free(c.data); throw err; } // (out of memory: the columns copied so far go back)
     return new Table(engine, cols, n, { owned: [...cols.keys()] });
   }
 
@@ -371,6 +380,7 @@ export class Table {
   aggAsync(spec, params = {}) { return this.engine._driveAsync(this.#aggG(spec, params)); }
 
   *#aggG(spec, params) {
+    checkSpec(spec);
     if (!this.engine.jit && this.#hasPacked()) return yield* this.#viaPlainG((t) => t.#aggG(spec, params)); // (the interpreter reads plain numbers)
     const narrow = this.#narrow();
     if (narrow !== this) return yield* narrow.#aggG(spec, params);
@@ -1713,6 +1723,7 @@ export class Table {
     const narrow = this.#narrow(); // sample and count only rows that can match the filter
     if (narrow !== this) return yield* narrow.#topG(k, by);
     const { engine } = this;
+    if (typeof k !== 'number' || k !== k) throw new TypeError(`vectro: top(k, by) needs k, the number of rows to keep, got ${typeof k === 'number' ? k : JSON.stringify(k) ?? k}`);
     k = Math.max(0, Math.floor(k));
     const keys = parseKeys(by, this.cols);
     const n = this.n;
@@ -1725,6 +1736,7 @@ export class Table {
     };
     // small tables, k close to n, or a text first key: just sort
     if (keys[0].column || n <= 50_000 || k * 8 >= n) return yield* sortAll(this);
+    this.#bind(keys[0].text, {}); // (an unknown column: reported with this table's columns, not the sample's)
 
     // A cutoff from an evenly spaced sample: the first key is computed for the
     // sampled rows only. The full passes (count, then collect) are fused
@@ -1987,7 +1999,7 @@ function codedText(engine, type, { codes: src, labels }) {
   });
   for (let i = 0; i < src.length; i++) {
     const c = src[i];
-    if (!(c >= 0 && c < labels.length)) throw new RangeError(`vectro: code ${c} at row ${i} has no label (${labels.length} labels)`);
+    if (!(c >= 0 && c < labels.length)) { engine.free(data); throw new RangeError(`vectro: code ${c} at row ${i} has no label (${labels.length} labels)`); }
     data[i] = lut[c];
   }
   return { data, dict, codes };
