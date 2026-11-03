@@ -11,7 +11,7 @@
 
 import { Table } from './table.mjs';
 import { OP, MAX_ARGS } from './kernels.mjs';
-import { parseNumber, STR_SHIFT, STR_ESCAPED, CSV_FIELD_START } from './csv-kernel.mjs';
+import { parseNumber, STR_SHIFT, STR_ESCAPED, STR_MAX_LEN, CSV_FIELD_START } from './csv-kernel.mjs';
 import { parseDateBytes, looksLikeDate, f32Dates } from './dates.mjs';
 import { decode, encode, indexOfByte } from './bytes.mjs';
 
@@ -75,7 +75,13 @@ function* loadBytesG(engine, bytes, opts = {}) {
       if (want && !want.has(nm)) { fieldMap[f] = -1; return; }
       fieldMap[f] = out.length;
       if (info.kinds[f] === 'date' && type === Float32Array) throw new Error(f32Dates(nm));
-      out.push({ name: nm, kind: KIND[info.kinds[f]], date: info.kinds[f] === 'date' });
+      let kind = info.kinds[f];
+      // free text is stored as byte offsets, which float32 can't hold exactly: a category instead
+      if (kind === 'string' && type === Float32Array) {
+        if (types[nm] === 'string') throw new Error(`vectro: "${nm}" is a free-text column, and a Float32Array table can't hold its byte offsets exactly; load it with types: { ${nm}: 'category' }, or use the default Float64Array`);
+        kind = 'category';
+      }
+      out.push({ name: nm, kind: KIND[kind], date: kind === 'date' });
     });
 
     // Cut points at row boundaries.
@@ -133,7 +139,7 @@ function* loadBytesG(engine, bytes, opts = {}) {
     const kinds = engine.alloc(Float64Array, out.length), check = engine.alloc(Float64Array, out.length);
     temp.push(kinds, check);
     const guessed = (nm) => (checkTypes ? checkTypes.includes(nm) : !(nm in types));
-    out.forEach((c, o) => { kinds[o] = c.kind; check[o] = guessed(c.name) && (c.kind === 0 || c.date) ? 1 : 0; });
+    out.forEach((c, o) => { kinds[o] = c.kind; check[o] = guessed(c.name) && (c.kind === 0 || c.kind === 2) ? 1 : 0; }); // (2: dates and free text)
     // One dictionary message per chunk per category column. A task takes at most MAX_ARGS arrays,
     // so a very wide file is parsed in batches of columns (the others skipped in each pass).
     const messages = [];
@@ -184,12 +190,15 @@ function* loadBytesG(engine, bytes, opts = {}) {
         if (col[r] !== col[r] && len && checked[o] === 1 && decode(bytes, s, s + len).trim()) checked[o] = 2;
       }
     });
-    // A guessed number or date column with other text after the sampled rows: loaded again as
+    // A guessed number or date column with other text after the sampled rows, or a guessed
+    // free-text column with a value too long for a byte ref (see csvParse): loaded again as
     // text (category), or a clear error where pieces are parsed apart (split tables, datasets).
     const bad = out.filter((c, o) => checked[o] === 2).map((c) => c.name);
     if (bad.length) {
       const fix = Object.fromEntries(bad.map((nm) => [nm, 'category']));
-      if (badType === 'throw') throw new Error(`vectro: column${bad.length > 1 ? 's' : ''} ${bad.map((nm) => `"${nm}"`).join(', ')} looked like ${out.find((c) => c.name === bad[0]).date ? 'dates' : 'numbers'} in the first ${sampleRows} rows, but later rows have other text; load with types: ${JSON.stringify(fix)}`);
+      const first = out.find((c) => c.name === bad[0]);
+      if (badType === 'throw') throw new Error(first.kind === 2 && !first.date ? `vectro: column "${first.name}" has a text value longer than ${STR_MAX_LEN} bytes; load with types: ${JSON.stringify(fix)}`
+        : `vectro: column${bad.length > 1 ? 's' : ''} ${bad.map((nm) => `"${nm}"`).join(', ')} looked like ${first.date ? 'dates' : 'numbers'} in the first ${sampleRows} rows, but later rows have other text; load with types: ${JSON.stringify(fix)}`);
       for (const c of cols) engine.free(c);
       temp.shift(); // (the bytes go on to the next try)
       return yield* loadBytesG(engine, bytes, { ...opts, types: { ...types, ...fix } });

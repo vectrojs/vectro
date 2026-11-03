@@ -142,9 +142,12 @@ export class Table {
   // ---- expressions ----------------------------------------------------------------
 
   // Parse an expression, swap text literals for dictionary codes, and check
-  // every name is a column or a param. Returns { ast, src }.
-  #bind(src, params) {
-    const ast = rewriteText(parse(src), this.cols, src);
+  // every name is a column or a param. Returns { ast, src }. codes: the expression may do
+  // arithmetic on text columns' codes (internal group numbers and keys), else that is an error.
+  #bind(src, params, codes = false) {
+    const parsed = parse(src);
+    if (!codes) checkTextUse(parsed, this.cols, src);
+    const ast = rewriteText(parsed, this.cols, src);
     // a text function matching labels scattered over many codes: one 0 / 1 per row, made from its
     // per-label answers (once per column's data), added as a hidden column the kernels read
     walk(ast, (m) => {
@@ -332,11 +335,12 @@ export class Table {
   filter(expr, params = {}) {
     const merged = this.#mergeParams(params);
     let { ast, src } = this.#bind(expr, merged);
+    if (ast.t === 'var' && this.cols.get(ast.name)?.dict) textAsNumber(ast.name, expr); // filter('city'): its codes as conditions
     walk(ast, (m) => { if (m.t === 'str') throw new SyntaxError(`vectro: text like ${JSON.stringify(m.v)} can only be compared with == or != to a text column, in "${expr}" (to compare dates, load the column as dates: { dates: ['name'] })`); });
-    const k = fold(ast);
-    if (k.t === 'num') { // no column in it (1 == 1, 0): every row, or none (a kernel needs a column to read)
+    const k = fold(withParams(ast, merged, this.cols));
+    if (k.t === 'num') { // no column in it (1 == 1, on == 1 with a param): every row, or none (a kernel needs a column to read)
       if (k.v !== 0) return new Table(this.engine, this.cols, this.n, { pred: this.pred, params: merged, zones: this.zones });
-      const c = [...this.cols.keys()].find((x) => !this.cols.get(x).strings);
+      const c = [...this.cols.keys()].find((x) => !this.cols.get(x).strings) ?? this.cols.keys().next().value;
       src = `${c} != ${c} && ${c} == ${c}`;
     }
     const pred = this.pred ? `(${this.pred}) && (${src})` : src;
@@ -344,14 +348,15 @@ export class Table {
   }
 
   // New column computed for every row, in one fused pass.
-  derive(name, expr, params = {}) { return this.engine._drive(this.#deriveG(name, expr, params)); }
-  deriveAsync(name, expr, params = {}) { return this.engine._driveAsync(this.#deriveG(name, expr, params)); }
+  // (internal columns, named __...: keys made from text codes on purpose, see #bind)
+  derive(name, expr, params = {}) { return this.engine._drive(this.#deriveG(name, expr, params, name.startsWith('__'))); }
+  deriveAsync(name, expr, params = {}) { return this.engine._driveAsync(this.#deriveG(name, expr, params, name.startsWith('__'))); }
 
-  *#deriveG(name, expr, params) {
+  *#deriveG(name, expr, params, codes = false) {
     checkName(name);
     if (this.cols.has(name)) throw new Error(`vectro: column "${name}" already exists`);
     const merged = this.#mergeParams(params);
-    const { src } = this.#bind(expr, merged);
+    const { src } = this.#bind(expr, merged, codes);
     const out = this.engine.alloc(this.type, this.n);
     yield* this.engine.evalG(src, this.#vars(merged), out);
     const top = parse(expr);
@@ -416,10 +421,31 @@ export class Table {
         it.countSlot = slot(P ? `count((${P}) && (${it.present}))` : `count(${it.present})`);
       }
     }
-    const r = []; // a kernel takes at most 8 reductions: run them in batches
-    for (let i = 0; i < reductions.length; i += 8) r.push(...[(yield* this.engine.evalG(reductions.slice(i, i + 8), this.#vars(merged)))].flat());
+    // reductions that read no column (sum(1), count(p) with params) are worked out here (a
+    // kernel needs a column to read); the others run in batches (a kernel takes at most 8)
+    const r = reductions.map((src) => this.#constReduction(src, merged));
+    const run = reductions.flatMap((src, j) => (r[j] === undefined ? [[src, j]] : []));
+    for (let i = 0; i < run.length; i += 8) {
+      const batch = run.slice(i, i + 8), got = [(yield* this.engine.evalG(batch.map(([src]) => src), this.#vars(merged)))].flat();
+      batch.forEach(([, j], q) => { r[j] = got[q]; });
+    }
     const value = (it) => (it.value !== undefined ? it.value : it.presentSlot !== undefined ? (r[it.presentSlot] ? r[it.slot] : NaN) : it.countSlot === undefined ? r[it.slot] : r[it.slot] / r[it.countSlot]);
     return done(Object.fromEntries(items.map((it) => [it.out, value(it)])));
+  }
+
+  // The value of a reduction such as 'sum((1) == (1) ? (1) : 0)' that reads no column (params
+  // written in), as the kernels would add it up over every row; undefined if it reads one.
+  #constReduction(src, params) {
+    const ast = parse(src);
+    let reads = false;
+    walk(ast, (m) => { if (m.t === 'var' && this.cols.has(m.name)) reads = true; });
+    const k = reads ? null : fold(withParams(ast.args[0], params, this.cols));
+    if (k?.t !== 'num') return undefined;
+    const v = this.type === Float32Array ? Math.fround(k.v) : k.v, n = this.n; // (float32 kernels round it)
+    if (ast.fn === 'count') return k.v !== 0 ? n : 0; // (as the kernels count: NaN != 0)
+    if (ast.fn === 'sum') return n ? v * n : 0;
+    if (ast.fn === 'min' || ast.fn === 'max') return n ? v : IDENTITY[ast.fn];
+    return v; // mean
   }
 
   sum(expr, params) { return this.agg({ v: `sum(${expr})` }, params).v; }
@@ -444,6 +470,7 @@ export class Table {
     // a category column: its missing values are '' (count / countDistinct skip them, as SQL skips NULL)
     const a0 = ast.args[0], text = a0.t === 'var' && this.cols.get(a0.name)?.dict;
     if (text && ast.fn === 'count') return missingRules('count', this.#bind(`${a0.name} != ''`, params).src);
+    if (text && !DISTINCT.has(ast.fn)) textAsNumber(a0.name, src); // sum(city), min(city): of its codes
     if (text && DISTINCT.has(ast.fn)) return { fn: ast.fn, arg: this.#bind(`${a0.name} != '' ? ${a0.name} : 0 / 0`, params).src };
     if (!DISTINCT.has(ast.fn)) return missingRules(ast.fn, this.#bind(toSource(ast.args[0]), params).src);
     if (DISTINCT.has(ast.fn) && ast.args[0].t === 'var' && this.cols.get(ast.args[0].name)?.strings) {
@@ -908,7 +935,7 @@ export class Table {
     if (!this.n) return;
     const gData = engine.alloc(this.type, this.n);
     try {
-      yield* engine.evalG(this.#bind(group, merged).src, this.#vars(merged), gData);
+      yield* engine.evalG(this.#bind(group, merged, true).src, this.#vars(merged), gData);
       const predAst = this.pred ? parse(this.pred) : null;
       const names = [...analysis.vars];
       if (predAst) walk(predAst, (m) => { if (m.t === 'var' && !names.includes(m.name)) names.push(m.name); });
@@ -1693,6 +1720,8 @@ export class Table {
     // copy only the columns the first key reads (a table can be very wide)
     const used = new Set();
     walk(parse(keys[0].text), (m) => { if (m.t === 'var' && this.cols.has(m.name)) used.add(m.name); });
+    // a first key that reads no column is the same on every row: the other keys decide (none: table order)
+    if (!used.size) return yield* (keys.length > 1 ? this.#topG(k, [by].flat().slice(1)) : this.#headG(k));
     const sampleTable = this.#gather(picked, picked.length, new Set(this.columnNames.filter((nm) => !used.has(nm))));
     let sample;
     try {
@@ -1885,6 +1914,37 @@ function checkName(name) {
   if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _)`);
 }
 
+// A category column used as a number (city > 0, price + city, -city) would use its codes, which
+// mean nothing as numbers: an error. Checked before rewriteText, which compares codes itself.
+// Allowed: == / != (to text in quotes), text functions, isMissing, coalesce, and passing the
+// value through (a copy of the column, a branch of ? :).
+function textAsNumber(name, src) {
+  throw new TypeError(`vectro: ${name} is a text column; compare it with == or != to text in quotes (${name} == 'Paris') or use a text function such as startsWith(${name}, 'P'), but it can't be used as a number, in "${src}"`);
+}
+function checkTextUse(ast, cols, src) {
+  const PASS = new Set([...Object.keys(TEXT_FNS), 'isMissing', 'coalesce', 'sum', 'count', 'mean', 'min', 'max']); // (reductions: from datasets, see #groupIntoG)
+  const asNumber = (n) => { if (n.t === 'var' && cols.get(n.name)?.dict) textAsNumber(n.name, src); visit(n); };
+  const visit = (n) => {
+    if (n.t === 'bin') { const f = n.op === '==' || n.op === '!=' || n.l.t === 'str' || n.r.t === 'str' ? visit : asNumber; f(n.l); f(n.r); } // (ts >= '2024-06-01': its own error, about dates)
+    else if (n.t === 'un') asNumber(n.x);
+    else if (n.t === 'cond') { asNumber(n.c); visit(n.x); visit(n.y); }
+    else if (n.t === 'call') n.args.forEach(PASS.has(n.fn) && (n.args.length === 1 || !(n.fn === 'min' || n.fn === 'max')) ? visit : asNumber);
+  };
+  visit(ast);
+}
+
+// The expression with params written in as numbers (for folding: on == 1 with { on: 1 } reads no column).
+function withParams(n, params, cols) {
+  switch (n.t) {
+    case 'var': return !cols.has(n.name) && typeof params[n.name] === 'number' ? { t: 'num', v: params[n.name] } : n;
+    case 'un': return { ...n, x: withParams(n.x, params, cols) };
+    case 'bin': return { ...n, l: withParams(n.l, params, cols), r: withParams(n.r, params, cols) };
+    case 'call': return { ...n, args: n.args.map((a) => withParams(a, params, cols)) };
+    case 'cond': return { ...n, c: withParams(n.c, params, cols), x: withParams(n.x, params, cols), y: withParams(n.y, params, cols) };
+  }
+  return n;
+}
+
 // Missing values (NaN) in aggregations, as in SQL: sum and mean skip them
 // (mean divides by the values present), min and max skip them, count(x)
 // counts the values present (count(condition) still counts where it holds).
@@ -1966,7 +2026,7 @@ function textCall(n, cols, src) {
   if (!rest.length || rest.some((a) => a.t !== 'str')) throw new SyntaxError(`vectro: ${n.fn}(${colNode.name}, …) needs text in quotes after the column, in "${src}"`);
   if (n.fn !== 'in' && rest.length !== 1) throw new SyntaxError(`vectro: ${n.fn}() takes a column and one text, in "${src}"`);
   const args = rest.map((a) => a.v);
-  const re = n.fn === 'like' || n.fn === 'ilike' ? new RegExp(`^${args[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`, n.fn === 'ilike' ? 'iu' : '') : null;
+  const re = n.fn === 'like' || n.fn === 'ilike' ? new RegExp(`^${args[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`, n.fn === 'ilike' ? 'iu' : 'u') : null; // (u: _ is one character, an emoji too)
   const match = c.dict.map((label) => TEXT_FNS[n.fn](label, args, re));
   // runs of consecutive codes that match (or, if shorter, that don't)
   const runs = (want) => {

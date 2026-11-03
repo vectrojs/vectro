@@ -300,6 +300,8 @@ function* execG(node, needed, temps) {
         const by = sortNode.by.map((b) => {
           const m = IDENT.exec(String(b));
           if (m && !s.derived.has(m[2])) return String(b).trim(); // a column ('-region' stays a label sort)
+          const same = m ? inline(parse(m[2]), s.derived) : null;
+          if (same?.t === 'var') return `${m[1]}${same.name}`; // a copy of a column: sorted as that column (text by label)
           return toSource(inline(parse(String(b)), s.derived));
         });
         r = yield { table: base, method: k === null ? 'sort' : 'top', args: k === null ? [by] : [k, by] };

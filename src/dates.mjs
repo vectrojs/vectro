@@ -19,6 +19,9 @@ export function daysFromCivil(y, m, d) {
   return era * 146097 + yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy - 719468;
 }
 
+const MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const daysInMonth = (y, m) => (m === 2 && y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0) ? 29 : MONTH_DAYS[m - 1]);
+
 // ISO 8601 date or date-time from bytes [s, e): YYYY-MM-DD, then optionally
 // T or space, HH:MM, :SS, .fraction, and Z or ±HH:MM / ±HHMM. NaN if it isn't one.
 export function parseDateBytes(b, s, e) {
@@ -35,7 +38,7 @@ export function parseDateBytes(b, s, e) {
   if (mo < 1 || mo > 12 || b[i] !== 45) return NaN;
   i++;
   const d = num(2);
-  if (d < 1 || d > 31) return NaN;
+  if (d < 1 || d > daysInMonth(neg ? -y : y, mo)) return NaN; // (2024-02-31 isn't a date: not rolled into March)
   let ms = daysFromCivil(neg ? -y : y, mo, d) * DAY;
   if (i === e) return ms;
   if (b[i] !== 84 && b[i] !== 116 && b[i] !== 32) return NaN;   // T, t or space
