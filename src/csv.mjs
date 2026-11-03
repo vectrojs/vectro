@@ -56,11 +56,13 @@ export function loadBytesAsync(engine, bytes, opts) { return engine._driveAsync(
 //              types); badType 'retype' (default): one with a value that isn't
 //              its type (text after the sampled rows) is loaded again as text;
 //              'throw': a clear error instead (pieces parsed separately)
+//   trimEnd    false: the bytes are a piece of a file, not its end, so blank lines at their end
+//              are rows (of missing values), as in the middle of a file
 function* loadBytesG(engine, bytes, opts = {}) {
-  const { delimiter = ',', header = true, types = {}, columns: only = null, type = Float64Array, sampleRows = 1000, chunkBytes = CHUNK_BYTES, pieces = null, onPieceRows = null, checkTypes = null, badType = 'retype' } = opts;
+  const { delimiter = ',', header = true, types = {}, columns: only = null, type = Float64Array, sampleRows = 1000, chunkBytes = CHUNK_BYTES, pieces = null, onPieceRows = null, checkTypes = null, badType = 'retype', trimEnd = true } = opts;
   const temp = [bytes];
   try {
-    const info = inspectCSV(bytes, { delimiter, header, types, sampleRows });
+    const info = inspectCSV(bytes, { delimiter, header, types, sampleRows, trimEnd });
     const { delim, names } = info;
     let { start, end } = info;
     const nFields = names.length;
@@ -220,13 +222,13 @@ function* loadBytesG(engine, bytes, opts = {}) {
 // Header, data range and column types of CSV bytes, from the header and a
 // sample of rows (the rest isn't read). kinds[f] is 'number', 'category' or
 // 'string' for field f, after applying the `types` overrides.
-export function inspectCSV(bytes, { delimiter = ',', header = true, types = {}, sampleRows = 1000 } = {}) {
+export function inspectCSV(bytes, { delimiter = ',', header = true, types = {}, sampleRows = 1000, trimEnd = true } = {}) {
   const delim = delimiter.charCodeAt(0);
   if (delimiter.length !== 1 || delim === QUOTE || delim === NL) throw new Error('vectro: delimiter must be one character, not a quote or newline');
 
   let start = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0; // UTF-8 BOM
   let end = bytes.length;
-  while (end > start && (bytes[end - 1] === NL || bytes[end - 1] === CR)) end--;
+  if (trimEnd) while (end > start && (bytes[end - 1] === NL || bytes[end - 1] === CR)) end--; // (blank lines at the end of the file: no rows)
 
   const first = splitRow(bytes, start, end, delim);
   const headerStart = start;
@@ -308,9 +310,11 @@ export function cleanNames(raw) {
     if (RESERVED.has(nm)) nm = `${nm}_`;
     return nm;
   });
-  // a repeated name gets _2, _3... skipping every name the header already has (a, a, a_2 -> a, a_3, a_2)
-  const taken = new Set(base), used = new Set();
-  return base.map((nm) => {
+  // a name that is already fine keeps it (a-b, a_b -> a_b_2, a_b); a repeated name gets _2, _3...
+  // skipping every name the header already has (a, a, a_2 -> a, a_3, a_2)
+  const taken = new Set(base), used = new Set(), kept = base.map((nm, i) => nm === raw[i] && !used.has(nm) && used.add(nm));
+  return base.map((nm, i) => {
+    if (kept[i]) return nm;
     if (!used.has(nm)) { used.add(nm); return nm; }
     let k = 2;
     while (taken.has(`${nm}_${k}`) || used.has(`${nm}_${k}`)) k++;

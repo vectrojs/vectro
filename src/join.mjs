@@ -90,10 +90,10 @@ export function* joinTablesG(L, R, opts = {}, makeTable) {
       return dst;
     };
     const out = new Map();
-    for (const [name, c] of L.cols) out.set(name, { ...c, data: yield* gather(c.data, li), zones: undefined });
+    for (const [name, c] of L.cols) if (!c.hidden) out.set(name, { ...c, data: yield* gather(c.data, li), zones: undefined }); // (hidden: a text filter's 0 / 1, not shown)
     const sameKey = new Set(rk.filter((name, k) => lk[k] === name));
     for (const [name, c] of R.cols) {
-      if (sameKey.has(name)) continue;
+      if (sameKey.has(name) || c.hidden) continue;
       let src = c.data, dict = c.dict, codes = c.codes;
       if (how === 'left') { // one more row at the end: the value for "no match"
         let x = build.extended.get(`${name}|${arrayId(c.data)}`);
@@ -199,7 +199,7 @@ export function* joinViewG(L, R, opts = {}, collectLeft, makeView) {
     const sameKey = new Set(rk.filter((name, k) => lk[k] === name));
     const looked = [];
     for (const [name, c] of R.cols) {
-      if (sameKey.has(name)) continue;
+      if (sameKey.has(name) || c.hidden) continue;
       let outName = name;
       while (cols.has(outName)) outName += suffix;
       const x = byGroup(`c:${name}|${arrayId(c.data)}`, c);
@@ -244,6 +244,7 @@ function* unmatchedRightG(engine, R, build, hit, ids, n, t) {
     if (u) for (let r = 0, o = 0; r < nR; r++) if (!h[rid[r] + 1]) rv[o++] = r;
     const cols = new Map();
     for (const [name, c] of R.cols) {
+      if (c.hidden) continue;
       let data;
       if (engine.jit && u) data = yield* gatherG(engine, c.data, rows, u, t);
       else { data = engine.alloc(R.type, u); const a = engine.live(c.data), d = engine.live(data); for (let i = 0; i < u; i++) d[i] = a[rv[i]]; }
