@@ -31,6 +31,8 @@ const BLOCK_ROWS = 4096; // rows per block when dealing out arrays
 const CSV_PIECE_BYTES = 64 * 1024, MAX_CSV_PIECES_PER_WORKER = 64;
 const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count', 'countDistinct', 'approxDistinct']);
 
+const closedError = () => new Error('vectro: this engine is closed (close() was called); create a new SplitEngine');
+
 // spawn() must return { post(msg, transfer), onMessage(fn), terminate() } and
 // may add onError(fn): fn(error) when the worker crashes or is killed.
 export class SplitEngine {
@@ -43,6 +45,7 @@ export class SplitEngine {
     this.rid = 0;
     this.nextTable = 0;
     this.localEngine = null;
+    this.closed = false;
     for (let i = 0; i < this.size; i++) {
       const w = spawn();
       w.onMessage((m) => {
@@ -66,6 +69,7 @@ export class SplitEngine {
   }
 
   _call(i, op, args, transfer = []) {
+    if (this.closed) return Promise.reject(closedError());
     if (this.failed[i]) return Promise.reject(this.failed[i]);
     const rid = ++this.rid;
     return new Promise((resolve, reject) => {
@@ -227,6 +231,7 @@ export class SplitEngine {
   // TCP stream (Node), so the data never passes through this thread.
   async streamAsync({ columns, format = 'csv', keepRows = Infinity, keepMs = null, timeColumn = null } = {}) {
     await this.ready;
+    if (this.closed) throw closedError();
     if (!columns || !Object.keys(columns).length) throw new Error('vectro: streamAsync needs columns, e.g. { ts: "number", region: "category" }');
     const id = ++this.nextTable;
     const perWorker = Number.isFinite(keepRows) ? Math.ceil(keepRows / this.size) : Infinity;
@@ -236,9 +241,14 @@ export class SplitEngine {
     return t;
   }
 
+  // Calls still waiting reject with "this engine is closed", as does every later call.
   async close() {
+    this.closed = true;
+    this.ready.catch(() => {}); // (closed before it was ready: nobody may be waiting)
     for (const w of this.workers) w.terminate();
     this.workers = [];
+    for (const p of this.pending.values()) p.reject(closedError());
+    this.pending.clear();
     await this.localEngine?.close();
   }
 }
