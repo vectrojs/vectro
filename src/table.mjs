@@ -2106,7 +2106,7 @@ const TEXT_FNS = {
   ilike: (label, [pattern], re) => re.test(lowerAll(label)), // (both lowercased, as DuckDB's ILIKE: the pattern below)
 };
 // lowercase one character at a time, as DuckDB's lower(): 'İ' is 'i', a final 'Σ' is 'σ'
-const lowerAll = (s) => s.replace(/[\u0130\u03a3]/g, (c) => (c === '\u0130' ? 'i' : '\u03c3')).toLowerCase();
+export const lowerAll = (s) => s.replace(/[\u0130\u03a3]/g, (c) => (c === '\u0130' ? 'i' : '\u03c3')).toLowerCase();
 const MAX_RANGES = 256;
 const LUT_NAMES = new Map(); // column|function|args -> the name of its per-row 0 / 1 array
 const MASKS = new WeakMap(); // a column's data array -> those arrays made for it (freed with it)

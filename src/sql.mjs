@@ -33,6 +33,7 @@
 import { Query, namesOf, findDataset } from './plan.mjs';
 import { quoteText } from './fuse.mjs';
 import { byCodePoint } from './sort.mjs';
+import { lowerAll } from './table.mjs';
 import { decodeOne } from './pack.mjs';
 import { TEXT_FUNCTIONS, toText, isNull, textToNumber, textToDate } from './sqltext.mjs';
 
@@ -934,7 +935,7 @@ function compileSelect(ast, env, outer, tail) {
     if (!keys.length) { sq = sq.derive('__g', '0'); keys = ['__g']; }
     sq = sq.groupBy(keys).agg({ __n: 'count()', __nn: `count(${missing})` });
     const [cn, cnn] = attach({ ...rel, query: sq, names: [...keys, '__n', '__nn'] }, outerKeys, relKeys, ['__n', '__nn'], ctx);
-    const [m] = attach(rel, [translate(e.x, ctx), ...outerKeys], [vcol, ...relKeys], [mcol], ctx);
+    const [m] = attach(rel, [valueOf(e.x, ctx), ...outerKeys], [vcol, ...relKeys], [mcol], ctx);
     const isIn = bin('==', v(m), num(1));
     const none = bin('==', call('coalesce', v(cn), num(0)), num(0));
     return bin('||', none, bin('&&', bin('&&', present(e.x, ctx), { t: 'un', op: '!', x: isIn }), bin('==', call('coalesce', v(cnn), num(0)), num(0))));
@@ -959,7 +960,7 @@ function compileSelect(ast, env, outer, tail) {
           if (rel.names.length !== 1) fail('IN (SELECT ...) needs exactly one column');
           const dist = { ...rel, query: rel.query.groupBy([rel.names[0]]).agg({ __m: 'count()' }).derive('__m1', '1') };
           if (negate) return notInValue(e, ctx, { ...dist, names: [rel.names[0], '__m', '__m1'] }, rel.names[0], '__m1', [], []);
-          const [m] = attach({ ...dist, names: [rel.names[0], '__m1'] }, [translate(e.x, ctx)], [rel.names[0]], ['__m1'], ctx);
+          const [m] = attach({ ...dist, names: [rel.names[0], '__m1'] }, [valueOf(e.x, ctx)], [rel.names[0]], ['__m1'], ctx);
           return bin('==', v(m), num(1));
         }
         fail('IN (SELECT ...) needs exactly one column');
@@ -969,7 +970,7 @@ function compileSelect(ast, env, outer, tail) {
       let rel = compileQuery({ ...inner, body: sel, orderBy: [], limit: null, offset: 0 }, env, outerHere);
       if (body.groupBy?.length) { const keys = ['__v', ...keyItems.map((it) => it.alias)]; rel = { ...rel, query: rel.query.groupBy(keys).agg({ __c: 'count()' }).derive('__m', '1'), names: [...keys, '__m'] }; }
       if (negate) return notInValue(e, ctx, rel, '__v', '__m', keyItems.map((it) => it.alias), pairs.map((pr) => translate(pr.outer, ctx)));
-      const [m] = attach(rel, [translate(e.x, ctx), ...pairs.map((pr) => translate(pr.outer, ctx))], ['__v', ...keyItems.map((it) => it.alias)], ['__m'], ctx);
+      const [m] = attach(rel, [valueOf(e.x, ctx), ...pairs.map((pr) => translate(pr.outer, ctx))], ['__v', ...keyItems.map((it) => it.alias)], ['__m'], ctx);
       return bin('==', v(m), num(1));
     }
     // (SELECT one value)
@@ -1004,6 +1005,7 @@ function compileSelect(ast, env, outer, tail) {
       case 'cast': return TEXT_TYPES.has(e.type) ? 'text' : DATE_TYPES.has(e.type) ? 'date' : 'number';
       case 'bin': return (e.op === '+' || e.op === '-') && (kindOf(e.l, ctx) === 'date') !== (kindOf(e.r, ctx) === 'date') ? 'date' : 'number'; // (a date plus or minus days or an interval)
       case 'case': return mostKind([...e.whens.map((w) => kindOf(w.v, ctx)), kindOf(e.otherwise, ctx)]);
+      case 'subq': return (e.kind ??= subqueryKind(e, ctx));
       case 'call':
         if (TEXT_FUNCTIONS[e.fn] && !isAgg(e)) return TEXT_FUNCTIONS[e.fn].out === 'text' ? 'text' : 'number';
         if (['COALESCE', 'IFNULL', 'NVL', 'NULLIF'].includes(e.fn)) return mostKind(e.args.map((a) => kindOf(a, ctx)));
@@ -1015,6 +1017,16 @@ function compileSelect(ast, env, outer, tail) {
         return 'number';
       default: return 'number';
     }
+  }
+  // (SELECT one value): the kind of its column, from its plan (nothing runs); a correlated
+  // one by its aggregate's argument (MIN(name) is text)
+  function subqueryKind(e, ctx) {
+    try {
+      const { inner, pairs } = correlate(e.q);
+      if (!pairs.length) { const rel = compileQuery(inner, env, outerHere); return rel.kinds.get(rel.names[0]) === 'text' ? 'text' : rel.kinds.get(rel.names[0]) === 'date' ? 'date' : 'number'; }
+      const it = inner.body.items?.[0]?.e;
+      return it?.k === 'str' ? 'text' : it?.k === 'call' && ['MIN', 'MAX'].includes(it.fn) && it.args[0]?.k === 'str' ? 'text' : 'number';
+    } catch { return 'number'; }
   }
   // version(), current_user...: { value, kind } or null
   function sessionFn(e) {
@@ -1281,23 +1293,30 @@ function compileSelect(ast, env, outer, tail) {
       }
       case 'between': {
         if (kindOf(e.x, ctx) === 'text') return T({ k: 'bin', op: 'AND', l: { k: 'bin', op: '>=', l: e.x, r: e.lo }, r: { k: 'bin', op: '<=', l: e.x, r: e.hi } });
-        const x = T(e.x);
-        return bin('&&', bin('>=', x, T(e.lo)), bin('<=', x, T(e.hi)));
+        const x = valueOf(e.x, ctx); // (a condition: 1, 0 or NULL, so an unknown one stays unknown)
+        return bin('&&', bin('>=', x, valueOf(e.lo, ctx)), bin('<=', x, valueOf(e.hi, ctx)));
       }
       case 'in': {
-        const x = T(e.x);
+        const x = kindOf(e.x, ctx) === 'text' ? T(e.x) : valueOf(e.x, ctx); // (a condition: 1, 0 or NULL)
         if (kindOf(e.x, ctx) === 'text') {
           if (e.list.some((i) => i.k !== 'str')) fail('IN on a text column takes text values in quotes');
           return call('in', x, ...e.list.map((i) => ({ t: 'str', v: i.v })));
         }
-        return e.list.map((i) => bin('==', x, T(i))).reduce((a, b) => bin('||', a, b));
+        return e.list.map((i) => bin('==', x, valueOf(i, ctx))).reduce((a, b) => bin('||', a, b));
       }
       case 'like': {
         if (e.pattern.k !== 'str') fail(`${e.ci ? 'ILIKE' : 'LIKE'} needs a pattern in quotes`);
         if (kindOf(e.x, ctx) !== 'text') fail(`${e.ci ? 'ILIKE' : 'LIKE'} works on text`);
         const there = present(e.x, ctx); // (missing text matches no pattern: unknown)
-        if (e.ci && e.x.k === 'col') return bin('&&', call('ilike', T(e.x), { t: 'str', v: e.pattern.v }), there); // (a column: label by label)
-        if (e.ci) return bin('&&', T({ k: 'like', x: { k: 'call', fn: 'LOWER', args: [e.x] }, pattern: { k: 'str', v: e.pattern.v.toLowerCase() } }), there);
+        if (e.ci) { // both sides lowercased as DuckDB does ('İ' is 'i'): a column (or text made into one) label by label
+          const tx = T(e.x);
+          if (tx.t === 'var') return bin('&&', call('ilike', tx, { t: 'str', v: e.pattern.v }), there);
+          if (tx.t === 'str') { // (text in quotes: worked out now)
+            const re = new RegExp(`^${lowerAll(e.pattern.v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`, 'u');
+            return num(tx.v !== '' && re.test(lowerAll(tx.v)) ? 1 : 0);
+          }
+          return bin('&&', T({ k: 'like', x: { k: 'call', fn: 'LOWER', args: [e.x] }, pattern: { k: 'str', v: lowerAll(e.pattern.v) } }), there);
+        }
         return bin('&&', call('like', T(e.x), { t: 'str', v: e.pattern.v }), there);
       }
       case 'isnull':
