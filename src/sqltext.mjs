@@ -106,7 +106,7 @@ function strftime(t, fmt) {
 // (missing values are left out instead of making the answer missing), f }
 export const TEXT_FUNCTIONS = {
   UPPER: { args: 's', out: 'text', f: (s) => s.toUpperCase() },
-  LOWER: { args: 's', out: 'text', f: (s) => s.toLowerCase() },
+  LOWER: { args: 's', out: 'text', f: (s) => s.replace(/[\u0130\u03a3]/g, (c) => (c === '\u0130' ? 'i' : '\u03c3')).toLowerCase() }, // (as DuckDB: İ is i, Σ is always σ)
   LENGTH: { args: 's', out: 'number', f: (s) => chars(s).length },
   OCTET_LENGTH: { args: 's', out: 'number', f: (s) => new TextEncoder().encode(s).length },
   TRIM: { args: 'ss', min: 1, out: 'text', f: (s, set = ' ') => trimSet(s, set, true, true) },
