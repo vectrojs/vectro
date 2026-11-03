@@ -1389,11 +1389,25 @@ export class Table {
     const KEEPS_KIND = new Set(['lag', 'lead', 'first_value', 'last_value', 'nth_value', 'min', 'max', 'percentile_disc']);
     for (const it of items) {
       if (cols.has(it.name)) throw new Error(`vectro: column "${it.name}" already exists`);
-      const vals = windowValues(n, b, { ...it, arg: it.arg ? values(it.arg) : null }, order.length > 0, orderKey, order[0]?.desc);
+      const src = it.arg && KEEPS_KIND.has(it.fn) ? t.cols.get(it.arg) : null; // (text stays text, dates stay dates)
+      let arg = it.arg ? values(it.arg) : null, codeOf = null;
+      if ((it.fn === 'min' || it.fn === 'max') && src?.dict) { // text: by its labels' order (missing text skipped), then back to codes
+        const rank = labelRanks(src.dict);
+        codeOf = new Float64Array(src.dict.length);
+        rank.forEach((r, code) => { if (r === r) codeOf[r] = code; });
+        arg = arg.map((code) => (code === code ? rank[code] : NaN));
+      }
+      let vals = windowValues(n, b, { ...it, arg }, order.length > 0, orderKey, order[0]?.desc);
+      if (codeOf) vals = vals.map((r) => (r === r ? codeOf[r] : NaN));
+      let dict = src?.dict ?? null, codes = src?.codes ?? null;
+      if (dict && vals.includes(NaN)) { // no row (LAG past the start, an empty frame): missing text, ''
+        let e = codes.get('');
+        if (e === undefined) { dict = [...dict, '']; codes = new Map(codes).set('', dict.length - 1); e = dict.length - 1; }
+        for (let i = 0; i < n; i++) if (vals[i] !== vals[i]) vals[i] = e;
+      }
       const data = engine.alloc(t.type, n);
       engine.live(data).set(vals);
-      const src = it.arg && KEEPS_KIND.has(it.fn) ? t.cols.get(it.arg) : null; // (text stays text, dates stay dates)
-      cols.set(it.name, { data, dict: src?.dict ?? null, codes: src?.codes ?? null, date: src?.date || (it.fn === 'percentile_cont' && t.cols.get(it.arg)?.date) || undefined });
+      cols.set(it.name, { data, dict, codes, date: src?.date || (it.fn === 'percentile_cont' && t.cols.get(it.arg)?.date) || undefined });
       owned.push(it.name);
     }
     for (const c of cols.values()) c.data = engine.live(c.data);

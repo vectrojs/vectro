@@ -56,32 +56,49 @@ function strftime(t, fmt) {
   const d = new Date(t), p2 = (x) => String(x).padStart(2, '0');
   const Y = d.getUTCFullYear(), M = d.getUTCMonth(), D = d.getUTCDate(), h = d.getUTCHours(), w = d.getUTCDay();
   const yday = Math.floor((Date.UTC(Y, M, D) - Date.UTC(Y, 0, 1)) / 86_400_000) + 1;
-  return fmt.replace(/%([a-zA-Z%])/g, (m, c) => {
+  const iso = () => { // ISO 8601 week and its year: the week's Thursday says which year it is in
+    const th = new Date(Date.UTC(Y, M, D + 3 - ((w + 6) % 7))), y = th.getUTCFullYear();
+    return { y, week: Math.floor((th - Date.UTC(y, 0, 1)) / 604_800_000) + 1 };
+  };
+  return fmt.replace(/%(-?)(.?)/g, (m, bare, c) => {
+    const n = (x, width) => (bare ? String(x) : String(x).padStart(width, '0')); // (%-d: no leading zeros)
     switch (c) {
       case 'Y': return String(Y);
-      case 'y': return p2(Y % 100);
-      case 'm': return p2(M + 1);
-      case 'd': return p2(D);
+      case 'y': return n(Y % 100, 2);
+      case 'm': return n(M + 1, 2);
+      case 'd': return n(D, 2);
+      case 'H': return n(h, 2);
+      case 'I': return n(h % 12 || 12, 2);
+      case 'M': return n(d.getUTCMinutes(), 2);
+      case 'S': return n(d.getUTCSeconds(), 2);
+      case 'j': return n(yday, 3);
+      case 'U': return n(Math.floor((yday - 1 + 7 - w) / 7), 2); // week of the year, from its first Sunday
+      case 'W': return n(Math.floor((yday - 1 + 7 - ((w + 6) % 7)) / 7), 2); // from its first Monday
+      case 'V': return n(iso().week, 2);
+      case 'G': return bare ? fail(m) : String(iso().y);
+    }
+    if (bare) fail(m);
+    switch (c) {
       case 'e': return String(D);
-      case 'H': return p2(h);
-      case 'I': return p2(h % 12 || 12);
       case 'p': return h < 12 ? 'AM' : 'PM';
-      case 'M': return p2(d.getUTCMinutes());
-      case 'S': return p2(d.getUTCSeconds());
       case 'f': return String(d.getUTCMilliseconds() * 1000).padStart(6, '0');
-      case 'j': return String(yday).padStart(3, '0');
+      case 'g': return String(d.getUTCMilliseconds()).padStart(3, '0'); // (milliseconds, as DuckDB has it)
       case 'a': return DAYS[w].slice(0, 3);
       case 'A': return DAYS[w];
       case 'w': return String(w);
       case 'u': return String(w || 7);
-      case 'b': return MONTHS[M].slice(0, 3);
+      case 'b': case 'h': return MONTHS[M].slice(0, 3);
       case 'B': return MONTHS[M];
-      case 'F': return `${Y}-${p2(M + 1)}-${p2(D)}`;
-      case 'T': return `${p2(h)}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`;
+      case 'F': case 'x': return `${Y}-${p2(M + 1)}-${p2(D)}`;
+      case 'T': case 'X': return `${p2(h)}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`;
+      case 'c': return `${Y}-${p2(M + 1)}-${p2(D)} ${p2(h)}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`;
+      case 'z': return '+00'; // (times are UTC)
+      case 'Z': return '';
       case '%': return '%';
-      default: return m;
+      default: return fail(m);
     }
   });
+  function fail(spec) { throw new SyntaxError(`vectro SQL: STRFTIME doesn't know ${spec} (it knows %Y %y %m %d %e %H %I %p %M %S %f %g %j %a %A %w %u %b %h %B %F %T %c %x %X %z %Z %U %W %V %G %%, and %-d %-m %-H %-I %-M %-S %-j %-y %-U %-W %-V without leading zeros)`); }
 }
 
 // name -> { args: types ('s' text, 'n' number, 't' time), min (args

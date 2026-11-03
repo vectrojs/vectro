@@ -77,7 +77,7 @@ function frames(n, b, frame, hasOrder, orderKey, desc) {
       let a = s, z = s;
       for (let i = s; i < end; i++) {
         const v = sign * orderKey[i];
-        if (v !== v) { lo[i] = qs[i]; hi[i] = qe[i]; continue; } // (missing keys: their ties)
+        if (v !== v) { if (f.start.n !== undefined) lo[i] = qs[i]; if (f.end.n !== undefined) hi[i] = qe[i]; continue; } // (missing keys: their ties, on the sides with a distance)
         if (f.start.n !== undefined) { const t = v + off(f.start); while (a < end && sign * orderKey[a] < t) a++; lo[i] = a; }
         if (f.end.n !== undefined) { const t = v + off(f.end); while (z < end && sign * orderKey[z] <= t) z++; hi[i] = z; }
       }
@@ -131,15 +131,17 @@ export function windowValues(n, b, item, hasOrder, orderKey, desc) {
     case 'last_value': for (let i = 0; i < n; i++) out[i] = hi[i] > lo[i] ? x[hi[i] - 1] : NaN; return out;
     case 'nth_value': for (let i = 0; i < n; i++) { const j = lo[i] + item.k - 1; out[i] = j < hi[i] ? x[j] : NaN; } return out;
     case 'sum': case 'avg': case 'count': {
-      // prefix sums of the values present, and of how many are present
+      // prefix sums of the values present, and of how many are present; the sums start
+      // again at each partition (s at a partition's first row reads as 0), so a huge
+      // value in one partition takes no digits from the next ones
       const s = new Float64Array(n + 1), c = new Float64Array(n + 1);
-      for (let i = 0; i < n; i++) { const v = x ? x[i] : 1; const ok = v === v; s[i + 1] = s[i] + (ok ? v : 0); c[i + 1] = c[i] + (ok ? 1 : 0); }
+      for (let i = 0; i < n; i++) { const v = x ? x[i] : 1; const ok = v === v; s[i + 1] = (i === ps[i] ? 0 : s[i]) + (ok ? v : 0); c[i + 1] = c[i] + (ok ? 1 : 0); }
       for (let i = 0; i < n; i++) {
-        const cnt = c[hi[i]] - c[lo[i]], sum = s[hi[i]] - s[lo[i]];
+        const cnt = c[hi[i]] - c[lo[i]], sum = (hi[i] === ps[i] ? 0 : s[hi[i]]) - (lo[i] === ps[i] ? 0 : s[lo[i]]);
         out[i] = item.fn === 'count' ? cnt : item.fn === 'avg' ? (cnt ? sum / cnt : NaN) : cnt ? sum : NaN; // (sum of nothing: NULL)
       }
-      if (item.fn === 'sum' && item.exactSmall !== false) { // short frames: add directly (prefix differences lose digits)
-        for (let i = 0; i < n; i++) if (hi[i] - lo[i] <= 64) { let t = 0, m = 0; for (let j = lo[i]; j < hi[i]; j++) { const v = x[j]; if (v === v) { t += v; m++; } } out[i] = m ? t : NaN; }
+      if (item.fn !== 'count' && item.exactSmall !== false) { // short frames: add directly (prefix differences lose digits)
+        for (let i = 0; i < n; i++) if (hi[i] - lo[i] <= 64) { let t = 0, m = 0; for (let j = lo[i]; j < hi[i]; j++) { const v = x[j]; if (v === v) { t += v; m++; } } out[i] = m ? (item.fn === 'avg' ? t / m : t) : NaN; }
       }
       return out;
     }
