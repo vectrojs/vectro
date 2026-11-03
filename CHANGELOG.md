@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.1.4
+
+Fixes from four more audit rounds: streams, SQL against DuckDB, the
+dataframe API against plain JavaScript, and the servers, plus a fuzzer
+(`npm run test:fuzz`) that now runs before every publish. No API changes.
+
+**Streams**
+- `keepRows` keeps the newest rows of the whole stream, and `keepMs`
+  measures from the newest time over all workers (they were per worker).
+- A CSV push or TCP connection cut inside a quoted field no longer loses rows.
+- Text filters over many labels (`contains`, `like`, `tag == bill`) on a live
+  stream free their 0 / 1 per row after each query. Before, they piled up
+  until the worker's memory grew and the query failed.
+
+**SQL**
+- Three-valued logic everywhere: a value used as a condition is true only
+  where it is present and not 0; a condition used as a value (COALESCE, CASE,
+  arithmetic, IN, BETWEEN, aggregates, windows) is 1 / 0 / NULL;
+  `(condition) IS NULL` is true where it is unknown.
+- Set operations: INTERSECT binds tighter than UNION and EXCEPT; NULL columns
+  take the other side's type; NULLS FIRST works after them.
+- Text: `<`, `>`, BETWEEN and joins compare by code point, as ORDER BY does;
+  a scalar subquery that returns text compares as text; ILIKE and LOWER
+  lowercase as DuckDB does (`İ` is `i`).
+- Windows over text (COUNT, LAG / LEAD, MIN / MAX); windowed SUM / AVG start
+  again at each partition; RANGE frames over dates count days.
+- Dates: `date + n` adds days, `DATE - DATE` gives days, MIN / MAX of dates
+  are dates. QUANTILE is QUANTILE_DISC, as in DuckDB. STRFTIME knows more
+  specifiers and refuses unknown ones.
+
+**Dataframe**
+- Expressions that read no column (`sum(1)`, `filter('on == 1', { on: 1 })`)
+  work; `-0` sorts as 0; text sorts by code point.
+- A text column used as a number (`city > 0`, `sum(city)`) is a clear error
+  instead of using its dictionary codes. Two text columns compare by label.
+- `compress()`, joins and `filter().select()` never show the hidden columns
+  text filters use.
+- `table()` checks every column before copying and frees what it copied if
+  one fails. Clearer messages for bad arguments and very deep expressions.
+
+**Loading data**
+- csvToDataset: blank lines at the end of a piece stay rows only when more
+  rows follow (as readCSV reads them); types are guessed from the first
+  1,000 complete rows, as readCSV guesses them.
+- JSON lines: text after the first 1,000 lines loads the column as text;
+  keys that first appear later become columns.
+- Impossible dates (2024-02-31) are missing, not rolled into March.
+- Free text in a Float32Array table loads as a category.
+
+**Engine and servers**
+- `close()` rejects queued and running queries (they stayed pending forever),
+  and every later call says the engine is closed. This covers every async
+  method, UNION queries, vector searches, live windows and `connect()`.
+- `POST /reload` loads first, then swaps the tables in; the old ones are
+  freed once the requests that started before have ended. The PostgreSQL
+  server frees old catalogs the same way.
+- Bad %-escapes in URLs are a 400; psql's `\d name` describes a table.
+
 ## 0.1.3
 
 Fixes from a second, wider audit: thousands of random cases for the
