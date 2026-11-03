@@ -78,40 +78,99 @@ export class ByteDict {
 }
 const POW10 = Array.from({ length: 23 }, (_, i) => 10 ** i);
 
-// Count quote characters (mode 0) or rows (mode 1) in chunk u.
+// The parser's quote rules as a state machine, so cuts and row counts agree
+// with it: a quote opens a quoted field only at the start of a field (a quote
+// inside an unquoted field, 27" or O"Brien, is a plain character); in a
+// quoted field "" is a quote and a lone quote closes it.
+//   0 field start, 1 in an unquoted field (or after a closing quote),
+//   2 in a quoted field, 3 a quote seen in a quoted field (closing, or half of "")
+export const CSV_FIELD_START = 0;
+function csvStep(state, c, delim) {
+  switch (state) {
+    case 0: return c === QUOTE ? 2 : c === NL || c === delim ? 0 : 1;
+    case 1: return c === NL || c === delim ? 0 : 1;
+    case 2: return c === QUOTE ? 3 : 2;
+    default: return c === QUOTE ? 2 : c === NL || c === delim ? 0 : 1;
+  }
+}
+// a row ends at a newline read in state 0, 1 or 3 (not inside a quoted field)
+const ROW_END = [true, true, false, true];
+
+// Chunk u: count quotes (mode 0), count rows from a field start (mode 1), or
+// (mode 2) run from each of the 4 states, writing into A[2] for each start
+// state s: [u * 8 + 2s] = the state at the chunk's end, [u * 8 + 2s + 1] = the
+// byte after the first row end (or -1). The caller then follows the real
+// state from chunk to chunk and cuts at row starts, all chunks scanned at once.
 // Rows are newlines outside quotes, plus a final line without a newline.
 export function csvScan(u, A, sc) {
   const bytes = A[0], bounds = A[1];
   const start = bounds[u], end = bounds[u + 1];
+  const mode = sc[0], hasQuotes = sc[1], delim = sc[2];
+  if (mode === 2) {
+    const info = A[2];
+    for (let s0 = 0; s0 < 4; s0++) {
+      let st = s0, first = -1;
+      for (let i = start; i < end; i++) {
+        const c = bytes[i];
+        if (c === NL && ROW_END[st]) { first = i + 1; break; }
+        st = csvStep(st, c, delim);
+      }
+      if (first >= 0) st = csvEnd(bytes, first, end, delim); // (a row ended: on from a field start)
+      info[u * 8 + 2 * s0] = st;
+      info[u * 8 + 2 * s0 + 1] = first;
+    }
+    return 0;
+  }
   if (end <= start) return 0;
-  const mode = sc[0], hasQuotes = sc[1];
   if (mode === 0) return countByte(bytes, QUOTE, start, end);
   let rows;
   if (!hasQuotes) {
     rows = countByte(bytes, NL, start, end); // native indexOf speed
   } else {
     rows = 0;
-    let inQuotes = false;
+    let st = 0;
     for (let i = start; i < end; i++) {
       const c = bytes[i];
-      if (c === QUOTE) inQuotes = !inQuotes;
-      else if (c === NL && !inQuotes) rows++;
+      if (c === NL && ROW_END[st]) { rows++; st = 0; continue; }
+      st = csvStep(st, c, delim);
     }
   }
   return bytes[end - 1] === NL ? rows : rows + 1;
 }
+// Row starts in [from, end) for one thread (from = a row start), by the same
+// rules: rowEnds(bytes, from, end, delim, at) calls at(i) with the byte after
+// each row's newline, in order; return false from at() to stop.
+export function csvRowEnds(bytes, from, end, delim, at) {
+  let st = 0;
+  for (let i = from; i < end; i++) {
+    const c = bytes[i];
+    if (c === NL && ROW_END[st]) { st = 0; if (at(i + 1) === false) return; continue; }
+    st = csvStep(st, c, delim);
+  }
+}
+// the state at `end`, starting at a field start at `from`
+function csvEnd(bytes, from, end, delim) {
+  let st = 0;
+  for (let i = from; i < end; i++) {
+    const c = bytes[i];
+    st = c === NL && ROW_END[st] ? 0 : csvStep(st, c, delim);
+  }
+  return st;
+}
 
 // Parse chunk u straight into the output columns.
-// A = [bytes, bounds, rowStarts, fieldMap, kinds, ...columns]
+// A = [bytes, bounds, rowStarts, fieldMap, kinds, check, ...columns]
 //   fieldMap[f] = output column for field f (-1 = skip)
 //   kinds[o] = 0 number, 1 category (dictionary codes), 2 free text (byte refs)
+//   check[o] = 1: a guessed number column; set to 2 where a value isn't a number
+//     (text after the sampled rows), so the caller can load it as text instead
 // sc = [delimiter, number of fields]
 // Text columns get chunk-local codes; emit() reports each chunk's dictionary
 // so the caller can renumber them into one shared dictionary.
 export function csvParse(u, A, sc, emit) {
-  const bytes = A[0], bounds = A[1], rowStarts = A[2], fieldMap = A[3], kinds = A[4];
+  const bytes = A[0], bounds = A[1], rowStarts = A[2], fieldMap = A[3], kinds = A[4], check = A[5];
   const cols = [];
-  for (let o = 0; o < kinds.length; o++) cols.push(A[5 + o]);
+  for (let o = 0; o < kinds.length; o++) cols.push(A[6 + o]);
   const delim = sc[0], nFields = sc[1];
   const dicts = Array.from(kinds, (k) => (k === 1 ? new ByteDict(bytes) : null));
   const end = bounds[u + 1];
@@ -142,7 +201,11 @@ export function csvParse(u, A, sc, emit) {
       const o = f < nFields ? fieldMap[f] : -1;
       if (o >= 0) {
         const kind = kinds[o];
-        if (kind === 0) cols[o][row] = parseNumber(bytes, s, e);
+        if (kind === 0) {
+          const x = parseNumber(bytes, s, e);
+          cols[o][row] = x;
+          if (x !== x && check[o] === 1 && !blankOrNaN(bytes, s, e)) check[o] = 2;
+        }
         else if (kind === 1) cols[o][row] = dicts[o].code(s, e, escaped);
         else {
           if (e - s > STR_MAX_LEN) throw new RangeError(`vectro: a text value in row ${row + 1} is longer than ${STR_MAX_LEN} bytes`);
@@ -164,6 +227,13 @@ export function csvParse(u, A, sc, emit) {
     row++;
   }
   dicts.forEach((d, o) => { if (d) emit({ kind: 'csvdict', unit: u, col: o, strings: d.strings }); });
+}
+
+// an empty value, or the text NaN (spaces around allowed): fine in a number column
+function blankOrNaN(b, s, e) {
+  while (s < e && b[s] === SPACE) s++;
+  while (e > s && (b[e - 1] === SPACE || b[e - 1] === CR)) e--;
+  return s === e || (e - s === 3 && b[s] === 78 && b[s + 1] === 97 && b[s + 2] === 78);
 }
 
 // Exact decimal parsing for plain numbers (Clinger's fast path: an integer of

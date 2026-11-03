@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.3
+
+Fixes from a second, wider audit: thousands of random cases for the
+dataframe API, CSV and JSON-lines loading and SQL, each checked against plain
+JavaScript or DuckDB. No API changes.
+
+**Loading data**
+- A quote inside an unquoted CSV field (`Monitor 27" wide`, `O"Brien`) is a
+  plain character, as the parser always read it. Before, the row counter took
+  it for the start of a quoted field: rows went missing, and with a file read
+  in chunks some rows got another row's values. The row counter, the cuts
+  between threads, split tables and csvToDataset now follow the parser's rules.
+- A CSV column guessed as numbers (or dates) from the first 1,000 rows that
+  has other text later is loaded again as text, instead of turning that text
+  into missing values. Split tables and csvToDataset, which read pieces apart,
+  stop with an error naming the column and the `types` to pass.
+- CSV files with more than about 250 columns load on every thread (they were
+  parsed in one task with too many arrays).
+- Repeated header names never collide: `a,a,a_2` loads as `a, a_3, a_2`.
+- JSON lines: a numeric array in some lines no longer drops the lines without
+  it (every line is a row; those with the vector go in the vector index), and
+  keys like `@timestamp` or `user-agent` are cleaned as CSV headers are
+  (`_timestamp`) instead of the file being skipped.
+
+**Queries**
+- Text filters (`contains`, `endsWith`, `like`, `ilike`, `in`, SQL `LIKE`)
+  whose matching labels are spread over many codes (a column of thousands of
+  SKUs) work, through a 0 / 1 per row made once from the labels, instead of
+  failing with "spread over too many runs".
+- `filter(...).select(...)` returns only the columns selected.
+- A lazy query counting a derived condition (`derive('big', 'price > 100')`,
+  then `count(big)`) gives the same answer as the eager one.
+- `isMissing(x)` on a text column is true for missing text (`''`).
+- SQL `GROUP BY a > 0` puts rows where the condition is NULL in a group of
+  their own.
+
 ## 0.1.2
 
 A correctness release, from comparing about 1,700 new SQL queries with DuckDB

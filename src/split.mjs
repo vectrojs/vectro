@@ -17,7 +17,8 @@
 // The page remembers rows per block ("segments") to put rows back in order.
 import { Engine as LocalEngine } from './engine.mjs';
 import { inspectCSV } from './csv.mjs';
-import { encode, countByte } from './bytes.mjs';
+import { encode } from './bytes.mjs';
+import { csvRowEnds } from './csv-kernel.mjs';
 import { parse, toSource } from './fuse.mjs';
 import { mergeHits } from './vectors.mjs';
 import { isCoded } from './table.mjs';
@@ -198,7 +199,7 @@ export class SplitEngine {
     // the file's last piece, which may not, is the last one of its worker).
     const len = info.end - info.start;
     const pieces = Math.max(1, Math.min(this.size * MAX_CSV_PIECES_PER_WORKER, Math.ceil(len / CSV_PIECE_BYTES)));
-    const cuts = cutRows(bytes, info.start, info.end, pieces);
+    const cuts = cutRows(bytes, info.start, info.end, pieces, info.delim);
     const workers = Math.min(this.size, cuts.length - 1);
     const mine = Array.from({ length: workers }, () => []);
     for (let p = 0; p + 1 < cuts.length; p++) mine[p % workers].push([cuts[p], cuts[p + 1]]);
@@ -209,7 +210,7 @@ export class SplitEngine {
       let at = head.length;
       for (const [s, e] of list) { buf.set(bytes.subarray(s, e), at); at += e - s; }
       const sizes = list.map(([s, e]) => e - s);
-      return this._call(w, 'loadCSV', { id, bytes: buf, pieces: sizes, opts: { ...opts, types: { ...types, ...(opts.types ?? {}) } } }, [buf.buffer]);
+      return this._call(w, 'loadCSV', { id, bytes: buf, pieces: sizes, opts: { ...opts, types: { ...types, ...(opts.types ?? {}) }, checkTypes: info.names.filter((nm) => !(nm in (opts.types ?? {}))), badType: 'throw' } }, [buf.buffer]);
     }));
     const dicts = await this.#shareDictionaries(id, loaded);
     const segs = loaded.map((r) => Float64Array.from(r.segs));
@@ -243,28 +244,26 @@ export class SplitEngine {
 }
 
 // `parts` + 1 cut points in [start, end), each at the start of a row. With
-// quotes in the data, a newline inside a quoted field is not a row end, so
-// the quotes before each cut are counted first.
-function cutRows(bytes, start, end, parts) {
+// quotes in the data, a newline inside a quoted field is not a row end (the
+// parser's quote rules, csv-kernel.mjs).
+function cutRows(bytes, start, end, parts, delim) {
   const cuts = [start];
   const hasQuotes = bytes.indexOf(QUOTE, start) !== -1;
-  let quotes = 0, counted = start;
-  for (let k = 1; k < parts; k++) {
-    let j = Math.max(cuts[k - 1], start + Math.floor(((end - start) * k) / parts));
-    if (hasQuotes) {
-      quotes += countByte(bytes, QUOTE, counted, j);
-      counted = j;
-      let inQuotes = quotes % 2 === 1;
-      for (; j < end; j++) {
-        const c = bytes[j];
-        if (c === QUOTE) inQuotes = !inQuotes;
-        else if (c === NL && !inQuotes) break;
-      }
-    } else {
+  if (hasQuotes) {
+    let k = 1;
+    csvRowEnds(bytes, start, end, delim, (i) => {
+      if (i < start + Math.floor(((end - start) * k) / parts)) return true;
+      cuts.push(i);
+      while (k < parts && i >= start + Math.floor(((end - start) * k) / parts)) k++;
+      return k < parts;
+    });
+  } else {
+    for (let k = 1; k < parts; k++) {
+      let j = Math.max(cuts[k - 1], start + Math.floor(((end - start) * k) / parts));
       j = bytes.indexOf(NL, j);
       if (j === -1 || j >= end) j = end;
+      cuts.push(Math.min(end, j + 1));
     }
-    cuts.push(Math.min(end, j + 1));
   }
   // strictly increasing, ending at `end` (so no piece is empty unless the data is)
   const out = [start];

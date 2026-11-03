@@ -36,7 +36,7 @@ import { Query, execute, findDataset, optimize, vars, namesOf, joinNames } from 
 import { parse, toSource, isMask } from './fuse.mjs';
 import { KINDS, decodeOne } from './pack.mjs';
 import { conditions, mayMatch, computeZones } from './zones.mjs';
-import { STR_SHIFT, STR_ESCAPED } from './csv-kernel.mjs';
+import { STR_SHIFT, STR_ESCAPED, csvRowEnds } from './csv-kernel.mjs';
 import { inspectCSV, loadBytes, loadBytesAsync } from './csv.mjs';
 import { freeBuild } from './join.mjs';
 import { copyRows, plainInto, remapCodes, textLength } from './rows.mjs';
@@ -1691,13 +1691,13 @@ function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = tru
         head = header ? buf.slice(0, info.start) : new Uint8Array(0);
         start = info.start;
       }
-      const end = last ? buf.length : rowsEnd(buf, start);
+      const end = last ? buf.length : rowsEnd(buf, start, delimiter);
       if (end > start || (!writer.meta && last)) { // (a header and no rows: still the columns)
         const rows = end > start ? buf.subarray(start, end) : new Uint8Array(0);
         const bytes = engine.alloc(Uint8Array, head.length + rows.length);
         bytes.set(head, 0);
         bytes.set(rows, head.length);
-        const t = yield { parse: bytes, opts: { delimiter, header, types: kinds, ...rest } };
+        const t = yield { parse: bytes, opts: { delimiter, header, types: kinds, ...rest, checkTypes: Object.keys(kinds).filter((nm) => !(nm in types)), badType: 'throw' } };
         try { writer.append(t); } finally { t.dispose(); }
         yield { flush: writer };
         onProgress?.({ bytes: pos, size, rows: writer.meta.rows + (writer.pending?.n ?? 0) });
@@ -1711,16 +1711,13 @@ function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = tru
   }
 }
 
-// Where the last complete row of buf[start..] ends (quotes may hold newlines).
-function rowsEnd(buf, start) {
+// Where the last complete row of buf[start..] ends (quotes may hold newlines;
+// the parser's quote rules, csv-kernel.mjs).
+function rowsEnd(buf, start, delimiter) {
   const NL = 10, QUOTE = 34;
   if (buf.indexOf(QUOTE, start) === -1) return buf.lastIndexOf(NL) + 1;
-  let inQuotes = false, end = start;
-  for (let i = start; i < buf.length; i++) {
-    const c = buf[i];
-    if (c === QUOTE) inQuotes = !inQuotes;
-    else if (c === NL && !inQuotes) end = i + 1;
-  }
+  let end = start;
+  csvRowEnds(buf, start, buf.length, delimiter.charCodeAt(0), (i) => { end = i; });
   return end;
 }
 

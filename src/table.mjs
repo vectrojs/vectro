@@ -130,7 +130,7 @@ export class Table {
   // ---- shape ----------------------------------------------------------------------
 
   get length() { return this.n; }            // physical rows (ignores the filter)
-  get columnNames() { return [...this.cols.keys()]; }
+  get columnNames() { return [...this.cols.keys()].filter((nm) => !this.cols.get(nm).hidden); } // (hidden: a text filter's 0 / 1 per row)
   get type() { const c = this.cols.values().next().value; return c.enc ? c.plainType : c.data.constructor; }
 
   column(name) {
@@ -145,6 +145,22 @@ export class Table {
   // every name is a column or a param. Returns { ast, src }.
   #bind(src, params) {
     const ast = rewriteText(parse(src), this.cols, src);
+    // a text function matching labels scattered over many codes: one 0 / 1 per row, made from its
+    // per-label answers (once per column's data), added as a hidden column the kernels read
+    walk(ast, (m) => {
+      if (m.t !== 'var' || !m.lut) return;
+      const c = this.cols.get(m.lut.column);
+      if (!MASKS.has(c.data)) MASKS.set(c.data, new Map());
+      const masks = MASKS.get(c.data);
+      let mask = masks.get(m.name);
+      if (!mask || mask.length < this.n) {
+        mask = this.engine.alloc(this.type === Float32Array ? Float32Array : Float64Array, this.n);
+        const codes = this.engine.live(c.data), match = m.lut.match, f32 = this.type === Float32Array;
+        for (let i = 0; i < this.n; i++) mask[i] = match[c.enc ? decodeOne(c.enc, codes[i], f32) : codes[i]] ? 1 : 0;
+        masks.set(m.name, mask);
+      }
+      if (this.cols.get(m.name)?.data !== mask) this.cols.set(m.name, { data: mask, dict: null, codes: null, hidden: true }); // (views sharing these columns have the same rows)
+    });
     walk(ast, (m) => {
       if (m.t !== 'var') return;
       if (!this.cols.has(m.name) && !(m.name in params)) {
@@ -285,7 +301,7 @@ export class Table {
       yield* engine._compactG(v, n, arrayNames.map((nm) => this.cols.get(nm).data), [perm], offsets, [...scalarNames.map((nm) => this.params[nm]), first.byteOffset], units);
       // every column gathered by those rows (packed columns stay packed)
       const out = new Map();
-      for (const [name, c] of this.cols) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, m, t, c.enc), zones: undefined, ...(c.enc ? { rows: m } : {}) });
+      for (const [name, c] of this.cols) if (!c.hidden) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, m, t, c.enc), zones: undefined, ...(c.enc ? { rows: m } : {}) }); // (hidden: the filter's, done with)
       for (const c of out.values()) c.data = engine.live(c.data);
       return new Table(engine, out, m, { owned: [...out.keys()] });
     } finally { engine.free(offsets); if (perm) engine.free(perm); }
@@ -1266,9 +1282,11 @@ export class Table {
   // available to it.
   select(...names) {
     const keep = new Set(names.flat());
-    for (const nm of keep) if (!this.cols.has(nm)) throw new Error(`vectro: no column "${nm}"`);
-    if (this.pred) walk(parse(this.pred), (m) => { if (m.t === 'var' && this.cols.has(m.name)) keep.add(m.name); });
-    const cols = new Map([...keep].map((nm) => [nm, this.cols.get(nm)])); // in the order asked (then the filter's columns)
+    for (const nm of keep) if (!this.cols.has(nm) || this.cols.get(nm).hidden) throw new Error(`vectro: no column "${nm}"`);
+    const cols = new Map([...keep].map((nm) => [nm, this.cols.get(nm)])); // in the order asked
+    if (this.pred) walk(parse(this.pred), (m) => { // the filter's other columns: kept for it, hidden
+      if (m.t === 'var' && this.cols.has(m.name) && !cols.has(m.name)) cols.set(m.name, { ...this.cols.get(m.name), hidden: true });
+    });
     return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params, zones: this.zones });
   }
 
@@ -1624,7 +1642,7 @@ export class Table {
       const perm = yield* sortPermG(engine, arrays, n, t);
       try {
         const out = new Map();
-        for (const [name, c] of this.cols) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, n, t, c.enc), zones: undefined, ...(c.enc ? { rows: n } : {}) }); // (packed stays packed)
+        for (const [name, c] of this.cols) if (!c.hidden) out.set(name, { ...c, data: yield* gatherG(engine, c.data, perm, n, t, c.enc), zones: undefined, ...(c.enc ? { rows: n } : {}) }); // (packed stays packed)
         for (const c of out.values()) c.data = engine.live(c.data); // later allocations may have moved memory
         return new Table(engine, out, n, { owned: [...out.keys()] });
       } finally {
@@ -1640,7 +1658,7 @@ export class Table {
     const { engine } = this;
     const out = new Map();
     for (const [name, c] of this.cols) {
-      if (omit?.has(name)) continue;
+      if (omit?.has(name) || c.hidden) continue;
       const data = engine.alloc(c.data.constructor, count + (c.enc ? 16 / c.data.BYTES_PER_ELEMENT : 0)); // (packed: codes copied as they are, room after the end)
       const src = engine.live(c.data);
       for (let i = 0; i < count; i++) data[i] = src[perm[i]];
@@ -1720,6 +1738,7 @@ export class Table {
     const t = yield* this.#collectG();
     const out = {};
     for (const [name, c] of t.cols) {
+      if (c.hidden) continue;
       const data = this.engine.live(c.data).subarray(0, t.n);
       if (c.dict) { const codes = new Uint32Array(t.n); codes.set(data); out[name] = { codes, labels: c.dict.slice() }; }
       else if (c.strings) { const sbuf = this.engine.live(c.strings); out[name] = Array.from(data, (v) => decodeString(sbuf, v)); }
@@ -1743,7 +1762,7 @@ export class Table {
     const t = yield* this.#collectG();
     const rows = [];
     const { engine } = this;
-    const cols = [...t.cols].map(([name, c]) => [name, c, engine.live(c.data), c.strings ? engine.live(c.strings) : null]);
+    const cols = [...t.cols].filter(([, c]) => !c.hidden).map(([name, c]) => [name, c, engine.live(c.data), c.strings ? engine.live(c.strings) : null]);
     const f32 = t.type === Float32Array;
     for (let i = 0; i < Math.min(t.n, limit); i++) {
       const row = {};
@@ -1848,8 +1867,10 @@ export class Table {
   // Free the columns this table allocated (shared columns stay alive).
   dispose() {
     for (const name of this.owned) {
-      const data = this.cols.get(name)?.data;
-      if (data) this.engine.free(data);
+      const c = this.cols.get(name);
+      if (c?.data) this.engine.free(c.data);
+      for (const m of MASKS.get(c?.data)?.values() ?? []) this.engine.free(m);
+      MASKS.delete(c?.data);
     }
     for (const b of this.ownedBuffers) this.engine.free(b);
     this.owned = [];
@@ -1933,6 +1954,8 @@ const TEXT_FNS = {
   ilike: (label, [pattern], re) => re.test(label), // (the pattern ignoring case)
 };
 const MAX_RANGES = 256;
+const LUT_NAMES = new Map(); // column|function|args -> the name of its per-row 0 / 1 array
+const MASKS = new WeakMap(); // a column's data array -> those arrays made for it (freed with it)
 
 // startsWith(region, 'E') -> (region >= 0 && region <= 1) || region == 5
 function textCall(n, cols, src) {
@@ -1964,7 +1987,11 @@ function textCall(n, cols, src) {
     .reduce((x, y) => ({ t: 'bin', op: '||', l: x, r: y }));
   if (!yes.length) return { t: 'bin', op: '==', l: col, r: num(-1) }; // nothing matches
   if (!no.length) return { t: 'bin', op: '==', l: col, r: col };      // everything matches
-  if (Math.min(yes.length, no.length) > MAX_RANGES) throw new Error(`vectro: ${n.fn}() matches ${match.filter(Boolean).length} labels of "${colNode.name}" spread over too many runs; group by it first or filter differently`);
+  if (Math.min(yes.length, no.length) > MAX_RANGES) { // too many ranges for one expression: a 0 / 1 per row (see Table #bind)
+    const key = `${colNode.name}|${n.fn}|${JSON.stringify(args)}`;
+    if (!LUT_NAMES.has(key)) LUT_NAMES.set(key, `__vectro_text_match_${LUT_NAMES.size}`);
+    return { t: 'bin', op: '!=', l: { t: 'var', name: LUT_NAMES.get(key), lut: { column: colNode.name, match } }, r: num(0) };
+  }
   return yes.length <= no.length ? anyOf(yes) : { t: 'un', op: '!', x: anyOf(no) };
 }
 
@@ -1981,7 +2008,14 @@ export function rewriteText(ast, cols, src) {
       return { t: 'num', v };
     }
     if (n.t === 'call' && DATE_FNS[n.fn]) return DATE_FNS[n.fn](one(n));
-    if (n.t === 'call' && n.fn === 'isMissing') { const x = one(n); return { t: 'bin', op: '!=', l: x, r: x }; }
+    if (n.t === 'call' && n.fn === 'isMissing') {
+      if (n.args.length === 1 && textCol(n.args[0])) { // missing text is '': its code (none: never missing)
+        const code = cols.get(n.args[0].name).codes.get('');
+        return { t: 'bin', op: '==', l: n.args[0], r: { t: 'num', v: code ?? -1 } };
+      }
+      const x = one(n);
+      return { t: 'bin', op: '!=', l: x, r: x };
+    }
     if (n.t === 'call' && n.fn === 'coalesce') { // first value that isn't missing
       if (n.args.length < 2) throw new SyntaxError(`vectro: coalesce() needs two values or more, in "${src}"`);
       return n.args.map(fix).reduceRight((rest, x) => ({ t: 'cond', c: { t: 'bin', op: '==', l: x, r: x }, x, y: rest }));

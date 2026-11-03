@@ -10,8 +10,8 @@
 //      columns get per-chunk dictionaries that are merged at the end.
 
 import { Table } from './table.mjs';
-import { OP } from './kernels.mjs';
-import { parseNumber, STR_SHIFT, STR_ESCAPED } from './csv-kernel.mjs';
+import { OP, MAX_ARGS } from './kernels.mjs';
+import { parseNumber, STR_SHIFT, STR_ESCAPED, CSV_FIELD_START } from './csv-kernel.mjs';
 import { parseDateBytes, looksLikeDate, f32Dates } from './dates.mjs';
 import { decode, encode, indexOfByte } from './bytes.mjs';
 
@@ -19,6 +19,7 @@ const KIND = { number: 0, category: 1, string: 2, date: 2 }; // dates are read a
 
 const NL = 10, CR = 13, QUOTE = 34;
 const CHUNK_BYTES = 2 << 20;
+const COLS_PER_PASS = MAX_ARGS - 8; // (a parse task's other arrays: bytes, bounds, rowStarts, fieldMap, kinds, check)
 const RESERVED = new Set(['Infinity', 'NaN', 'sum', 'mean', 'min', 'max', 'count', 'abs', 'sqrt', 'floor', 'ceil']);
 
 // CSV given as a string or bytes (Uint8Array, Buffer).
@@ -51,7 +52,12 @@ export function loadBytesAsync(engine, bytes, opts) { return engine._driveAsync(
 //              onPieceRows(rows per piece) is called before parsing
 // Parse CSV bytes that are already in engine memory.
 // (Plain memory moves when it grows, so views are refreshed after each alloc.)
-function* loadBytesG(engine, bytes, { delimiter = ',', header = true, types = {}, columns: only = null, type = Float64Array, sampleRows = 1000, chunkBytes = CHUNK_BYTES, pieces = null, onPieceRows = null } = {}) {
+//   checkTypes names of columns whose type was guessed (default: those not in
+//              types); badType 'retype' (default): one with a value that isn't
+//              its type (text after the sampled rows) is loaded again as text;
+//              'throw': a clear error instead (pieces parsed separately)
+function* loadBytesG(engine, bytes, opts = {}) {
+  const { delimiter = ',', header = true, types = {}, columns: only = null, type = Float64Array, sampleRows = 1000, chunkBytes = CHUNK_BYTES, pieces = null, onPieceRows = null, checkTypes = null, badType = 'retype' } = opts;
   const temp = [bytes];
   try {
     const info = inspectCSV(bytes, { delimiter, header, types, sampleRows });
@@ -92,20 +98,20 @@ function* loadBytesG(engine, bytes, { delimiter = ',', header = true, types = {}
     if (pieces) {
       // already cut at rows
     } else if (hasQuotes) {
-      const { parts: quotes } = yield* engine._chunksG(OP.CSV_SCAN, chunks, [bytes, bounds], [0, 1]);
-      let before = 0;
-      const raw = Float64Array.from(bounds);
-      for (let k = 1; k < chunks; k++) {
-        before += quotes[k - 1];
-        let inQuotes = before % 2 === 1;
-        let j = raw[k];
-        for (; j < end; j++) {
-          const c = bytes[j];
-          if (c === QUOTE) inQuotes = !inQuotes;
-          else if (c === NL && !inQuotes) break;
-        }
-        bounds[k] = Math.max(bounds[k - 1], Math.min(end, j + 1));
+      // every chunk scanned from each parser state at once (csv-kernel.mjs csvScan mode 2); then the
+      // real state is followed chunk to chunk, and each cut moves to the first row start after it
+      let scan = engine.alloc(Float64Array, chunks * 8);
+      temp.push(scan);
+      yield* engine._chunksG(OP.CSV_SCAN, chunks, [bytes, bounds, scan], [2, 1, delim]);
+      scan = engine.live(scan);
+      const cut = new Float64Array(chunks + 1).fill(-1);
+      let state = CSV_FIELD_START; // (the data starts at a row)
+      for (let k = 0; k < chunks; k++) {
+        if (k > 0) cut[k] = scan[k * 8 + 2 * state + 1];
+        state = scan[k * 8 + 2 * state];
       }
+      for (let k = chunks - 1; k >= 1; k--) bounds[k] = cut[k] >= 0 ? cut[k] : k + 1 < chunks ? bounds[k + 1] : end; // (no row end in a chunk: it joins the next)
+      for (let k = 1; k < chunks; k++) bounds[k] = Math.max(bounds[k - 1], Math.min(end, bounds[k]));
     } else {
       for (let k = 1; k < chunks; k++) {
         const nl = indexOfByte(bytes, NL, bounds[k], end);
@@ -115,7 +121,7 @@ function* loadBytesG(engine, bytes, { delimiter = ',', header = true, types = {}
     bounds[chunks] = end;
 
     // Rows per chunk -> first row of each chunk.
-    const { parts: rowsPer } = yield* engine._chunksG(OP.CSV_SCAN, chunks, [bytes, bounds], [1, hasQuotes ? 1 : 0]);
+    const { parts: rowsPer } = yield* engine._chunksG(OP.CSV_SCAN, chunks, [bytes, bounds], [1, hasQuotes ? 1 : 0, delim]);
     onPieceRows?.(Array.from(rowsPer));
     let rowStarts = engine.alloc(Float64Array, chunks);
     temp.push(rowStarts);
@@ -124,12 +130,29 @@ function* loadBytesG(engine, bytes, { delimiter = ',', header = true, types = {}
 
     // Parse.
     let cols = out.map(() => engine.alloc(type, total));
-    const kinds = engine.alloc(Float64Array, out.length);
-    temp.push(kinds);
-    out.forEach((c, o) => { kinds[o] = c.kind; });
-    // one dictionary message per chunk per category column
-    const expect = chunks * out.filter((c) => c.kind === 1).length;
-    const { messages } = yield* engine._chunksG(OP.CSV_PARSE, chunks, [bytes, bounds, rowStarts, fieldMap, kinds, ...cols], [delim, nFields], expect);
+    const kinds = engine.alloc(Float64Array, out.length), check = engine.alloc(Float64Array, out.length);
+    temp.push(kinds, check);
+    const guessed = (nm) => (checkTypes ? checkTypes.includes(nm) : !(nm in types));
+    out.forEach((c, o) => { kinds[o] = c.kind; check[o] = guessed(c.name) && (c.kind === 0 || c.date) ? 1 : 0; });
+    // One dictionary message per chunk per category column. A task takes at most MAX_ARGS arrays,
+    // so a very wide file is parsed in batches of columns (the others skipped in each pass).
+    const messages = [];
+    for (let b0 = 0; b0 < out.length || b0 === 0; b0 += COLS_PER_PASS) {
+      const b1 = Math.min(out.length, b0 + COLS_PER_PASS), whole = b0 === 0 && b1 === out.length;
+      let fm = fieldMap, kd = kinds, ck = check;
+      if (!whole) {
+        fm = engine.alloc(Float64Array, nFields); kd = engine.alloc(Float64Array, b1 - b0); ck = engine.alloc(Float64Array, b1 - b0);
+        temp.push(fm, kd, ck);
+        const fmAll = engine.live(fieldMap), kAll = engine.live(kinds), cAll = engine.live(check);
+        for (let f = 0; f < nFields; f++) fm[f] = fmAll[f] >= b0 && fmAll[f] < b1 ? fmAll[f] - b0 : -1;
+        for (let o = b0; o < b1; o++) { kd[o - b0] = kAll[o]; ck[o - b0] = cAll[o]; }
+      }
+      const expect = chunks * out.slice(b0, b1).filter((c) => c.kind === 1).length;
+      const r = yield* engine._chunksG(OP.CSV_PARSE, chunks, [bytes, bounds, rowStarts, fm, kd, ck, ...cols.slice(b0, b1)], [delim, nFields], expect);
+      for (const m of r.messages) messages.push(whole ? m : { ...m, col: m.col + b0 });
+      if (!whole) { const cAll = engine.live(check), cb = engine.live(ck); for (let o = b0; o < b1; o++) cAll[o] = cb[o - b0]; }
+      if (whole) break;
+    }
 
     // One dictionary per text column, numbered in order of first appearance.
     [bytes, rowStarts] = [engine.live(bytes), engine.live(rowStarts)];
@@ -149,6 +172,7 @@ function* loadBytesG(engine, bytes, { delimiter = ',', header = true, types = {}
     }
 
     // Date columns: each value's text (still in the file's bytes) as ms.
+    const checked = engine.live(check);
     out.forEach((c, o) => {
       if (!c.date) return;
       const col = cols[o];
@@ -157,8 +181,19 @@ function* loadBytesG(engine, bytes, { delimiter = ',', header = true, types = {}
         if (v !== v) continue;
         const s = Math.floor(v / STR_SHIFT), len = (v - s * STR_SHIFT) % STR_ESCAPED;
         col[r] = parseDateBytes(bytes, s, s + len);
+        if (col[r] !== col[r] && len && checked[o] === 1 && decode(bytes, s, s + len).trim()) checked[o] = 2;
       }
     });
+    // A guessed number or date column with other text after the sampled rows: loaded again as
+    // text (category), or a clear error where pieces are parsed apart (split tables, datasets).
+    const bad = out.filter((c, o) => checked[o] === 2).map((c) => c.name);
+    if (bad.length) {
+      const fix = Object.fromEntries(bad.map((nm) => [nm, 'category']));
+      if (badType === 'throw') throw new Error(`vectro: column${bad.length > 1 ? 's' : ''} ${bad.map((nm) => `"${nm}"`).join(', ')} looked like ${out.find((c) => c.name === bad[0]).date ? 'dates' : 'numbers'} in the first ${sampleRows} rows, but later rows have other text; load with types: ${JSON.stringify(fix)}`);
+      for (const c of cols) engine.free(c);
+      temp.shift(); // (the bytes go on to the next try)
+      return yield* loadBytesG(engine, bytes, { ...opts, types: { ...types, ...fix } });
+    }
 
     // Free-text columns point into the file's bytes, so the table keeps them.
     const keepBytes = out.some((c) => c.kind === 2 && !c.date);
@@ -257,14 +292,20 @@ function fieldText(bytes, f) {
 }
 
 // Column names must work in expressions: "Order Date" -> Order_Date.
-function cleanNames(raw) {
-  const seen = new Map();
-  return raw.map((r, i) => {
+export function cleanNames(raw) {
+  const base = raw.map((r, i) => {
     let nm = r.trim().replace(/[^A-Za-z0-9_]/g, '_') || `col${i}`;
     if (/^\d/.test(nm)) nm = `_${nm}`;
     if (RESERVED.has(nm)) nm = `${nm}_`;
-    const k = seen.get(nm) ?? 0;
-    seen.set(nm, k + 1);
-    return k ? `${nm}_${k + 1}` : nm;
+    return nm;
+  });
+  // a repeated name gets _2, _3... skipping every name the header already has (a, a, a_2 -> a, a_3, a_2)
+  const taken = new Set(base), used = new Set();
+  return base.map((nm) => {
+    if (!used.has(nm)) { used.add(nm); return nm; }
+    let k = 2;
+    while (taken.has(`${nm}_${k}`) || used.has(`${nm}_${k}`)) k++;
+    used.add(`${nm}_${k}`);
+    return `${nm}_${k}`;
   });
 }

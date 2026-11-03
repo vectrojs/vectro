@@ -16,7 +16,7 @@ export const FORMATS = {
   arrow: 'application/vnd.apache.arrow.stream',
 };
 
-export const columnsOf = (table) => [...table.cols].map(([name, c]) => ({ name: displayName(name), col: name, type: c.dict || c.strings ? 'text' : c.date ? 'date' : 'number' }));
+export const columnsOf = (table) => [...table.cols].filter(([, c]) => !c.hidden).map(([name, c]) => ({ name: displayName(name), col: name, type: c.dict || c.strings ? 'text' : c.date ? 'date' : 'number' }));
 
 // RFC 4180: quoted when it holds a comma, a quote or a line break
 const csvText = (v) => (/[",\r\n]/.test(v) ? `"${v.replaceAll('"', '""')}"` : v);

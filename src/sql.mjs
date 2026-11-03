@@ -1476,7 +1476,8 @@ function compileSelect(ast, env, outer, tail) {
       else if (g.k === 'col' && !g.table && items.some((it) => it.alias === g.name) && !scope.some((s) => s.names.has(g.name))) e = items.find((it) => it.alias === g.name).e;
       if (hasAgg(e)) fail('GROUP BY can\'t use aggregates');
       if (hasWindow(e)) fail('GROUP BY can\'t use window functions');
-      const t = e.k === 'col' ? colOf(e) : translate(e, plain);
+      let t = e.k === 'col' ? colOf(e) : translate(e, plain);
+      if (isCond(e) && e.k !== 'num') t = condValue(e, plain, t); // (GROUP BY a > 0: true, false and NULL groups)
       let name;
       if (t.t === 'var') name = t.name;
       else { name = `__g${keys.length}_${n.hidden++}`; q = q.derive(name, src(t)); }

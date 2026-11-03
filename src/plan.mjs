@@ -25,7 +25,7 @@
 //     parts of an expression once per row).
 // explain() prints the optimized plan.
 
-import { parse, toSource, walk } from './fuse.mjs';
+import { parse, toSource, walk, isMask } from './fuse.mjs';
 import { DATE_RESULT } from './dates.mjs';
 
 export const vars = (ast) => { const out = new Set(); walk(ast, (n) => { if (n.t === 'var') out.add(n.name); }); return out; };
@@ -63,7 +63,13 @@ function inline(ast, derived) {
       return { ...n, l: sub(l), r: sub(r) };
     }
     if (n.t === 'un') return { ...n, x: sub(n.x) };
-    if (n.t === 'call') return { ...n, args: n.args.map(sub) };
+    if (n.t === 'call') {
+      const args = n.args.map(sub);
+      // count(big) counts rows where big has a value; with big = price > 100 inlined, count(price > 100)
+      // would count where the condition holds: as a value (1 / 0, as derive stores it) it stays the same
+      if (n.fn === 'count' && args.length === 1 && n.args[0].t === 'var' && derived.has(n.args[0].name) && isMask(args[0])) args[0] = { t: 'bin', op: '+', l: args[0], r: { t: 'num', v: 0 } };
+      return { ...n, args };
+    }
     if (n.t === 'cond') return { ...n, c: sub(n.c), x: sub(n.x), y: sub(n.y) };
     return n;
   };

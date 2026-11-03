@@ -7,6 +7,7 @@ import { resolve, sep, extname, basename, join } from 'node:path';
 import { VectorIndex } from '../vectors.mjs';
 import { Engine } from '../node.mjs';
 import { parseNDJSON } from '../ndjson.mjs';
+import { cleanNames } from '../csv.mjs';
 
 export const MAX_FILE_BYTES = 2 ** 31;
 export const FREE_TEXT_ROWS = 5_000_000;
@@ -16,7 +17,7 @@ export const LOADABLE = new Set(['.csv', '.tsv', '.jsonl', '.ndjson', '.arrow', 
 export class LoadError extends Error {}
 
 export const kindOf = (c) => (c.strings ? 'text' : c.dict ? 'category' : c.date ? 'date' : 'number');
-export const columnsOf = (t) => Object.fromEntries([...t.cols].map(([n, c]) => [n, kindOf(c)]));
+export const columnsOf = (t) => Object.fromEntries([...t.cols].filter(([, c]) => !c.hidden).map(([n, c]) => [n, kindOf(c)]));
 export const tableName = (file) => basename(file, extname(file)).replace(/[^A-Za-z0-9_]/g, '_').replace(/^(\d)/, '_$1');
 
 // A path inside root (symbolic links resolved), or a LoadError.
@@ -62,25 +63,30 @@ export function filesIn(root) {
 // A table's memory back (datasets closed).
 export function release(table) { if (table?.isDataset) table.close(); else table?.dispose(); }
 
+// Every object is a row of the table; the ones with a vector (`field`, `dim` numbers) also go
+// into the vector index, with their columns.
 async function loadWithEmbeddings(engine, bytes, field, dim, kinds) {
   const names = [...kinds].filter(([k, v]) => v && k !== field).map(([k]) => k);
-  const cols = Object.fromEntries(names.map((n) => [n, []]));
+  const clean = cleanNames(names);
+  const cols = Object.fromEntries(clean.map((n) => [n, []])), withVector = Object.fromEntries(clean.map((n) => [n, []]));
   const vectors = [];
   let skipped = 0;
   for (const line of new TextDecoder().decode(bytes).split('\n')) {
     if (!line.trim()) continue;
     let o;
     try { o = JSON.parse(line); } catch { skipped++; continue; }
-    const v = o?.[field];
-    if (!o || typeof o !== 'object' || !Array.isArray(v) || v.length !== dim) { skipped++; continue; }
-    vectors.push(v);
-    for (const n of names) {
+    if (!o || typeof o !== 'object' || Array.isArray(o)) { skipped++; continue; }
+    const v = o[field], hasVector = Array.isArray(v) && v.length === dim && v.every((x) => typeof x === 'number');
+    if (hasVector) vectors.push(v);
+    names.forEach((n, k) => {
       const x = o[n];
-      cols[n].push(kinds.get(n) === 'number' ? (typeof x === 'number' ? x : typeof x === 'boolean' ? +x : typeof x === 'string' && x.trim() ? Number(x) : NaN) : x == null || typeof x === 'object' ? '' : String(x));
-    }
+      const value = kinds.get(n) === 'number' ? (typeof x === 'number' ? x : typeof x === 'boolean' ? +x : typeof x === 'string' && x.trim() ? Number(x) : NaN) : x == null || typeof x === 'object' ? '' : String(x);
+      cols[clean[k]].push(value);
+      if (hasVector) withVector[clean[k]].push(value);
+    });
   }
   const table = engine.table(cols);
-  const index = await VectorIndex.create(engine, { vectors, dim, metric: 'cosine', columns: cols });
+  const index = await VectorIndex.create(engine, { vectors, dim, metric: 'cosine', columns: withVector });
   return { table, index, skipped, embedding: { field, dim } };
 }
 
@@ -104,7 +110,8 @@ function loadJSONLines(engine, bytes, types) {
   const names = [...kinds].filter(([, v]) => v).map(([k]) => k);
   if (!names.length) throw new LoadError('no JSON objects with plain values found in the first lines');
   const r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)));
-  const cols = Object.fromEntries(names.map((n, k) => [n, r.dicts[k] ? Array.from(r.cols[k], (code) => r.dicts[k][code]) : r.cols[k]]));
+  const clean = cleanNames(names); // ("@timestamp", "user-agent": names that work in expressions, as CSV headers get)
+  const cols = Object.fromEntries(names.map((n, k) => [clean[k], r.dicts[k] ? Array.from(r.cols[k], (code) => r.dicts[k][code]) : r.cols[k]]));
   return { table: engine.table(cols), skipped: r.bad };
 }
 

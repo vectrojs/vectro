@@ -77,14 +77,13 @@ for (const [name, make] of engines) {
   await t.dispose();
   await e.close();
 }
-// too many scattered matches is refused rather than compiled into a huge filter
+// matches scattered over many codes: a 0 / 1 per row instead of a huge filter (test-edges.mjs has more)
 {
   const e = new Engine();
   const alt = Array.from({ length: 1200 }, (_, i) => (i % 2 ? 'b' : 'a') + i);
   const t = e.table({ tag: alt, n: alt.map((_, i) => i) });
+  checks++; if (t.filter("startsWith(tag, 'a')").count() !== 600) fail(`scattered matches: ${t.filter("startsWith(tag, 'a')").count()}`);
   let msg = '';
-  try { t.filter("startsWith(tag, 'a')").count(); } catch (err) { msg = err.message; }
-  checks++; if (!msg.includes('too many runs')) fail(`scattered matches: ${msg}`);
   // free text columns can't use them
   const csv = e.parseCSV('note\nhello\nworld\n', { types: { note: 'string' } });
   msg = '';
