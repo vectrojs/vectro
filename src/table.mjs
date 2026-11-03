@@ -2037,8 +2037,10 @@ const TEXT_FNS = {
   contains: (label, [p]) => label.includes(p),
   in: (label, list) => list.includes(label),
   like: (label, [pattern], re) => re.test(label),
-  ilike: (label, [pattern], re) => re.test(label), // (the pattern ignoring case)
+  ilike: (label, [pattern], re) => re.test(lowerAll(label)), // (both lowercased, as DuckDB's ILIKE: the pattern below)
 };
+// lowercase one character at a time, as DuckDB's lower(): 'İ' is 'i', a final 'Σ' is 'σ'
+const lowerAll = (s) => s.replace(/[\u0130\u03a3]/g, (c) => (c === '\u0130' ? 'i' : '\u03c3')).toLowerCase();
 const MAX_RANGES = 256;
 const LUT_NAMES = new Map(); // column|function|args -> the name of its per-row 0 / 1 array
 const MASKS = new WeakMap(); // a column's data array -> those arrays made for it (freed with it)
@@ -2052,7 +2054,7 @@ function textCall(n, cols, src) {
   if (!rest.length || rest.some((a) => a.t !== 'str')) throw new SyntaxError(`vectro: ${n.fn}(${colNode.name}, …) needs text in quotes after the column, in "${src}"`);
   if (n.fn !== 'in' && rest.length !== 1) throw new SyntaxError(`vectro: ${n.fn}() takes a column and one text, in "${src}"`);
   const args = rest.map((a) => a.v);
-  const re = n.fn === 'like' || n.fn === 'ilike' ? new RegExp(`^${args[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`, n.fn === 'ilike' ? 'iu' : 'u') : null; // (u: _ is one character, an emoji too)
+  const re = n.fn === 'like' || n.fn === 'ilike' ? new RegExp(`^${(n.fn === 'ilike' ? lowerAll(args[0]) : args[0]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`, 'u') : null; // (u: _ is one character, an emoji too)
   const match = c.dict.map((label) => TEXT_FNS[n.fn](label, args, re));
   // runs of consecutive codes that match (or, if shorter, that don't)
   const runs = (want) => {

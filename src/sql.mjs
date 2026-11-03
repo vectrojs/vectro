@@ -32,6 +32,7 @@
 
 import { Query, namesOf, findDataset } from './plan.mjs';
 import { quoteText } from './fuse.mjs';
+import { byCodePoint } from './sort.mjs';
 import { decodeOne } from './pack.mjs';
 import { TEXT_FUNCTIONS, toText, isNull, textToNumber, textToDate } from './sqltext.mjs';
 
@@ -849,7 +850,7 @@ function compileSelect(ast, env, outer, tail) {
         usingMap.set(c.toLowerCase(), out);
       });
     }
-    for (const c of extra) { const t = translate(c, plain); q = q.filter(src(t)); } // (translating may join: q after it)
+    for (const c of extra) { const t = truth(c, plain); q = q.filter(src(t)); } // (translating may join: q after it)
   }
 
   // RIGHT / FULL JOIN: the matching pairs (FULL: and the left rows without a
@@ -1110,7 +1111,7 @@ function compileSelect(ast, env, outer, tail) {
     if (e.k === 'null') return { value: null, kind: 'number' };
     if (e.k === 'neg' && e.x.k === 'num') return { value: -e.x.v, kind: 'number' };
     if (e.k === 'date') return { value: textToDate(e.v), kind: 'date' };
-    const kind = kindOf(e, ctx) ?? 'number', t = translate(e, ctx);
+    const kind = kindOf(e, ctx) ?? 'number', t = valueOf(e, ctx);
     if (t.t === 'num') return { value: t.v, kind: 'number' };
     if (t.t === 'str') return { value: t.v, kind: 'text' };
     return { col: materialize(t, ctx), kind };
@@ -1157,7 +1158,7 @@ function compileSelect(ast, env, outer, tail) {
     return valueColumn(ctx, args, ([a, b], [ka, kb]) => {
       const x = conv(a, ka), y = conv(b, kb);
       if (x !== x || y !== y) return NaN;
-      return test(x < y ? -1 : x > y ? 1 : 0) ? 1 : 0;
+      return test(asOf === 'text' ? byCodePoint(x, y) : x < y ? -1 : x > y ? 1 : 0) ? 1 : 0; // (text: by code point, as ORDER BY sorts it)
     }, { text: false, label: op });
   }
   // true where a value is there (SQL's NULL is NaN for numbers, '' for text); null: always there (a literal)
@@ -1176,6 +1177,19 @@ function compileSelect(ast, env, outer, tail) {
   }
   // a condition as a value: 1 true, 0 false, NaN unknown (SQL's NULL boolean)
   function condValue(e, ctx, t) { return cond(t, num(1), cond(negated(e, ctx), num(0), num(NaN))); }
+  // any expression where a value goes: a condition as its value (1, 0 or NULL), others as they are
+  function valueOf(e, ctx, t = translate(e, ctx)) { return isCond(e) && e.k !== 'num' ? condValue(e, ctx, t) : t; }
+  // any expression used as a condition (WHERE, HAVING, CASE WHEN, AND, OR, NOT): true only where
+  // it is there and not 0 (a NULL value is unknown; NaN would count as true in the kernels).
+  // t: its translation, if made already (a var for a condition: its value, from GROUP BY)
+  function truth(e, ctx, t) {
+    if (isCond(e) && !(t && t.t === 'var')) return t ?? translate(e, ctx);
+    if (e.k === 'null') return num(0);
+    t ??= translate(e, ctx);
+    if (t.t === 'num') return num(t.v !== 0 && t.v === t.v ? 1 : 0);
+    if (t.t === 'str' || kindOf(e, ctx) === 'text') return t;
+    return bin('&&', bin('==', t, t), bin('!=', t, num(0)));
+  }
   // NOT x with SQL's three values: where x is unknown (a missing value), so is NOT x, and the
   // row is dropped. Comparisons become their opposites (false on missing values already).
   const FLIP = { '=': '<>', '<>': '=', '!=': '=', '<': '>=', '<=': '>', '>': '<=', '>=': '<' };
@@ -1183,7 +1197,7 @@ function compileSelect(ast, env, outer, tail) {
   function negated(x, ctx) {
     const T = (y) => translate(y, ctx);
     switch (x.k) {
-      case 'not': return T(x.x);
+      case 'not': return truth(x.x, ctx);
       case 'bin':
         if (x.op === 'AND') return bin('||', negated(x.l, ctx), negated(x.r, ctx));
         if (x.op === 'OR') return bin('&&', negated(x.l, ctx), negated(x.r, ctx));
@@ -1204,7 +1218,7 @@ function compileSelect(ast, env, outer, tail) {
     }
   }
   function translate(e, ctx) {
-    const T = (x) => translate(x, ctx);
+    const T = (x) => translate(x, ctx), V = (x) => valueOf(x, ctx);
     switch (e.k) {
       case 'num': return num(e.v);
       case 'null': return num(NaN);
@@ -1218,12 +1232,12 @@ function compileSelect(ast, env, outer, tail) {
       }
       case 'col': { const sv = sessionRef(e); return sv ? constValue(sv, ctx) : ctx.col(e); }
       case 'star': fail('* only works as a whole SELECT item (or COUNT(*))');
-      case 'neg': return { t: 'un', op: '-', x: T(e.x) };
+      case 'neg': return { t: 'un', op: '-', x: V(e.x) };
       case 'not': return negated(e.x, ctx);
       case 'exists': case 'insub': case 'subq': return subqueryValue(e, ctx);
       case 'window': return ctx.window(e);
       case 'bin': {
-        const B = (x) => (x.k === 'null' ? num(0) : T(x)); // (a NULL condition is unknown: never true)
+        const B = (x) => truth(x, ctx); // (a NULL condition is unknown: never true)
         if (e.op === 'AND') return bin('&&', B(e.l), B(e.r));
         if (e.op === 'OR') return bin('||', B(e.l), B(e.r));
         const op = { '=': '==', '<>': '!=' }[e.op] ?? e.op;
@@ -1234,7 +1248,7 @@ function compileSelect(ast, env, outer, tail) {
           return e.r.v ? bin('&&', bin('!=', T(x), num(0)), present(x, ctx)) : bin('==', T(x), num(0));
         }
         if (op === 'IS') { // a IS b: equal, or both missing
-          const a = T(e.l), b = T(e.r);
+          const a = V(e.l), b = V(e.r);
           return bin('||', bin('==', a, b), bin('&&', call('isMissing', a), call('isMissing', b)));
         }
         if (op === '~' || op === '~*' || op === '!~' || op === '!~*') { // regular expressions
@@ -1260,10 +1274,10 @@ function compileSelect(ast, env, outer, tail) {
         if ((op === '+' || op === '-') && (kindOf(e.l, ctx) === 'date' || kindOf(e.r, ctx) === 'date')) return dateArith(e, op, ctx);
         if (op === '!=') return bin('&&', bin('!=', T(e.l), T(e.r)), bin('&&', present(e.l, ctx), present(e.r, ctx))); // (missing on either side: unknown, so not kept)
         if (op === '%') { // SQL: the sign of the dividend (truncate the quotient toward 0)
-          const a = T(e.l), b = T(e.r), qt = bin('/', a, b);
+          const a = V(e.l), b = V(e.r), qt = bin('/', a, b);
           return bin('-', a, bin('*', cond(bin('>=', qt, num(0)), call('floor', qt), call('ceil', qt)), b));
         }
-        return bin(op, T(e.l), T(e.r));
+        return bin(op, V(e.l), V(e.r));
       }
       case 'between': {
         if (kindOf(e.x, ctx) === 'text') return T({ k: 'bin', op: 'AND', l: { k: 'bin', op: '>=', l: e.x, r: e.lo }, r: { k: 'bin', op: '<=', l: e.x, r: e.hi } });
@@ -1287,6 +1301,7 @@ function compileSelect(ast, env, outer, tail) {
         return bin('&&', call('like', T(e.x), { t: 'str', v: e.pattern.v }), there);
       }
       case 'isnull':
+        if (isCond(e.x) && e.x.k !== 'num') return { t: 'un', op: '!', x: present(e.x, ctx) }; // (a condition: NULL where unknown)
         if (e.x.k === 'str') return num(e.x.v === '' ? 1 : 0); // ('' is missing text)
         return kindOf(e.x, ctx) === 'text' ? bin('==', T(e.x), { t: 'str', v: '' }) : call('isMissing', T(e.x));
       case 'case': {
@@ -1295,7 +1310,7 @@ function compileSelect(ast, env, outer, tail) {
           if (branches.every((b) => b.k === 'str' || b.k === 'null')) { // labels in quotes only: each row's label code, on every thread
             const labels = [...new Set(branches.map((b) => (b.k === 'str' ? b.v : '')))], codeOf = (b) => num(labels.indexOf(b.k === 'str' ? b.v : ''));
             let code = codeOf(e.otherwise);
-            for (let i = e.whens.length - 1; i >= 0; i--) code = cond(e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : T(e.whens[i].c), codeOf(e.whens[i].v), code);
+            for (let i = e.whens.length - 1; i >= 0; i--) code = cond(e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : truth(e.whens[i].c, ctx), codeOf(e.whens[i].v), code);
             if (code.t !== 'num') {
               const col = materialize(code, ctx), name = `__t${n.hidden++}`;
               ctx.step({ name, inputs: [col], run: () => { q = q.textmap(name, { inputs: [col], labels, label: 'case' }); } });
@@ -1303,14 +1318,14 @@ function compileSelect(ast, env, outer, tail) {
             }
           }
           let which = num(branches.length - 1);
-          for (let i = e.whens.length - 1; i >= 0; i--) which = cond(e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : T(e.whens[i].c), num(i), which);
+          for (let i = e.whens.length - 1; i >= 0; i--) which = cond(e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : truth(e.whens[i].c, ctx), num(i), which);
           const args = [which.t === 'num' ? { value: which.v, kind: 'number' } : { col: materialize(which, ctx), kind: 'number' }, ...branches.map((b) => argOf(b, ctx))];
           return valueColumn(ctx, args, (xs, ks) => { const x = xs[1 + xs[0]]; return x === null ? '' : toText(x, ks[1 + xs[0]]); }, { skip: true, label: 'case' });
         }
-        let out = T(e.otherwise);
+        let out = V(e.otherwise);
         for (let i = e.whens.length - 1; i >= 0; i--) {
-          const c = e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : T(e.whens[i].c);
-          out = cond(c, T(e.whens[i].v), out);
+          const c = e.base ? T({ k: 'bin', op: '=', l: e.base, r: e.whens[i].c }) : truth(e.whens[i].c, ctx);
+          out = cond(c, V(e.whens[i].v), out);
         }
         return out;
       }
@@ -1329,7 +1344,7 @@ function compileSelect(ast, env, outer, tail) {
           if (!whole && !date && !bool && !FLOAT_TYPES.has(e.type)) fail(`CAST to ${e.type} is not supported`);
           return valueColumn(ctx, [argOf(e.x, ctx)], ([x]) => { if (bool) return asBool(x); if (date) { const t = textToDate(x); return e.type === 'DATE' ? Math.floor(t / 86_400_000) * 86_400_000 : t; } const v = textToNumber(x); return whole ? Math.trunc(v) : v; }, { text: false, date, label: e.type.toLowerCase() });
         }
-        const x = T(e.x);
+        const x = V(e.x);
         if (INT_TYPES.has(e.type)) return cond(bin('>=', x, num(0)), call('floor', x), call('ceil', x));
         if (FLOAT_TYPES.has(e.type)) return x;
         if (BOOL_TYPES.has(e.type)) return cond(bin('==', x, x), cond(bin('!=', x, num(0)), num(1), num(0)), num(NaN));
@@ -1345,7 +1360,7 @@ function compileSelect(ast, env, outer, tail) {
           if (e.fn === 'NULLIF') return valueColumn(ctx, args, ([a, b], [ka, kb]) => (a === null ? '' : b !== null && toText(a, ka) === toText(b, kb) ? '' : toText(a, ka)), { skip: true, label: 'nullif' });
           return valueColumn(ctx, args, (xs, ks) => { const i = xs.findIndex((x) => x !== null); return i < 0 ? '' : toText(xs[i], ks[i]); }, { skip: true, label: 'coalesce' });
         }
-        const a = e.args.map(T), need = (k) => { if (a.length !== k) fail(`${e.fn}() takes ${k} value(s)`); };
+        const a = e.args.map(V), need = (k) => { if (a.length !== k) fail(`${e.fn}() takes ${k} value(s)`); };
         switch (e.fn) {
           case 'ABS': case 'SQRT': case 'FLOOR': need(1); return call(e.fn.toLowerCase(), a[0]);
           case 'CEIL': case 'CEILING': need(1); return call('ceil', a[0]);
@@ -1412,7 +1427,7 @@ function compileSelect(ast, env, outer, tail) {
   if (ast.where) {
     if (hasAgg(ast.where)) fail('aggregates (SUM, COUNT...) can\'t be used in WHERE: use HAVING');
     if (hasWindow(ast.where)) fail('window functions can\'t be used in WHERE (filter on them in an outer query)');
-    const t = ast.where.k === 'null' ? num(0) : translate(ast.where, plain); // (WHERE NULL: unknown, no row)
+    const t = truth(ast.where, plain); // (WHERE NULL: unknown, no row)
     q = q.filter(src(t));
   }
 
@@ -1486,7 +1501,8 @@ function compileSelect(ast, env, outer, tail) {
         if (item.arg && kindCtx(c.args[0]) === 'text') item.arg = cond(bin('&&', bin('!=', item.arg, { t: 'str', v: '' }), bin('==', item.arg, item.arg)), num(1), num(NaN));
       }
       if (w.frame) {
-        const bound = (b) => (b.x === undefined ? { kind: b.kind } : { kind: b.kind, n: (() => { const t = tr(b.x); if (t.t !== 'num' || !(t.v >= 0)) fail('a window frame needs a number of rows (or a distance) like 3 PRECEDING'); return t.v; })() });
+        const days = w.frame.unit === 'range' && w.order.length === 1 && kindCtx(w.order[0].e) === 'date'; // (n PRECEDING over a date: n days, as date - n; an INTERVAL: its milliseconds)
+        const bound = (b) => (b.x === undefined ? { kind: b.kind } : { kind: b.kind, n: (() => { const t = tr(b.x); if (t.t !== 'num' || !(t.v >= 0)) fail('a window frame needs a number of rows (or a distance) like 3 PRECEDING'); return days && !hasInterval(b.x) ? t.v * 86_400_000 : t.v; })() });
         item.frame = { unit: w.frame.unit, start: bound(w.frame.start), end: bound(w.frame.end) };
         if (item.frame.start.kind === 'unbounded' && w.frame.start.kind === 'unbounded' && false) item.frame.start.kind = 'unbounded';
       }
@@ -1501,7 +1517,14 @@ function compileSelect(ast, env, outer, tail) {
     for (const spec of windowPlan ?? []) {
       const partition = spec.partition.map((t) => hide(t, '__wp'));
       const order = [];
+      const byValue = spec.order.length === 1 && spec.items.some((it) => it.frame?.unit === 'range' && (it.frame.start.n !== undefined || it.frame.end.n !== undefined));
       for (const o of spec.order) {
+        if (o.nullsFirst && byValue) { // (RANGE with a distance takes one key: missing keys as the end the sort puts first)
+          const name = hide(o.ast, '__wo'), h = `__nf${n.hidden++}`;
+          q = q.derive(h, `${name} == ${name} ? ${name} : ${o.desc ? 'Infinity' : '(-Infinity)'}`);
+          order.push({ name: h, desc: o.desc });
+          continue;
+        }
         const name = hide(o.ast, '__wo');
         if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, o.text ? `${name} == '' ? 0 : 1` : `${name} == ${name} ? 1 : 0`); order.push({ name: h }); }
         order.push({ name, desc: o.desc });
@@ -1564,7 +1587,7 @@ function compileSelect(ast, env, outer, tail) {
       aggs.set(k, name);
       if (e.args.some(hasAgg)) fail('aggregates can\'t contain aggregates');
       if (PERCENTILE.has(e.fn)) {
-        const qn = percentileAgg(e, keys.map((x) => x.name), (x) => translate(x, plain));
+        const qn = percentileAgg(e, keys.map((x) => x.name), (x) => valueOf(x, plain));
         const arg = e.fn === 'MEDIAN' || e.fn.startsWith('QUANTILE') ? e.args[0] : e.within.e;
         if (kindOf(arg, plain) === 'text') { extraKeys.push(qn); aggs.set(k, qn); return v(qn); } // (one value per group: a key, so it stays text)
         spec[name] = `min(${qn})`;
@@ -1574,7 +1597,7 @@ function compileSelect(ast, env, outer, tail) {
       const fn = e.fn === 'COUNT' && e.star ? 'count' : e.fn === 'COUNT' && e.distinct ? 'countDistinct' : AGG[e.fn];
       if (e.distinct && e.fn !== 'COUNT') fail(`${e.fn}(DISTINCT ...) is not supported (COUNT(DISTINCT x) is)`);
       if (!e.star && e.args.length !== 1) fail(`${e.fn}() takes one value`);
-      const arg = e.star ? null : src(translate(e.args[0], plain));
+      const arg = e.star ? null : src(valueOf(e.args[0], plain));
       spec[name] = e.star ? 'count()' : `${fn}(${arg})`;
       if (fn === 'sum') { spec[`${name}_n`] = `count(${arg})`; return cond(bin('>', v(`${name}_n`), num(0)), v(name), num(NaN)); } // (SUM of no values: NULL)
       if ((fn === 'min' || fn === 'max') && kindOf(e.args[0], plain) === 'date') return asDate(name);
@@ -1599,11 +1622,12 @@ function compileSelect(ast, env, outer, tail) {
       if (k && e.k !== 'col') return v(k.name);
       return translate(e, post);
     };
-    planWindows(translatePost, (x) => kindOf(x, post));
     const tri = (e, t) => { if (!isCond(e) || e.k === 'num' || t.t === 'var') return t; try { return condValue(e, post, t); } catch { return t; } }; // (built from GROUP BY expressions: as it is)
+    const valuePost = (e) => tri(e, translatePost(e));
+    planWindows(valuePost, (x) => kindOf(x, post));
     const outs = withCols(items.map((it) => { const t = translatePost(it.e); return { ...it, ast: textConst(tri(it.e, t), post) }; }));
-    const havingAst = ast.having ? (ast.having.k === 'null' ? num(0) : translatePost(ast.having)) : null;
-    const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, translatePost) }));
+    const havingAst = ast.having ? truth(ast.having, post, ast.having.k === 'null' ? undefined : translatePost(ast.having)) : null;
+    const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, valuePost) }));
     q = q.groupBy([...keys.map((k) => k.name), ...extraKeys]).agg(Object.keys(spec).length ? spec : { __a_rows: 'count()' });
     const late = new Set(windowVars.values()), after = []; // (those using window values: after the windows)
     for (const st of deferred) if (st.inputs.some((x) => late.has(x))) { late.add(st.name); after.push(st); } else st.run();
@@ -1615,10 +1639,10 @@ function compileSelect(ast, env, outer, tail) {
     return finish(outs, (o) => (o.e.k === 'col' ? post.kindOfCol(o.e) ?? kinds.get(resolveSafe(o.e)) : kindOf(o.e, post)), post);
   }
   const pre = windowCtx(plain);
-  planWindows((e) => (e.k === 'col' ? colOf(e) : translate(e, pre)), (x) => kindOf(x, pre));
+  planWindows((e) => (e.k === 'col' ? colOf(e) : valueOf(e, pre)), (x) => kindOf(x, pre));
   applyWindows();
   const outs = withCols(items.map((it) => { const t = it.e.k === 'col' ? colOf(it.e) : translate(it.e, pre); return { ...it, ast: textConst(isCond(it.e) && it.e.k !== 'num' ? condValue(it.e, pre, t) : t, pre) }; }));
-  const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, (e) => (e.k === 'col' ? colOf(e) : translate(e, pre))) }));
+  const orderAsts = orderBy.map((o) => ({ ...o, ast: orderTarget(o.e, outs, (e) => (e.k === 'col' ? colOf(e) : valueOf(e, pre))) }));
   for (const o of outs) if (o.ast.t !== 'var') q = q.derive(o.col, src(o.ast));
   for (const o of orderAsts) sortKey(o, orderKind(o, outs, pre));
   if (ast.distinct) { // (the sort's own columns, NULLS FIRST marks and such, made from the selected ones: kept as keys too)

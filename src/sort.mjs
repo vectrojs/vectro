@@ -33,7 +33,7 @@ export function labelRanks(dict, desc) {
 // Text in code point order, as DuckDB sorts it (JavaScript's < compares UTF-16 units, which
 // puts 'ﬁ' and full-width letters after emoji): a surrogate unit is part of a code point
 // above every unit that isn't one, so it sorts after them.
-function byCodePoint(a, b) {
+export function byCodePoint(a, b) {
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) {
     const x = a.charCodeAt(i), y = b.charCodeAt(i);
