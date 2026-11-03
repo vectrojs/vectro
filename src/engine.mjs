@@ -810,12 +810,13 @@ export function trackAsyncMethods(cls, engineOf, extra = []) {
     const d = Object.getOwnPropertyDescriptor(cls.prototype, name);
     if (!(name.endsWith('Async') || extra.includes(name)) || typeof d.value !== 'function') continue;
     const f = d.value;
-    cls.prototype[name] = function (...args) {
+    const wrapped = function (...args) {
+      const out = f.apply(this, args); // (an error thrown at once is still thrown at once)
       const engine = engineOf(this);
-      let out;
-      try { out = f.apply(this, args); } catch (err) { if (!engine?._track) throw err; out = Promise.reject(err); }
       return engine?._track ? engine._track(out) : out;
     };
+    Object.defineProperty(wrapped, 'name', { value: name });
+    cls.prototype[name] = wrapped;
   }
 }
 

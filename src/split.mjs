@@ -832,4 +832,5 @@ function total(list) {
 // (close() while calls are pending: see SplitEngine _track)
 trackAsyncMethods(SplitEngine, (e) => e);
 trackAsyncMethods(SplitTable, (t) => t.engine, ['dispose']);
-trackAsyncMethods(StreamTable, (t) => t.engine, ['dispose', 'push']);
+trackAsyncMethods(StreamTable, (t) => t.engine, ['dispose', 'push', 'connect']);
+trackAsyncMethods(LiveWindow, (w) => w.stream?.engine, ['dispose']);

@@ -347,10 +347,14 @@ const dir = mkdtempSync(join(tmpdir(), 'vectro-audit-server-'));
     const csv = ${JSON.stringify(join(dir, 'r3.csv'))};
     writeFileSync(csv, 'k,v\\n' + Array.from({ length: 200_000 }, (_, i) => i + ',' + i).join('\\n') + '\\n');
     const out = [];
-    for (const op of ['readCSVAsync', 'parseCSVAsync', 'sqlAsync', 'countAsync']) {
+    const { VectorIndex } = await import(${JSON.stringify(pathToFileURL(fileURLToPath(new URL('../src/vectors.mjs', import.meta.url))).href)});
+    for (const op of ['readCSVAsync', 'parseCSVAsync', 'sqlAsync', 'countAsync', 'unionAsync', 'searchAsync']) {
       const e = new Engine(), t = e.table({ g: Float64Array.from({ length: 300_000 }, (_, i) => i % 7) });
+      const index = op === 'searchAsync' ? await VectorIndex.create(e, { vectors: Array.from({ length: 50_000 }, (_, i) => [i % 3, 1, i % 5]), dim: 3 }) : null;
       const p = op === 'readCSVAsync' ? e.readCSVAsync(csv) : op === 'parseCSVAsync' ? e.parseCSVAsync('a,b\\n' + '1,2\\n'.repeat(200_000))
-        : op === 'sqlAsync' ? sql('SELECT g, COUNT(*) AS n FROM t GROUP BY g', { t }).toRowsAsync() : t.lazy().countAsync();
+        : op === 'sqlAsync' ? sql('SELECT g, COUNT(*) AS n FROM t GROUP BY g', { t }).toRowsAsync()
+        : op === 'unionAsync' ? sql('SELECT g FROM t UNION ALL SELECT g FROM t', { t }).toRowsAsync()
+        : op === 'searchAsync' ? index.searchAsync([1, 1, 1], { k: 5 }) : t.lazy().countAsync();
       await e.close();
       out.push(await p.then(() => 'resolved', (err) => /this engine is closed/.test(err.message) ? 'closed' : err.message));
     }
@@ -361,7 +365,14 @@ const dir = mkdtempSync(join(tmpdir(), 'vectro-audit-server-'));
   const r = await run(process.execPath, ['--unhandled-rejections=strict', join(dir, 'close-r3.mjs')], { timeout: 120_000 });
   let out = null;
   try { out = JSON.parse(r.stdout.trim().split('\n').pop()); } catch { /* reported below */ }
-  check(r.code === 0 && out?.length === 5 && out.slice(0, 4).every((x) => x === 'closed' || x === 'resolved'), `close() during async calls, strict: code ${r.code} ${JSON.stringify(out)} ${r.stderr.slice(0, 300)}`);
+  check(r.code === 0 && out?.length === 7 && out.slice(0, 6).every((x) => x === 'closed' || x === 'resolved'), `close() during async calls, strict: code ${r.code} ${JSON.stringify(out)} ${r.stderr.slice(0, 300)}`);
+  // the wrapped methods keep their names, and an error thrown at once still is
+  const e = new Engine(), t = e.table({ a: [1, 2] });
+  check(t.sumAsync.name === 'sumAsync' && e.readCSVAsync.name === 'readCSVAsync', `wrapped names: ${t.sumAsync.name}, ${e.readCSVAsync.name}`);
+  let thrown = false;
+  try { t.deriveAsync(123, 'a').catch(() => {}); } catch { thrown = true; }
+  check(thrown, 'deriveAsync(123) still throws at once');
+  await e.close();
 }
 
 // round 3: whenFree runs once the holds taken before it end; keepMs right after a push never shows more than the window

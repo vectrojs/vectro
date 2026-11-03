@@ -16,8 +16,11 @@
 // filters, split tables (Web Workers on any page) and edge runtimes work with
 // no extra code. cosine: vectors and query are normalized, score = dot
 // (higher is closer). l2: score = squared distance (lower is closer).
+import { trackAsyncMethods } from './engine.mjs';
+
 const DIMS_PER_PASS = 24; // a pass reads 24 vector columns + the running sum
 const METRICS = new Set(['cosine', 'dot', 'l2']);
+
 
 export class VectorIndex {
   constructor(table, { dim, metric, names }) {
@@ -135,4 +138,11 @@ export function mergeHits(lists, k, metric) {
   const all = lists.flat();
   const better = metric === 'l2' ? (a, b) => a.score - b.score : (a, b) => b.score - a.score;
   return all.sort(better).slice(0, k);
+}
+
+// (close() while a search runs: see Engine _track)
+trackAsyncMethods(VectorIndex, (v) => v.table?.engine, ['dispose']);
+{
+  const create = VectorIndex.create;
+  VectorIndex.create = function (engine, opts) { const out = create.call(this, engine, opts); return engine?._track ? engine._track(out) : out; };
 }
