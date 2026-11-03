@@ -33,6 +33,13 @@ export const MAX_DEPTH = 1000;
 const tooDeep = () => new SyntaxError(`vectro: expression too deep (more than ${MAX_DEPTH} levels of nesting or terms in a chain); split it up`);
 
 export function parse(src) {
+  try { return parseText(src); } catch (err) { // (a smaller stack than ours runs out before the limits below)
+    if (err instanceof RangeError && /call stack/i.test(err.message)) throw tooDeep();
+    throw err;
+  }
+}
+
+function parseText(src) {
   if (typeof src !== 'string') throw new TypeError(`vectro: an expression must be text, like "price > 10", got ${src === null ? 'null' : typeof src}`);
   const toks = tokenize(src);
   let i = 0, level = 0;
