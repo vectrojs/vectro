@@ -12,7 +12,7 @@ import { FrameReader } from './frames.mjs';
 import { ArrowReader } from './arrow.mjs';
 import { parse, isMask } from './fuse.mjs';
 import { SKETCH_SIZE, sketchAdd, sketchMerge, hashNumber, hashText } from './sketch.mjs';
-import { csvTail, CSV_FIELD_START } from './csv-kernel.mjs';
+import { csvTail, csvRowEnds, CSV_FIELD_START } from './csv-kernel.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
@@ -103,6 +103,8 @@ export function createStreams(getEngine) {
       return;
     }
     const engine = getEngine();
+    bytes = dropBlankRows(bytes);
+    if (!bytes.length) return;
     const buf = new Uint8Array(s.header.length + bytes.length);
     buf.set(s.header, 0);
     buf.set(bytes, s.header.length);
@@ -112,6 +114,23 @@ export function createStreams(getEngine) {
     } finally {
       t.dispose();
     }
+  }
+
+  // CSV rows that are blank (a heartbeat newline): left out, as JSON lines streams skip blank lines;
+  // parsed, each was a row of missing values. A blank row is "\n" or "\r\n" outside quotes.
+  function dropBlankRows(bytes) {
+    const keep = [];
+    let from = 0, blank = false;
+    csvRowEnds(bytes, 0, bytes.length, COMMA, (at) => {
+      if (at - from === 1 || (at - from === 2 && bytes[from] === 13)) blank = true; else keep.push([from, at]);
+      from = at;
+    });
+    if (!blank) return bytes;
+    if (from < bytes.length) keep.push([from, bytes.length]);
+    const out = new Uint8Array(keep.reduce((a, [x, y]) => a + y - x, 0));
+    let o = 0;
+    for (const [x, y] of keep) { out.set(bytes.subarray(x, y), o); o += y - x; }
+    return out;
   }
 
   // Append m parsed rows. part(k) gives column k's values (and, for

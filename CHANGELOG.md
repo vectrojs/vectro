@@ -194,6 +194,9 @@ Fixes from audit round 5.
   (`'{"nested":true}'`); a key with only nested values is such a column (it
   was dropped). A vector field is one that holds a list of numbers of one
   length in every row. Streams still leave nested values missing.
+- Streams: a blank line in a CSV stream (a heartbeat newline) is not a row,
+  as JSON lines streams already skipped them; it was a row of missing values,
+  so `count()` grew. `keepRows` counts rows, not blank lines.
 
 ## 0.1.4
 

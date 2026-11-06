@@ -669,6 +669,7 @@ export class StreamTable extends SplitTable {
     if (last === -1) { this.partial = this.partial ? join(this.partial, bytes) : Uint8Array.prototype.slice.call(bytes); return Promise.resolve(); }
     const lines = this.partial ? join(this.partial, bytes.subarray(0, last + 1)) : Uint8Array.prototype.slice.call(bytes, 0, last + 1);
     this.partial = last + 1 < bytes.length ? Uint8Array.prototype.slice.call(bytes, last + 1) : null;
+    if (Number.isFinite(this.keepRows)) rows = realRows(lines, this.format); // (keepRows counts rows, not blank lines: the workers skip those)
     const w = this.next;
     this.next = (this.next + 1) % this.counts.length;
     // pos: the place of the chunk's first row in push order; cut: rows placed
@@ -839,3 +840,20 @@ trackAsyncMethods(SplitEngine, (e) => e);
 trackAsyncMethods(SplitTable, (t) => t.engine, ['dispose']);
 trackAsyncMethods(StreamTable, (t) => t.engine, ['dispose', 'push', 'connect']);
 trackAsyncMethods(LiveWindow, (w) => w.stream?.engine, ['dispose']);
+
+// Complete rows in lines (whole CSV rows or JSON lines), blank ones left out.
+function realRows(lines, format) {
+  let n = 0, from = 0;
+  if (format === 'csv') {
+    csvRowEnds(lines, 0, lines.length, COMMA, (at) => { if (!(at - from === 1 || (at - from === 2 && lines[from] === 13))) n++; from = at; });
+    return n;
+  }
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] !== NL) continue;
+    let j = from;
+    while (j < i && (lines[j] === 32 || lines[j] === 9 || lines[j] === 13)) j++;
+    if (j < i) n++;
+    from = i + 1;
+  }
+  return n;
+}
