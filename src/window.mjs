@@ -112,11 +112,16 @@ export function windowValues(n, b, item, hasOrder, orderKey, desc) {
         const e = pe[s];
         let a = s, z = e; // present values: NaN sort last
         while (z > a && x[z - 1] !== x[z - 1]) z--;
-        const m = z - a;
+        let xs = x, m = z - a;
+        if (item.distinct && m) { // (each value once; sorted, so equal values sit together, -0 with 0)
+          xs = [x[a]];
+          for (let i = a + 1; i < z; i++) if (x[i] !== x[i - 1]) xs.push(x[i]);
+          a = 0; m = xs.length;
+        }
         let v = NaN;
         if (m) {
-          if (item.fn === 'percentile_disc') v = x[a + Math.max(0, Math.ceil(item.p * m) - 1)];
-          else { const r = item.p * (m - 1), lo = Math.floor(r); v = x[a + lo] + (r - lo) * ((x[a + Math.min(m - 1, lo + 1)]) - x[a + lo]); }
+          if (item.fn === 'percentile_disc') v = xs[a + discRank(item.p, m, item.desc)];
+          else { const r = item.p * (m - 1), lo = Math.floor(r); v = xs[a + lo] + (r - lo) * ((xs[a + Math.min(m - 1, lo + 1)]) - xs[a + lo]); }
         }
         out.fill(v, s, e);
         s = e;
@@ -160,3 +165,7 @@ export function windowValues(n, b, item, hasOrder, orderKey, desc) {
   }
   throw new Error(`vectro: unknown window function ${item.fn}`);
 }
+
+// PERCENTILE_DISC(p): the rank (0 = the smallest of m values present) of the
+// first value, in the ORDER BY direction, whose share of the values reaches p
+export const discRank = (p, m, desc = false) => (desc ? m - Math.max(1, Math.ceil(p * m)) : Math.max(0, Math.ceil(p * m) - 1));

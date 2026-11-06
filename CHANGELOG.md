@@ -50,6 +50,12 @@ Fixes from audit round 5.
   gave NULL). Expressions can use it too, as `mod(a, b)`. The kernels compute
   it in WebAssembly (no remainder instruction there), so `dist/vectro.wasm`
   is rebuilt.
+- Percentiles: `PERCENTILE_DISC(p) WITHIN GROUP (ORDER BY x DESC)` picks the
+  right value (it took the ascending 1 - p, one value off whenever p × n is
+  whole); `MEDIAN(DISTINCT x)` and the other percentiles with DISTINCT count
+  each value once (DISTINCT was ignored); percentiles of text skip missing
+  text and give a label (MEDIAN of text is the lower middle label, as in
+  DuckDB; it gave a number), and PERCENTILE_CONT of text is an error.
 
 ## 0.1.4
 

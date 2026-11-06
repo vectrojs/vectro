@@ -18,7 +18,7 @@ import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { partitionedGroupsG, estimateGroups, PARTITION_ROWS, PARTITION_GROUPS, DIRECT_SLOTS } from './partition.mjs';
 import { joinTablesG, joinViewG, lookupGroupsG } from './join.mjs';
 import { Query } from './plan.mjs';
-import { bounds, windowValues, readsPeers } from './window.mjs';
+import { bounds, windowValues, readsPeers, discRank } from './window.mjs';
 import { copyRows } from './rows.mjs';
 import { textmapRows } from './textmap.mjs';
 import { writeArrow } from './arrow.mjs';
@@ -1425,7 +1425,7 @@ export class Table {
 
   *#windowG({ partition = [], order = [], items, firstRanks = null }) {
     const { engine } = this;
-    if (items.length && order.length === 1 && !order[0].desc && items.every((it) => (it.fn === 'percentile_cont' || it.fn === 'percentile_disc') && it.arg === order[0].name) && !this.cols.get(order[0].name)?.dict) return yield* this.#percentilesG(partition, items); // (text: by its sorted labels, below)
+    if (items.length && order.length === 1 && !order[0].desc && items.every((it) => (it.fn === 'percentile_cont' || it.fn === 'percentile_disc') && it.arg === order[0].name && !it.distinct) && !this.cols.get(order[0].name)?.dict) return yield* this.#percentilesG(partition, items); // (text: by its sorted labels, below)
     if (firstRanks && order.length) { // only rows that can rank in the first k (see plan.mjs firstRanks)
       const few = yield* this.#firstRowsG(partition, order[0], firstRanks);
       if (few) { try { return yield* few.#windowG({ partition, order, items }); } finally { few.dispose(); } }
@@ -1450,7 +1450,7 @@ export class Table {
       if (cols.has(it.name)) throw new Error(`vectro: column "${it.name}" already exists`);
       const src = it.arg && KEEPS_KIND.has(it.fn) ? t.cols.get(it.arg) : null; // (text stays text, dates stay dates)
       let arg = it.arg ? values(it.arg) : null, codeOf = null;
-      if ((it.fn === 'min' || it.fn === 'max') && src?.dict) { // text: by its labels' order (missing text skipped), then back to codes
+      if ((it.fn === 'min' || it.fn === 'max' || it.fn === 'percentile_disc') && src?.dict) { // text: by its labels' order (missing text skipped), then back to codes
         const rank = labelRanks(src.dict);
         codeOf = new Float64Array(src.dict.length);
         rank.forEach((r, code) => { if (r === r) codeOf[r] = code; });
@@ -2280,7 +2280,7 @@ function percentileRanks(sizes, items) {
   const wants = [];
   const plan = items.map((it) => Array.from(sizes, (m, k) => {
     if (!m) return null;
-    if (it.fn === 'percentile_disc') { wants.push([k, Math.max(0, Math.ceil(it.p * m) - 1)]); return { at: wants.length - 1 }; }
+    if (it.fn === 'percentile_disc') { wants.push([k, discRank(it.p, m, it.desc)]); return { at: wants.length - 1 }; }
     const r = it.p * (m - 1), lo = Math.floor(r);
     wants.push([k, lo]);
     if (lo + 1 < m && r > lo) { wants.push([k, lo + 1]); return { at: wants.length - 2, frac: r - lo }; }

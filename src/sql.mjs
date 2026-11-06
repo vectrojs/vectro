@@ -1582,17 +1582,21 @@ function compileSelect(ast, env, outer, tail) {
       if (!e.within) fail(`${e.fn}(p) needs WITHIN GROUP (ORDER BY x)`);
       const t = tr(e.args[0] ?? fail(`${e.fn}(p) needs a fraction p`));
       if (t.t !== 'num' || !(t.v >= 0 && t.v <= 1)) fail(`${e.fn}(p): p must be a number from 0 to 1`);
-      p = e.within.desc ? 1 - t.v : t.v;
+      p = t.v;
       arg = e.within.e;
     } else { // QUANTILE_CONT(x, p) (DuckDB)
       const t = tr(e.args[1] ?? fail(`${e.fn}(x, p) needs a fraction p`));
       if (t.t !== 'num' || !(t.v >= 0 && t.v <= 1)) fail(`${e.fn}(x, p): p must be a number from 0 to 1`);
       p = t.v; arg = e.args[0];
     }
-    const disc = e.fn === 'PERCENTILE_DISC' || e.fn === 'QUANTILE_DISC' || e.fn === 'QUANTILE'; // (DuckDB's QUANTILE is QUANTILE_DISC)
+    const text = kindOf(arg, plain) === 'text';
+    // (DuckDB's QUANTILE is QUANTILE_DISC; the MEDIAN of text is the lower middle label, as there)
+    const disc = e.fn === 'PERCENTILE_DISC' || e.fn === 'QUANTILE_DISC' || e.fn === 'QUANTILE' || (e.fn === 'MEDIAN' && text);
+    if (!disc && text) fail(`${e.fn} of text can't fall between two labels: use PERCENTILE_DISC or QUANTILE_DISC`);
+    const desc = !!e.within?.desc; // (ORDER BY x DESC: CONT is the ascending 1 - p; DISC picks from the other end)
     const argName = hide(tr(arg), '__qa');
     const name = `__q${n.hidden++}`;
-    q = q.window({ partition: groupKeyNames, order: [{ name: argName }], items: [{ name, fn: disc ? 'percentile_disc' : 'percentile_cont', arg: argName, p }] });
+    q = q.window({ partition: groupKeyNames, order: [{ name: argName }], items: [{ name, fn: disc ? 'percentile_disc' : 'percentile_cont', arg: argName, p: !disc && desc ? 1 - p : p, ...(disc && desc ? { desc: true } : {}), ...(e.distinct ? { distinct: true } : {}) }] });
     return name;
   }
 
