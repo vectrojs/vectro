@@ -110,7 +110,6 @@ for (const by of ['w', '-w', ['k2', '-w'], 's', '-d', ['-v', 'id']]) DF.push([`t
 
   for (let i = 0; i < DF.length; i++) {
     const [label, f] = DF[i];
-    if (SOURCE === 'dataset' && A && /groupBy|top/.test(label)) continue; // (datasets have no groupBy().aggAsync / topAsync yet: O2)
     let a; try { a = await f(D); if (a && !Array.isArray(a)) a = Object.fromEntries(Object.entries(a).map(([k, v]) => [k, norm(v)])); } catch (er) { a = 'ERROR ' + er.message.split('\n')[0].slice(0, 80); }
     const h = hash(a);
     if (!want) { written.df.push([label, h]); continue; }
