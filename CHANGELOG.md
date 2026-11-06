@@ -111,6 +111,12 @@ Fixes from audit round 5.
   the text `"Infinity"` / `"-Infinity"` (`Infinity` / `-Infinity` in CSV).
   They were null, the same as a missing value, so `MIN(x) = -Infinity` reached
   Excel or an LLM as "no value". NaN is still missing.
+- SQL regular expressions (`REGEXP_MATCHES`, `REGEXP_REPLACE`,
+  `REGEXP_EXTRACT`, `~`) refuse a pattern with a repeated group that itself
+  repeats or has `|`, such as `(a+)+$` or `(a|aa)*`. JavaScript's regular
+  expressions backtrack, and `(a+)+$` on 31 characters never finished, so one
+  query could freeze a server. Rewrite such a pattern, for example with a
+  character class (`[ab]+`).
 
 ## 0.1.4
 

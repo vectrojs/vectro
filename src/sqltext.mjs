@@ -38,12 +38,47 @@ function substring(s, start, len) {
   if (len !== undefined && len < 0) { a = at + len; b = at; }
   return cs.slice(Math.max(0, a), Math.max(0, Math.min(n, b))).join('');
 }
+// JavaScript's regular expressions backtrack: a repeated group that itself repeats or has |
+// ((a+)+$, (a|aa)*$) takes exponential time on text that almost matches (31 characters never
+// finished, freezing a server; DuckDB uses RE2, which can't). Such patterns are refused.
+function repeatsRepeat(p) {
+  const open = [false]; // per open group (and the whole pattern): its body repeats without bound or has |
+  let group = null; // the group that just closed (a quantifier after it repeats it)
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
+    let closed = null;
+    if (c === '\\') i++;
+    else if (c === '[') { // a character class: nothing in it repeats
+      i++;
+      while (i < p.length && p[i] !== ']') { if (p[i] === '\\') i++; i++; }
+    } else if (c === '(') {
+      open.push(false);
+      if (p[i + 1] === '?') { // (?: (?= (?! (?<= (?<! (?<name>
+        i += 2;
+        if (p[i] === '<' && p[i + 1] !== '=' && p[i + 1] !== '!') while (i < p.length && p[i] !== '>') i++;
+        else if (p[i] === '<') i++;
+      }
+    } else if (c === ')') {
+      if (open.length > 1) { closed = open.pop(); open[open.length - 1] ||= closed; }
+    } else if (c === '|') open[open.length - 1] = true;
+    else {
+      const b = c === '{' ? /^\{(\d+)(,(\d*))?\}/.exec(p.slice(i)) : null;
+      const max = c === '*' || c === '+' ? Infinity : b ? (b[2] === undefined ? +b[1] : b[3] === '' ? Infinity : +b[3]) : c === '?' ? 1 : 0;
+      if (b) i += b[0].length - 1;
+      if (max === Infinity) open[open.length - 1] = true;
+      if (group !== null && max >= 2 && group) return true;
+    }
+    group = closed;
+  }
+  return false;
+}
 const regexes = new Map();
 function regex(pattern, flags = '') {
   const key = `${flags}/${pattern}`;
   let re = regexes.get(key);
   if (!re) {
     if (regexes.size > 1000) regexes.clear();
+    if (repeatsRepeat(String(pattern))) throw new SyntaxError(`vectro SQL: regular expression /${pattern}/ could take very long (a repeated group that itself repeats or has |); rewrite it, e.g. with a character class`);
     try { re = new RegExp(pattern, flags.replace(/[^gimsu]/g, '') + 'u'); } catch (err) { throw new SyntaxError(`vectro SQL: bad regular expression /${pattern}/: ${err.message}`); }
     regexes.set(key, re);
   }

@@ -110,5 +110,16 @@ if (MODE === 'node') {
   }
 }
 
+// T7: a regular expression whose repeated group repeats itself or has | is refused (JavaScript's
+// regular expressions backtrack: '(a+)+$' on 30 a's and a b didn't finish); others still work
+{
+  const e = new Engine({ threads: 1 }), t = e.table({ s: ['a'.repeat(30) + 'b', 'ab@x.org'] });
+  const ask = (q) => { try { return [JSON.stringify(sql(q, { t }).toRows())]; } catch (err) { return [/could take very long/.test(err.message) ? 'refused' : 'error: ' + err.message]; } };
+  for (const q of ["SELECT COUNT(*) AS n FROM t WHERE REGEXP_MATCHES(s, '(a+)+$')", "SELECT REGEXP_REPLACE(s, '(a|aa)*c', 'x') AS r FROM t", "SELECT COUNT(*) AS n FROM t WHERE s ~ '((ab)+)+c'", "SELECT REGEXP_EXTRACT(s, '(?:a*){2,}c') AS r FROM t"]) same(ask(q), ['refused'], `T7 refused: ${q}`);
+  same(ask("SELECT REGEXP_EXTRACT(s, '([a-z]+)@', 1) AS r FROM t"), [JSON.stringify([{ r: '' }, { r: 'ab' }])], 'T7: a plain group still works');
+  same(ask("SELECT COUNT(*) AS n FROM t WHERE REGEXP_MATCHES(s, '^(?:a){2}[(a+)]+')"), [JSON.stringify([{ n: 1 }])], 'T7: a bounded group and a class with ( + ) still work');
+  await e.close();
+}
+
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} round-5 text checks passed`);
 process.exit(failures ? 1 : 0);
