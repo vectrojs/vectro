@@ -860,9 +860,11 @@ function compileSelect(ast, env, outer, tail) {
       // x BETWEEN lo AND hi across the sides: two comparisons; a IS NOT DISTINCT FROM b: keys where missing
       // matches missing (numbers: whether it is there, and the value or 0; text: missing as a label of its own)
       const expanded = conjuncts(j.on).flatMap((c) => {
+        while (c.k === 'not' && c.x.k === 'not') c = c.x.x; // (IS NOT DISTINCT FROM is NOT (IS DISTINCT FROM): NOT NOT)
         if (c.k === 'between' && apart(c.x, c.lo) && apart(c.x, c.hi)) return [{ k: 'bin', op: '>=', l: c.x, r: c.lo }, { k: 'bin', op: '<=', l: c.x, r: c.hi }];
         if (c.k === 'bin' && c.op === 'IS' && !(c.r.k === 'num' && c.r.bool) && apart(c.l, c.r)) {
-          if (kindOf(c.l, plain) === 'text') { const none = (x) => ({ k: 'call', fn: 'COALESCE', args: [x, { k: 'str', v: '\u0001' }] }); return [{ k: 'bin', op: '=', l: none(c.l), r: none(c.r) }]; }
+          const kindAt = (x) => (sideOf(x) === 'left' ? kindOf(x, plain) : x.k === 'col' ? right.kinds.get(x.name) : 'number'); // (the right table isn't in scope yet)
+          if (kindAt(c.l) === 'text' || kindAt(c.r) === 'text') { const none = (x) => ({ k: 'call', fn: 'COALESCE', args: [x, { k: 'str', v: '\u0001' }] }); return [{ k: 'bin', op: '=', l: none(c.l), r: none(c.r) }]; }
           const flag = (x) => ({ k: 'case', base: null, whens: [{ c: { k: 'isnull', x }, v: { k: 'num', v: 0 } }], otherwise: { k: 'num', v: 1 } });
           const val = (x) => ({ k: 'call', fn: 'COALESCE', args: [x, { k: 'num', v: 0 }] });
           return [{ k: 'bin', op: '=', l: flag(c.l), r: flag(c.r) }, { k: 'bin', op: '=', l: val(c.l), r: val(c.r) }];
