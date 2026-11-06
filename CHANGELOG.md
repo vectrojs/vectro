@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+Fixes from audit round 5 (the six worst bugs first).
+
+- LIKE and ILIKE (in SQL and in `like()` / `ilike()`) match in linear time.
+  They were a backtracking regular expression: `LIKE '%a%e%o%zzz'` on 4 KB of
+  ordinary text took 10 seconds.
+
 ## 0.1.4
 
 Fixes from four more audit rounds: streams, SQL against DuckDB, the

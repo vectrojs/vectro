@@ -34,6 +34,7 @@ import { Query, namesOf, findDataset } from './plan.mjs';
 import { quoteText } from './fuse.mjs';
 import { byCodePoint } from './sort.mjs';
 import { lowerAll } from './table.mjs';
+import { likeMatcher } from './like.mjs';
 import { decodeOne } from './pack.mjs';
 import { TEXT_FUNCTIONS, toText, isNull, textToNumber, textToDate } from './sqltext.mjs';
 
@@ -1312,8 +1313,7 @@ function compileSelect(ast, env, outer, tail) {
           const tx = T(e.x);
           if (tx.t === 'var') return bin('&&', call('ilike', tx, { t: 'str', v: e.pattern.v }), there);
           if (tx.t === 'str') { // (text in quotes: worked out now)
-            const re = new RegExp(`^${lowerAll(e.pattern.v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`, 'u');
-            return num(tx.v !== '' && re.test(lowerAll(tx.v)) ? 1 : 0);
+            return num(tx.v !== '' && likeMatcher(lowerAll(e.pattern.v))(lowerAll(tx.v)) ? 1 : 0);
           }
           return bin('&&', T({ k: 'like', x: { k: 'call', fn: 'LOWER', args: [e.x] }, pattern: { k: 'str', v: lowerAll(e.pattern.v) } }), there);
         }

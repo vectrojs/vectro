@@ -9,6 +9,7 @@ import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
 import { trackAsyncMethods } from './engine.mjs';
 import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
 import { parse, toSource, walk, analyze, isMask, fold, checkSpec } from './fuse.mjs';
+import { likeMatcher } from './like.mjs';
 import { generateGroupBy, generateCompact, generateHashGroups, generateMarkPairs, generateStridedKeys } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
@@ -2112,8 +2113,8 @@ const TEXT_FNS = {
   endsWith: (label, [p]) => label.endsWith(p),
   contains: (label, [p]) => label.includes(p),
   in: (label, list) => list.includes(label),
-  like: (label, [pattern], re) => re.test(label),
-  ilike: (label, [pattern], re) => re.test(lowerAll(label)), // (both lowercased, as DuckDB's ILIKE: the pattern below)
+  like: (label, [pattern], matches) => matches(label),
+  ilike: (label, [pattern], matches) => matches(lowerAll(label)), // (both lowercased, as DuckDB's ILIKE: the pattern below)
 };
 // lowercase one character at a time, as DuckDB's lower(): 'İ' is 'i', a final 'Σ' is 'σ'
 export const lowerAll = (s) => s.replace(/[\u0130\u03a3]/g, (c) => (c === '\u0130' ? 'i' : '\u03c3')).toLowerCase();
@@ -2131,8 +2132,8 @@ function textCall(n, cols, src) {
   if (!rest.length || rest.some((a) => a.t !== 'str')) throw new SyntaxError(`vectro: ${n.fn}(${colNode.name}, …) needs text in quotes after the column, in "${src}"`);
   if (n.fn !== 'in' && rest.length !== 1) throw new SyntaxError(`vectro: ${n.fn}() takes a column and one text, in "${src}"`);
   const args = rest.map((a) => a.v);
-  const re = n.fn === 'like' || n.fn === 'ilike' ? new RegExp(`^${(n.fn === 'ilike' ? lowerAll(args[0]) : args[0]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`, 'u') : null; // (u: _ is one character, an emoji too)
-  const match = c.dict.map((label) => TEXT_FNS[n.fn](label, args, re));
+  const matches = n.fn === 'like' || n.fn === 'ilike' ? likeMatcher(n.fn === 'ilike' ? lowerAll(args[0]) : args[0]) : null;
+  const match = c.dict.map((label) => TEXT_FNS[n.fn](label, args, matches));
   // runs of consecutive codes that match (or, if shorter, that don't)
   const runs = (want) => {
     const out = [];
