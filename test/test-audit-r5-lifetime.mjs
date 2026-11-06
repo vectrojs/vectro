@@ -6,7 +6,8 @@
 // work runs rejects the work with "this engine is closed" and the process ends by
 // itself. Also: a table made inside a chain (t.sort(...).head(20)) is freed once
 // dropped (it couldn't be disposed and was kept until close(): 150 calls held
-// 900 MB); a SplitEngine nobody closed doesn't keep the process alive.
+// 900 MB); a SplitEngine nobody closed doesn't keep the process alive; a
+// script piped into node can start worker threads.
 import { MODE } from './test-mode.mjs';
 if (MODE !== 'node') { console.log('lifetime checks run Node child processes: skipped in this mode'); process.exit(0); }
 import { spawnSync } from 'node:child_process';
@@ -78,6 +79,13 @@ for (const [label, body] of Object.entries(STOP)) {
 for (const [label, body] of [['Engine', `const e = new Engine(); await e.table(big(300000)).aggAsync({ s: 'sum(v)' }); console.log('done');`], ['SplitEngine', `const se = new SplitEngine({ workers: 2 }); await (await se.tableAsync(big(1000))).aggAsync({ n: 'count()' }); console.log('done');`]]) {
   const r = run('open-' + label, body, 8000);
   same([r.status, r.out], [0, 'done'], `a script that leaves a ${label} open still ends by itself`);
+}
+// 5. a script piped into node (or given with --input-type -e) can start worker threads (they refused --input-type)
+{
+  const script = `import { Engine, SplitEngine } from '${src}node.mjs'; const e = new Engine(); const t = e.table({ a: Float64Array.from({ length: 2e6 }, (_, i) => i % 7) });
+console.log(t.sum('a')); const se = new SplitEngine({ workers: 2 }); console.log((await (await se.tableAsync({ a: [1, 2, 3] })).aggAsync({ n: 'count()' })).n); await se.close(); await e.close();`;
+  const r = spawnSync(process.execPath, ['--input-type=module'], { input: script, encoding: 'utf8', timeout: 20000 });
+  same([r.status, r.stdout.trim().split('\n')], [0, ['5999995', '3']], 'a script piped into node --input-type=module runs worker threads');
 }
 rmSync(dir, { recursive: true, force: true });
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} round-5 lifetime checks passed`);

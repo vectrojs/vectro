@@ -67,6 +67,9 @@ Fixes from audit round 5.
   `'a' || SUBSTRING('a', 2)` is missing. CONCAT skips missing pieces:
   `CONCAT(UPPER(SUBSTRING(s, 1, 1)), LOWER(SUBSTRING(s, 2)))` capitalizes a
   one-letter word too.
+- A script run with `node --input-type=module -e '…'` or piped into node can
+  use worker threads: they inherited `--input-type`, which Node refuses for
+  workers, so the process stopped as soon as the first one started.
 
 ## 0.1.4
 
