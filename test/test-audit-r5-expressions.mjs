@@ -118,20 +118,26 @@ rmSync(dir, { recursive: true, force: true });
   await e.close();
 }
 
-// planning time: nested or many-argument functions grew 2-4 times per level and ran out of memory
+// planning time: nested or many-argument functions grew 2-4 times per level and ran out of memory. Many-argument
+// LEAST / GREATEST and nested COALESCE / IFNULL / LEAST must answer; ROUND / NULLIF / % nested many levels deep may
+// instead stop at once with "too large once written out"; none may hang or run out of memory
 if (MODE === 'node') {
-  const SH = {
-    'GREATEST of 16 columns': `GREATEST(${Array.from({ length: 16 }, (_, i) => `a + ${i}`).join(', ')})`, 'LEAST of 16 columns': `LEAST(${Array.from({ length: 16 }, (_, i) => `a - ${i}`).join(', ')})`,
-    '16 nested COALESCE': `${'COALESCE('.repeat(16)}a${', 0)'.repeat(16)}`, '16 nested IFNULL': `${'IFNULL('.repeat(16)}a${', 0)'.repeat(16)}`,
-    '16 nested LEAST': `${'LEAST('.repeat(16)}a${', 5)'.repeat(16)}`, '16 nested ROUND': `${'ROUND('.repeat(16)}a${', 1)'.repeat(16)}`,
-    '24 nested NULLIF': `${'NULLIF('.repeat(24)}a${', 7)'.repeat(24)}`, '16 nested %': `${'('.repeat(16)}a${' % 7)'.repeat(16)}`,
-  };
-  for (const [label, x] of Object.entries(SH)) {
+  const SH = [
+    ['GREATEST of 16 columns', `GREATEST(${Array.from({ length: 16 }, (_, i) => `a + ${i}`).join(', ')})`, '16,null,12'], ['LEAST of 16 columns', `LEAST(${Array.from({ length: 16 }, (_, i) => `a - ${i}`).join(', ')})`, '-14,null,-18'],
+    ['GREATEST of 300 columns', `GREATEST(${Array.from({ length: 300 }, (_, i) => `a + ${i}`).join(', ')})`, '300,null,296'],
+    ['16 nested COALESCE', `${'COALESCE('.repeat(16)}a${', 0)'.repeat(16)}`, '1,0,-3'], ['16 nested IFNULL', `${'IFNULL('.repeat(16)}a${', 0)'.repeat(16)}`, '1,0,-3'],
+    ['16 nested LEAST', `${'LEAST('.repeat(16)}a${', 5)'.repeat(16)}`, '1,5,-3'], ['16 nested ROUND', `${'ROUND('.repeat(16)}a${', 1)'.repeat(16)}`, '1,null,-3', true],
+    ['24 nested NULLIF', `${'NULLIF('.repeat(24)}a${', 7)'.repeat(24)}`, '1,null,-3', true], ['16 nested %', `${'('.repeat(16)}a${' % 7)'.repeat(16)}`, '1,null,-3', true],
+  ];
+  for (const [label, x, want, mayRefuse] of SH) {
     const r = spawnSync(process.execPath, ['--max-old-space-size=512', '--input-type=module', '-e', `
       import { Engine } from ${JSON.stringify(new URL('../src/node.mjs', import.meta.url).href)}; import { sql } from ${JSON.stringify(new URL('../src/sql.mjs', import.meta.url).href)};
-      const e = new Engine({ threads: 1 }), t = e.table({ a: [1, NaN, -3] }); sql(process.env.Q, { t }).toRows(); console.log('ok'); await e.close();`],
+      const e = new Engine({ threads: 1 }), t = e.table({ a: [1, NaN, -3] });
+      try { console.log(sql(process.env.Q, { t }).toRows().map((r) => (Number.isNaN(r.x) ? 'null' : r.x)).join(',')); } catch (err) { console.log(/too large once written out/.test(err.message) ? 'too large' : err.message); }
+      await e.close();`],
       { encoding: 'utf8', timeout: 5000, env: { ...process.env, Q: `SELECT ${x} AS x FROM t` } });
-    same([r.stdout.trim()], ['ok'], `${label} plans and runs within 5 s (${r.signal ? 'killed after 5 s' : r.status ? 'exit ' + r.status : 'ok'})`);
+    const got = r.stdout.trim();
+    same([mayRefuse && got === 'too large' ? want : got], [want], `${label} answers within 5 s${mayRefuse ? ' (or refuses at once)' : ''} (${r.signal ? 'killed after 5 s' : r.status ? 'exit ' + r.status : 'ok'})`);
   }
 }
 

@@ -1373,6 +1373,7 @@ function compileSelect(ast, env, outer, tail) {
       }
       case 'call': {
         if (isAgg(e)) return ctx.agg(e);
+        if (FLATTEN[e.fn]) e = { ...e, args: flatArgs(e) }; // (COALESCE(COALESCE(a, b), c) is COALESCE(a, b, c): nesting would repeat the inner one)
         if (TEXT_FUNCTIONS[e.fn]) return textCall(e, ctx);
         if (['COALESCE', 'IFNULL', 'NVL', 'NULLIF'].includes(e.fn) && kindOf(e, ctx) === 'text') {
           if (e.args.length < 2 || (e.fn === 'NULLIF' && e.args.length !== 2)) fail(`${e.fn}() needs ${e.fn === 'NULLIF' ? 'two values' : 'two values or more'}`);
@@ -1391,8 +1392,12 @@ function compileSelect(ast, env, outer, tail) {
           }
           case 'LEAST': case 'GREATEST': { // missing values skipped, as in PostgreSQL and DuckDB (NULL only if all are)
             if (a.length < 2) fail(`${e.fn}() needs two values or more`);
-            const f = e.fn === 'LEAST' ? 'min' : 'max';
-            return a.reduce((x, y) => call(f, call('coalesce', x, y), call('coalesce', y, x)));
+            // a missing value can't win (it counts as +Infinity for LEAST, -Infinity for GREATEST), and the answer is
+            // missing only where every value is: each value once, not a chain that repeats what came before (that
+            // doubled with every value)
+            const least = e.fn === 'LEAST', f = least ? 'min' : 'max', none = num(least ? Infinity : -Infinity);
+            const best = a.map((x) => call('coalesce', x, none)).reduce((x, y) => call(f, x, y));
+            return cond(a.map((x) => bin('!=', x, x)).reduce((x, y) => bin('&&', x, y)), num(NaN), best);
           }
           case 'COALESCE': case 'IFNULL': case 'NVL': if (a.length < 2) fail(`${e.fn}() needs two values or more`); return call('coalesce', ...a);
           case 'NULLIF': need(2); return cond(bin('==', a[0], a[1]), num(NaN), a[0]);
@@ -1717,7 +1722,37 @@ function compileSelect(ast, env, outer, tail) {
 }
 
 // AST -> expression text (as fuse.mjs toSource, with text quoted for the parser)
+// COALESCE and IFNULL / NVL nest into one COALESCE, LEAST into LEAST, GREATEST into GREATEST
+const COALESCES = ['COALESCE', 'IFNULL', 'NVL'];
+const FLATTEN = { COALESCE: COALESCES, IFNULL: COALESCES, NVL: COALESCES, LEAST: ['LEAST'], GREATEST: ['GREATEST'] };
+const flatArgs = (e) => e.args.flatMap((x) => (x.k === 'call' && FLATTEN[e.fn].includes(x.fn) && !x.over && !x.distinct ? flatArgs(x) : [x]));
+
+// The text of an expression. It is a tree in which a part used twice is one object
+// (ROUND's argument, say); printed, every use is written out, so a part nested in
+// itself many levels deep doubles or triples per level. Count the size first (once
+// per object) and stop at a size no real query reaches, before the text is made.
+const MAX_NODES = 200_000;
+const sizes = new WeakMap();
+function sizeOf(n) {
+  let k = sizes.get(n);
+  if (k !== undefined) return k;
+  switch (n.t) {
+    case 'un': k = 1 + sizeOf(n.x); break;
+    case 'bin': k = 1 + sizeOf(n.l) + sizeOf(n.r); break;
+    case 'call': k = 1 + n.args.reduce((a, x) => a + sizeOf(x), 0) * (n.fn === 'coalesce' ? 3 : 1); break; // (coalesce is written out with each value three times)
+    case 'cond': k = 1 + sizeOf(n.c) + sizeOf(n.x) + sizeOf(n.y); break;
+    default: k = 1;
+  }
+  k = Math.min(k, 2 ** 52);
+  sizes.set(n, k);
+  return k;
+}
 function toSourceAst(n) {
+  if (sizeOf(n) > MAX_NODES) fail('the expression is too large once written out (ROUND, NULLIF, % or CAST nested many levels deep repeat what is inside them); split it into steps with a CTE or a subquery');
+  return printAst(n);
+}
+function printAst(n) {
+  const toSourceAst = printAst;
   switch (n.t) {
     case 'num': return Number.isNaN(n.v) ? 'NaN' : n.v === Infinity ? 'Infinity' : n.v === -Infinity ? '(-Infinity)' : n.v < 0 ? `(${n.v})` : String(n.v);
     case 'str': return quoteText(n.v);

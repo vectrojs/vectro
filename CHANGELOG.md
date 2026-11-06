@@ -15,6 +15,12 @@ Fixes from audit round 5 (the six worst bugs first).
   price < (SELECT v FROM u)`) is an error, as in DuckDB and PostgreSQL. It
   silently joined every row to every value, so a SUM came out several times
   too big.
+- SQL: GREATEST and LEAST of many values, and COALESCE / IFNULL nested in
+  each other, plan in milliseconds. Each value used to be written out two to
+  four times per level: GREATEST of 12 columns took more than 10 seconds and
+  then ran out of memory. Other functions nested many levels deep (ROUND,
+  NULLIF, %) stop at once with "the expression is too large" instead of
+  hanging.
 
 ## 0.1.4
 
