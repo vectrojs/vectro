@@ -10,12 +10,26 @@ import { Dataset, DatasetWriter, writeDataset, csvToDataset, csvToDatasetAsync, 
 import { nodeFiles } from './files-node.mjs';
 setFiles(nodeFiles);
 
+// Worker threads take the process's Node flags, but Node refuses --input-type
+// for workers: a script run with `node --input-type=module -e` or piped into
+// node stopped once the first worker started. Then the flags are given without
+// it (or none, if Node refuses another of them for workers too).
+function newWorker(url, opts = {}) {
+  const args = process.execArgv;
+  if (!args.some((a) => a === '--input-type' || a.startsWith('--input-type='))) return new Worker(url, opts);
+  const execArgv = args.filter((a, i) => !a.startsWith('--input-type') && args[i - 1] !== '--input-type'); // (--input-type module: its value too)
+  try { return new Worker(url, { ...opts, execArgv }); } catch (err) {
+    if (err.code !== 'ERR_WORKER_INVALID_EXEC_ARGV') throw err;
+    return new Worker(url, { ...opts, execArgv: [] });
+  }
+}
+
 export const nodePlatform = {
   cpus: () => availableParallelism(),
   spawn(workerData) {
     const { port1, port2 } = new MessageChannel();
     port1.unref();
-    const worker = new Worker(new URL('./worker.mjs', import.meta.url), {
+    const worker = newWorker(new URL('./worker.mjs', import.meta.url), {
       workerData: { ...workerData, port: port2 },
       transferList: [port2],
     });
@@ -96,11 +110,12 @@ export { Table } from './table.mjs';
 import { SplitEngine as BaseSplitEngine } from './split.mjs';
 
 export function spawnSplitWorker() {
-  const w = new Worker(new URL('./split-worker-node.mjs', import.meta.url));
+  const w = newWorker(new URL('./split-worker-node.mjs', import.meta.url));
   w.unref();
   return {
     post: (msg, transfer) => w.postMessage(msg, transfer ?? []),
-    onMessage: (fn) => w.on('message', fn),
+    onMessage: (fn) => { w.on('message', fn); w.unref(); }, // (a listener refs the worker again: a script that never calls close() would never end)
+    ref: () => w.ref(), unref: () => w.unref(), // (SplitEngine keeps the process alive while it waits for answers, see #hold)
     onError: (fn) => { w.on('error', fn); w.on('exit', (code) => fn(new Error(`exited with code ${code}`))); },
     terminate: () => w.terminate(),
   };

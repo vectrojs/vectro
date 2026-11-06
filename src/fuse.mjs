@@ -2,11 +2,11 @@
 // `[sum(a), min(a), count(a > 500 && b < 3)]` into ONE WebAssembly SIMD
 // function that reads each array once, instead of one pass per operation.
 
-import { I32, F64, V128, TY, Fn, loops, buildModule, get, set, simd, vload, vstore, memarg } from './wasm.mjs';
+import { I32, F64, V128, TY, Fn, loops, buildModule, get, set, simd, vload, vstore, memarg, emitModScalar, emitModVector } from './wasm.mjs';
 
 // ---- parsing -----------------------------------------------------------------
 
-const TOKEN = /\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|([A-Za-z_]\w*)|(&&|\|\||==|!=|<=|>=|[-+*/()<>,?:!])|'([^']*)'|"([^"]*)")/y;
+const TOKEN = /\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|([\p{L}_][\p{L}\p{M}\p{N}_]*)|(&&|\|\||==|!=|<=|>=|[-+*/()<>,?:!])|'((?:[^']|'')*)'|"([^"]*)")/yu; // (inside '...', '' is one ')
 
 function tokenize(src) {
   const out = [];
@@ -18,7 +18,7 @@ function tokenize(src) {
     if (m[1] !== undefined) out.push({ t: 'num', v: Number(m[1]) });
     else if (m[2] !== undefined) out.push({ t: 'id', v: m[2] });
     else if (m[3] !== undefined) out.push({ t: 'op', v: m[3] });
-    else out.push({ t: 'str', v: m[4] ?? m[5] });
+    else out.push({ t: 'str', v: m[4] !== undefined ? m[4].replaceAll("''", "'") : m[5] });
   }
   return out;
 }
@@ -113,8 +113,8 @@ export function checkSpec(spec) {
 // ---- analysis ----------------------------------------------------------------
 
 const REDUCTIONS = new Set(['sum', 'count', 'mean', 'min', 'max']);
-const UNARY_FN = new Set(['abs', 'sqrt', 'floor', 'ceil']);
-const BINARY_FN = new Set(['min', 'max']);
+const UNARY_FN = new Set(['abs', 'sqrt', 'floor', 'ceil', 'fround']); // (fround(x): x as a 32-bit float, SQL's REAL)
+const BINARY_FN = new Set(['min', 'max', 'mod']); // (mod(a, b): a % b exactly, as JavaScript's %)
 const CMP = { '==': 'eq', '!=': 'ne', '<': 'lt', '>': 'gt', '<=': 'le', '>=': 'ge' };
 const ARITH = { '+': 'add', '-': 'sub', '*': 'mul', '/': 'div' };
 
@@ -122,11 +122,11 @@ const isReduction = (n) => n.t === 'call' && REDUCTIONS.has(n.fn) && n.args.leng
 // Masks are true/false values (comparisons and logic); everything else is a number.
 export const isMask = (n) => (n.t === 'bin' && (CMP[n.op] || n.op === '&&' || n.op === '||')) || (n.t === 'un' && n.op === '!');
 
-// Text as the tokenizer reads it back exactly (no escapes inside quotes).
+// Text as the tokenizer reads it back exactly ('' inside '...' is one ').
 export function quoteText(v) {
   if (!v.includes("'")) return `'${v}'`;
   if (!v.includes('"')) return `"${v}"`;
-  throw new SyntaxError(`vectro: text with both ' and " can't be used in an expression: ${JSON.stringify(v)}`);
+  return `'${v.replaceAll("'", "''")}'`; // (both kinds: ' doubled, as SQL writes it)
 }
 
 // Turn an AST back into source (fully parenthesized), e.g. after rewriting it.
@@ -198,7 +198,7 @@ const FOLD_BIN = { '+': (a, b) => a + b, '-': (a, b) => a - b, '*': (a, b) => a 
   // as the kernels compute them: 1 / 0, a comparison with NaN false (but != true), NaN counting as true in && and ||
   '==': (a, b) => +(a === b), '!=': (a, b) => +(a !== b), '<': (a, b) => +(a < b), '<=': (a, b) => +(a <= b), '>': (a, b) => +(a > b), '>=': (a, b) => +(a >= b),
   '&&': (a, b) => +(a !== 0 && b !== 0), '||': (a, b) => +(a !== 0 || b !== 0) };
-const FOLD_FN = { abs: Math.abs, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, min: Math.min, max: Math.max };
+const FOLD_FN = { abs: Math.abs, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, fround: Math.fround, min: Math.min, max: Math.max, mod: (a, b) => a % b };
 export function fold(n) {
   const isNum = (x) => x.t === 'num';
   switch (n.t) {
@@ -237,7 +237,9 @@ export const SCA = {
   f32: { add: 0x92, sub: 0x93, mul: 0x94, div: 0x95, min: 0x96, max: 0x97, abs: 0x8b, neg: 0x8c, sqrt: 0x91, ceil: 0x8d, floor: 0x8e, eq: 0x5b, ne: 0x5c, lt: 0x5d, gt: 0x5e, le: 0x5f, ge: 0x60, fromBool: 0xb3, fromF64: [0xb6] },
 };
 const V128_NOT = 0x4d, V128_AND = 0x4e, V128_OR = 0x50, BITSELECT = 0x52;
-const F64X2_PROMOTE_LOW = 0x5f, F64X2_ADD = 0xf0, F64X2_MIN = 0xf4, F64X2_MAX = 0xf5;
+export const F32X4_DEMOTE_ZERO = 0x5e, F32_DEMOTE = 0xb6, F64_PROMOTE = 0xbb;
+export const F64X2_PROMOTE_LOW = 0x5f;
+const F64X2_ADD = 0xf0, F64X2_MIN = 0xf4, F64X2_MAX = 0xf5;
 const I32_AND = 0x71, I32_OR = 0x72, I32_EQZ = 0x45, SELECT = 0x1b, F64_PROMOTE_F32 = 0xbb;
 const F64_OPS = { add: 0xa0, min: 0xa4, max: 0xa5 };
 const HIGH_HALF = [8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7]; // i8x16.shuffle lanes
@@ -305,7 +307,13 @@ export class Emitter {
         if (ARITH[n.op]) { this.vec(n.l, k); this.vec(n.r, k); return f.emit(simd(V[ARITH[n.op]])); }
         break;
       case 'call':
+        if (n.fn === 'mod') { // (no vector remainder: lane by lane)
+          const va = f.local(V128), vb = f.local(V128);
+          this.vec(n.args[0], k); f.emit(set(va)); this.vec(n.args[1], k); f.emit(set(vb));
+          return emitModVector(f, this.t, va, vb);
+        }
         n.args.forEach((a) => this.vec(a, k));
+        if (n.fn === 'fround') return this.t === 'f64' ? f.emit(simd(F32X4_DEMOTE_ZERO), simd(F64X2_PROMOTE_LOW)) : undefined; // (f32 values already are)
         return f.emit(simd(V[n.fn]));
       case 'cond':
         this.vec(n.x, k); this.vec(n.y, k); this.vecMask(n.c, k);
@@ -338,6 +346,8 @@ export class Emitter {
         break;
       case 'call':
         n.args.forEach((a) => this.sca(a));
+        if (n.fn === 'mod') return emitModScalar(f, this.t);
+        if (n.fn === 'fround') return this.t === 'f64' ? f.emit([F32_DEMOTE, F64_PROMOTE]) : undefined;
         return f.emit([S[n.fn]]);
       case 'cond':
         this.sca(n.x); this.sca(n.y); this.scaMask(n.c);

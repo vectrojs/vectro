@@ -59,13 +59,14 @@ export function* joinTablesG(L, R, opts = {}, makeTable) {
       if (!a) throw new Error(`vectro: join: the left table has no column "${lk[k]}"`);
       if (!b) throw new Error(`vectro: join: the right table has no column "${rk[k]}"`);
       if (a.strings || b.strings) throw new Error(`vectro: join: can't join on free-text column "${a.strings ? lk[k] : rk[k]}" (load it as a category)`);
-      if (!a.dict !== !b.dict && nL && nR) throw new Error(`vectro: join: "${lk[k]}" and "${rk[k]}" must both be text or both numbers`);
+      if (!a.dict !== !b.dict && nL && nR) throw new Error(`vectro: join: "${opts.labels?.left?.[k] ?? lk[k]}" and "${opts.labels?.right?.[k] ?? rk[k]}" must both be text or both numbers`); // (labels: the names SQL wrote, not its hidden ones)
       leftKeys.push(a.data);
     }
     if (!build) {
       build = yield* buildRight(engine, t, L, R, lk, rk, how);
       if (cache) { if (!cache.has(target)) cache.set(target, new Map()); cache.get(target).set(`${cacheKey}|${rk.map((n) => arrayId(R.cols.get(n)?.data)).join(',')}`, build); } else ownBuild = true;
     }
+    if (opts.single && repeatedKey(engine, build)) throw new Error(opts.single); // (a key with more than one right row where one was promised)
     const { K, start, rows } = build;
 
     // 2. each left row's group number, or -1
@@ -155,6 +156,7 @@ export function* joinViewG(L, R, opts = {}, collectLeft, makeView) {
       build = yield* buildRight(engine, t, L, R, lk, rk, how);
       if (cache) { if (!cache.has(target)) cache.set(target, new Map()); cache.get(target).set(`${cacheKey}|${rk.map((n) => arrayId(R.cols.get(n)?.data)).join(',')}`, build); } else ownBuild = true;
     }
+    if (opts.single && repeatedKey(engine, build)) throw new Error(opts.single);
     if (!build.rowOf || !engine.jit) return null;
     const left = yield* collectLeft();
     const n = left.n, K = build.K;
@@ -406,6 +408,20 @@ export function freeBuild(engine, build) { for (const a of build?.arrays ?? []) 
 // Step 1: the right table's side. Keys as numbers (text keys as the left
 // table's codes), numbered in one hash table; then the right rows of each
 // group number side by side: rows[start[g] .. start[g + 1]).
+// Does a right key that can match (no missing part) have more than one row? (A
+// missing key, or a label the left table lacks, matches nothing: rows with one
+// may share a group.)
+function repeatedKey(engine, build) {
+  if (build.rowOf) return false;
+  const { K, start, rows } = build, keys = build.rightKeys.map((a) => engine.live(a));
+  for (let g = 0; g < K; g++) {
+    if (start[g + 1] - start[g] < 2) continue;
+    const r = rows[start[g]];
+    if (keys.every((k) => k[r] === k[r])) return true;
+  }
+  return false;
+}
+
 function* buildRight(engine, t, L, R, lk, rk, how) {
   const nk = rk.length, nR = R.n;
   const arrays = [];

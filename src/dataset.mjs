@@ -38,7 +38,7 @@ import { KINDS, decodeOne } from './pack.mjs';
 import { conditions, mayMatch, computeZones } from './zones.mjs';
 import { STR_SHIFT, STR_ESCAPED, csvRowEnds } from './csv-kernel.mjs';
 import { trackAsyncMethods } from './engine.mjs';
-import { inspectCSV, loadBytes, loadBytesAsync } from './csv.mjs';
+import { inspectCSV, loadBytes, loadBytesAsync, crOnlyToLF } from './csv.mjs';
 import { freeBuild } from './join.mjs';
 import { copyRows, plainInto, remapCodes, textLength } from './rows.mjs';
 export { copyRows };
@@ -104,7 +104,7 @@ export class DatasetWriter {
     this.pendingRows = 0; // (copying the waiting rows on every append made many small appends quadratic)
     this.meta = null;
     this.labels = new Map(); // category column -> { dict, codes }: one dictionary for the dataset
-    this.file = typeof path === 'string' ? need('writing a dataset').openWrite(path, { append }) : path;
+    this.file = typeof path === 'string' ? need('writing a dataset').openWrite(path, { append, atomic: true }) : path;
     if (this.file.existed) {
       if (!footer) try { footer = readFooter(this.file); } catch (err) { this.file.close(); throw err; }
       const { meta, footerStart } = footer;
@@ -157,6 +157,7 @@ export class DatasetWriter {
   close() {
     if (this.summary) return this.summary;
     if (this.aborted) throw new Error('vectro: this dataset writer was aborted');
+    let closed = false;
     try {
       if (!this.meta) throw new Error('vectro: append at least one table to a dataset (it can have no rows)');
       if (this.parts.length && (this.pendingRows || !this.meta.chunks.length)) {
@@ -173,16 +174,19 @@ export class DatasetWriter {
       this.file.write(tail, this.pos);
       this.pos += TAIL;
       this.file.truncate(this.pos);
+      this.file.close();
+      closed = true;
+      this.file.commit?.(); // (a new file in Node: written beside the path, now put in its place)
       this.summary = { path: this.path, rows: this.meta.rows, chunks: this.meta.chunks.length, bytes: this.pos };
       return this.summary;
     } finally {
       this.#dropParts();
-      this.file.close();
+      if (!closed) { this.file.close(); this.file.discard?.(); }
     }
   }
 
-  // Stop without a footer (the file is left unreadable as a dataset; a
-  // browser file is discarded).
+  // Stop without a footer: a new file is discarded (in Node and browsers), an
+  // existing one appended to is left unreadable as a dataset.
   abort() {
     if (this.summary || this.aborted) return;
     this.aborted = true;
@@ -236,10 +240,13 @@ export class DatasetWriter {
         plainInto(engine, c, lo, hi, out, f32);
         if (m.kind === 'category') remapCodes(out, c.dict, this.labels.get(m.name));
       }
+      const dates = new Set(this.meta.columns.filter((m) => m.kind === 'date').map((m) => m.name));
       for (const [name, c] of cols) {
         c.data = engine.live(c.data);
-        const [min, max, missing] = n ? engine.eval(['min(v == v ? v : Infinity)', 'max(v == v ? v : -Infinity)', 'count(v != v)'], { v: c.data }) : [Infinity, -Infinity, 0];
+        const date = dates.has(name);
+        const [min, max, missing, offDay = 0] = n ? engine.eval(['min(v == v ? v : Infinity)', 'max(v == v ? v : -Infinity)', 'count(v != v)', ...(date ? ['count(v == v && v != floor(v / 86400000) * 86400000)'] : [])], { v: c.data }) : [Infinity, -Infinity, 0];
         chunk.cols[name] = { min: jsonNumber(min), max: jsonNumber(max), missing };
+        if (date) chunk.cols[name].day = offDay === 0; // (every time at midnight: a column of days, so DATE - DATE is days)
         if (n > BLOCK) { const z = computeZones(engine.live(c.data), n, BLOCK); chunk.cols[name].blocks = { min: Array.from(z.mins, jsonNumber), max: Array.from(z.maxs, jsonNumber) }; }
       }
       if (n && cols.size) ct.compress(); // (no number or category columns: nothing to pack)
@@ -431,12 +438,21 @@ export class Dataset {
   groupBy(keys) { return this.lazy().groupBy(keys); }
   agg(spec, params) { return this.lazy().agg(spec, params); }
   aggAsync(spec, params) { return this.lazy().aggAsync(spec, params); }
-  count(expr) { return expr ? this.agg({ v: `count(${expr})` }).v : this.lazy().count(); }
-  async countAsync(expr) { return expr ? (await this.aggAsync({ v: `count(${expr})` })).v : this.lazy().countAsync(); }
+  count(expr, params) { return expr ? this.agg({ v: `count(${expr})` }, params).v : this.lazy().count(); }
+  async countAsync(expr, params) { return expr ? (await this.aggAsync({ v: `count(${expr})` }, params)).v : this.lazy().countAsync(); }
   sum(expr, params) { return this.agg({ v: `sum(${expr})` }, params).v; }
   mean(expr, params) { return this.agg({ v: `mean(${expr})` }, params).v; }
   min(expr, params) { return this.agg({ v: `min(${expr})` }, params).v; }
   max(expr, params) { return this.agg({ v: `max(${expr})` }, params).v; }
+  async sumAsync(expr, params) { return (await this.aggAsync({ v: `sum(${expr})` }, params)).v; }
+  async meanAsync(expr, params) { return (await this.aggAsync({ v: `mean(${expr})` }, params)).v; }
+  async minAsync(expr, params) { return (await this.aggAsync({ v: `min(${expr})` }, params)).v; }
+  async maxAsync(expr, params) { return (await this.aggAsync({ v: `max(${expr})` }, params)).v; }
+  // (as a table's: the rows, in a table in memory)
+  sortAsync(by) { return this.lazy().sort(by).collectAsync(); }
+  topAsync(k, by) { return this.lazy().top(k, by).collectAsync(); }
+  limitAsync(n, offset) { return this.lazy().limit(n, offset).collectAsync(); }
+  joinAsync(other, opts) { return this.lazy().join(other, opts).collectAsync(); }
   head(n) { return this.lazy().limit(n).collect(); }
   headAsync(n) { return this.lazy().limit(n).collectAsync(); }
   toRows(limit = Infinity) { return this.lazy().toRows(limit); }
@@ -444,6 +460,7 @@ export class Dataset {
   collect() { return this.lazy().collect(); }        // the whole dataset in memory
   collectAsync() { return this.lazy().collectAsync(); }
   explain() { return this.lazy().explain(); }
+  async explainAsync() { return this.explain(); } // (nothing runs: the plan as text)
 
   // Called by plan.mjs for a plan that reads a dataset.
   runPlan(plan, sync) { return sync ? driveSync(runPlanG(plan)) : driveAsync(runPlanG(plan)); }
@@ -557,13 +574,13 @@ export class Dataset {
           const g = groups[groups.length - 1];
           if (g && r[1] - g.end <= file.coalesce && r[1] + r[2] - g.start <= (file.pieceBytes ?? READ_PIECE)) { g.items.push(r); g.end = Math.max(g.end, r[1] + r[2]); } else groups.push({ start: r[1], end: r[1] + r[2], items: [r] });
         }
-        await Promise.all(groups.map(async (g) => {
+        await settled(groups.map(async (g) => {
           const buf = new Uint8Array(g.end - g.start);
           await file.read(buf, g.start);
           for (const [arr, off, len] of g.items) view(arr, 0, len).set(buf.subarray(off - g.start, off - g.start + len));
         }));
       } else {
-        await Promise.all(this.#pieces(reads).map(async ([arr, off, len, at]) => { // (in pieces: several reads at once)
+        await settled(this.#pieces(reads).map(async ([arr, off, len, at]) => { // (in pieces: several reads at once)
           if (this.engine.isShared) return file.read(view(arr, at, len), off); // straight into engine memory
           const buf = new Uint8Array(len); // (plain memory may move while the read runs)
           await file.read(buf, off);
@@ -621,6 +638,15 @@ function driveSync(gen) {
   return step.value;
 }
 
+// Promise.all that waits for every promise before failing: a read still writing into an array must
+// end before the chunk's arrays are freed
+async function settled(promises) {
+  const all = await Promise.allSettled(promises);
+  const bad = all.find((r) => r.status === 'rejected');
+  if (bad) throw bad.reason;
+  return all.map((r) => r.value);
+}
+
 async function driveAsync(gen) {
   const pending = new Map(); // chunk -> promise of its table
   try {
@@ -645,7 +671,10 @@ async function driveAsync(gen) {
     }
     return step.value;
   } finally {
-    for (const p of pending.values()) p.then((t) => t.dispose(), () => {});
+    // chunks read ahead and not used (the query failed, or stopped early): wait for them before the answer
+    // is given, so no work of this query is still on the engine's threads when the caller goes on
+    const left = await Promise.allSettled(pending.values());
+    for (const r of left) if (r.status === 'fulfilled') r.value.dispose();
   }
 }
 
@@ -670,33 +699,37 @@ function substitute(node, target, repl) {
 
 // The dataset columns a plan reads (null: all of them). Mirrors what the
 // executor in plan.mjs asks of its input.
-function needs(node, need, ds) {
+// The columns of `ds` the plan reads (null: all). With stop, the columns of
+// that node's rows the steps above it use instead (ALL: all of them).
+const ALL = Symbol('all');
+function needs(node, need, ds, stop = null) {
+  if (stop && node === stop) return need ?? ALL;
   switch (node.op) {
     case 'scan': return node.table === ds ? need : undefined;
     case 'unmatched': return undefined;
-    case 'filter': return needs(node.input, need && union(need, vars(node.ast)), ds);
+    case 'filter': return needs(node.input, need && union(need, vars(node.ast)), ds, stop);
     case 'derive':
-      if (!need) return needs(node.input, null, ds);
-      if (!need.has(node.name)) return needs(node.input, need, ds);
-      return needs(node.input, union([...need].filter((n) => n !== node.name), vars(node.ast)), ds);
-    case 'select': return needs(node.input, new Set(need ? node.names.filter((n) => need.has(n)) : node.names), ds);
-    case 'aggregate': return needs(node.input, new Set([...node.keys, ...Object.values(node.spec).flatMap((a) => [...vars(a)])]), ds);
-    case 'total': return needs(node.input, new Set(Object.values(node.spec).flatMap((a) => [...vars(a)])), ds);
-    case 'sort': return needs(node.input, need && union(need, node.by.flatMap((b) => [...vars(parse(String(b)))])), ds);
-    case 'limit': return needs(node.input, need, ds);
-    case 'output': return needs(node.input, null, ds);
-    case 'textmap': return needs(node.input, need && new Set([...[...need].filter((n) => n !== node.name), ...node.inputs]), ds);
+      if (!need) return needs(node.input, null, ds, stop);
+      if (!need.has(node.name)) return needs(node.input, need, ds, stop);
+      return needs(node.input, union([...need].filter((n) => n !== node.name), vars(node.ast)), ds, stop);
+    case 'select': return needs(node.input, new Set(need ? node.names.filter((n) => need.has(n)) : node.names), ds, stop);
+    case 'aggregate': return needs(node.input, new Set([...node.keys, ...Object.values(node.spec).flatMap((a) => [...vars(a)])]), ds, stop);
+    case 'total': return needs(node.input, new Set(Object.values(node.spec).flatMap((a) => [...vars(a)])), ds, stop);
+    case 'sort': return needs(node.input, need && union(need, node.by.flatMap((b) => [...vars(parse(String(b)))])), ds, stop);
+    case 'limit': return needs(node.input, need, ds, stop);
+    case 'output': return needs(node.input, null, ds, stop);
+    case 'textmap': return needs(node.input, need && new Set([...[...need].filter((n) => n !== node.name), ...node.inputs]), ds, stop);
     case 'window': {
       const made = new Set(node.items.map((it) => it.name));
       const inputs = [...node.partition, ...node.order.map((o) => o.name), ...node.items.map((it) => it.arg).filter(Boolean)];
-      return needs(node.input, need && new Set([...[...need].filter((n) => !made.has(n)), ...inputs]), ds);
+      return needs(node.input, need && new Set([...[...need].filter((n) => !made.has(n)), ...inputs]), ds, stop);
     }
     case 'join': {
       const { left } = joinNames(node);
       const needL = new Set(onKeys(node.opts.on)[0]);
       for (const n of need ?? namesOf(node)) if (left.has(n)) needL.add(n);
       for (const n of namesOf(node.right)) if (left.has(n)) needL.add(n); // (they decide the names of right columns)
-      return needs(node.left, needL, ds);
+      return needs(node.left, needL, ds, stop);
     }
   }
   return null;
@@ -871,7 +904,7 @@ function* runChunksG(plan, path, sink) {
   while (!BLOCKING[path[bi].op]) bi--;
   let B = path[bi], kind = BLOCKING[B.op];
   const below = path.slice(bi + 1, -1); // (the steps between the dataset and B: what each chunk runs)
-  if (B.op === 'sort' && bi > 0 && path[bi - 1].op === 'limit' && path[bi - 1].input === B) { B = path[bi - 1]; kind = 'top'; }
+  if (B.op === 'sort' && bi > 0 && path[bi - 1].op === 'limit' && path[bi - 1].input === B && path[bi - 1].n !== Infinity) { B = path[bi - 1]; kind = 'top'; }
   const top = kind === 'top' ? B.input.input : B.input; // what runs on each chunk
   // columns to read, and the chunks the filters right above the dataset allow
   const need = needs(plan, null, ds);
@@ -889,9 +922,13 @@ function* runChunksG(plan, path, sink) {
   ds.lastRun.skipped = ds.chunkCount - pieces.length;
   const list = pieces.length ? pieces : [{ i: -1, lo: 0, hi: 0 }]; // (no rows, but the plan still runs once for the result's shape)
   // columns made below B (names made above it, such as a result's renames, are not: B sees the dataset's)
-  const derived = new Set(below.filter((n) => n.op === 'derive' || n.op === 'textmap' || n.op === 'join').flatMap((n) => (n.op === 'join' ? namesOf(n.right) : [n.name])));
+  const derived = new Set(below.filter((n) => n.op === 'derive' || n.op === 'textmap' || n.op === 'join').flatMap((n) => (n.op === 'join' ? [...namesOf(n.right), ...joinNames(n).fromRight.keys()] : [n.name]))); // (a join's right columns under their output names too: s_right)
   // derived columns that are arithmetic on number columns of the dataset (a top-k cutoff can compare them)
   derived.numeric = new Set(below.filter((n) => n.op === 'derive' && arithmetic(n.ast, ds)).map((n) => n.name));
+  // the columns of each chunk's rows the steps from B up use: a chunk's plan is cut to them, so a column it
+  // makes (a derive, a select's) that nothing uses isn't made from columns that were never read
+  const above = needs(plan, null, ds, top);
+  if (above instanceof Set) derived.keep = above;
   const acc = accumulator(kind, B, engine, sink, ds, derived);
   let finalTable = null;
   engine._joinRuns = (engine._joinRuns ?? 0) + 1; // joins keep their right side's build while a dataset runs
@@ -963,7 +1000,7 @@ function smallestColumn(ds) {
 //   finish(): the merged result (a table, or totals for 'total')
 function accumulator(kind, B, engine, sink, ds, derived) {
   if (kind === 'group' || kind === 'total') return groupAccumulator(kind, B, engine, ds, derived);
-  if (kind === 'gather' && sink && B.op === 'sort') { const first = firstSortKey(B.by[0], ds, derived); if (first && /^[A-Za-z_]\w*$/.test(first.expr)) return sortSpillAccumulator(B, engine, ds, derived, first); }
+  if (kind === 'gather' && sink && B.op === 'sort') { const first = firstSortKey(B.by[0], ds, derived); if (first && /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(first.expr)) return sortSpillAccumulator(B, engine, ds, derived, first); }
   const parts = [];
   let rows = 0;
   // top-k: once k rows are kept, a row whose first key is worse than the
@@ -976,7 +1013,7 @@ function accumulator(kind, B, engine, sink, ds, derived) {
   const zkeys = [];
   if (first) for (const by of B.input.by) {
     const key = firstSortKey(by, ds, derived, true);
-    const c = key && /^[A-Za-z_]\w*$/.test(key.expr) && !derived.has(key.expr) && ds.cols.get(key.expr);
+    const c = key && /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(key.expr) && !derived.has(key.expr) && ds.cols.get(key.expr);
     if (!c || c.dict || c.strings) break;
     zkeys.push(key);
   }
@@ -1018,6 +1055,12 @@ function accumulator(kind, B, engine, sink, ds, derived) {
     } : null,
     *chunk(P, chunk) {
       let node;
+      if (derived.keep && (kind === 'top' || kind === 'head' || kind === 'gather')) {
+        const have = namesOf(P);
+        let keepNames = have.filter((n) => derived.keep.has(n));
+        if (!keepNames.length) keepNames = [have.find((n) => chunk.cols.has(n)) ?? have[0]]; // (count(): one column read, for the rows)
+        if (keepNames.length < have.length) P = { op: 'select', names: keepNames, input: P };
+      }
       if (kind === 'top') {
         node = { op: 'output', input: { op: 'limit', n: k, offset: 0, input: { ...B.input, input: P } } };
         if (cutoff !== null) { // only rows at least as good as the k-th so far: keep them all (the merge picks the best)
@@ -1247,7 +1290,7 @@ function firstSortKey(by, ds, derived, numeric = false) {
   const src = String(by).trim();
   const desc = src.startsWith('-');
   const expr = desc ? src.slice(1).trim() : src;
-  const ident = /^[A-Za-z_]\w*$/.test(expr);
+  const ident = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(expr);
   if (ident && !derived.has(expr) && (ds.cols.get(expr)?.dict || ds.cols.get(expr)?.strings)) return null;
   if (ident && derived.has(expr) && !(numeric && derived.numeric?.has(expr))) return null; // (a join's text column, or a derived label: be safe)
   return { expr, desc };
@@ -1294,6 +1337,26 @@ function groupAccumulator(kind, B, engine, ds, derived) {
     merge[p] = parse(`${ast.fn === 'count' ? 'sum' : ast.fn}(${p})`);
     outs.push({ out, col: p });
   });
+  // A group's sum over a chunk is NaN where its values hold +Infinity and -Infinity. Summing partial sums skips
+  // NaN (it is missing), so each one's groups where it is NaN are counted in a column of their own, summed
+  // too, and the answer is NaN there
+  const nanOf = (k) => `${k}__nan`;
+  const sums = Object.keys(partial).filter((k) => partial[k].fn === 'sum');
+  for (const k of sums) merge[nanOf(k)] = parse(`sum(${nanOf(k)})`);
+  const markNaN = (t) => {
+    for (const k of sums) {
+      const d = engine.live(t.cols.get(k).data), flag = engine.alloc(Float64Array, t.n), f = engine.live(flag);
+      for (let i = 0; i < t.n; i++) f[i] = d[i] === d[i] ? 0 : 1;
+      t.cols.set(nanOf(k), { data: f, dict: null, codes: null });
+      t.owned = [...t.owned, nanOf(k)];
+    }
+  };
+  const nanBack = (G, k, data) => { // (NaN in the answer where a chunk's sum was)
+    const flag = G.cols.get(nanOf(k));
+    if (!flag) return;
+    const f = engine.live(flag.data), d = engine.live(data);
+    for (let i = 0; i < G.n; i++) if (f[i] > 0) d[i] = NaN;
+  };
   if (!Object.keys(partial).length) { partial.__vectro_rows = parse('count()'); merge.__vectro_rows = parse('sum(__vectro_rows)'); }
   const main = { parts: [], rows: 0, last: 0 };
   const dense = kind === 'group' ? densePlan(ds, derived, keys, partial, engine) : null;
@@ -1339,6 +1402,7 @@ function groupAccumulator(kind, B, engine, ds, derived) {
       } else {
         const r = yield { run: { op: 'output', input: { op: 'aggregate', keys, spec: partial, input: P } } };
         const kept = yield* keep(engine, r, chunk);
+        markNaN(kept);
         main.parts.push(kept);
         main.rows += kept.n;
         chunksDone++;
@@ -1448,16 +1512,18 @@ function groupAccumulator(kind, B, engine, ds, derived) {
   }
 
   // Merged partial groups G -> the result: keys, then each aggregation.
-  function finalize(G, counts) {
+  function finalize(G0, counts) {
+      const G = G0._plain(); // (packed partial columns: their values, not their codes)
       try {
         const cols = new Map(), owned = [];
         const take = (t, name) => { t.owned = t.owned.filter((n) => n !== name); return t.cols.get(name); };
         for (const k of keys) { cols.set(k, take(G, k)); owned.push(k); }
         for (const o of outs) {
-          if (o.col) cols.set(o.out, take(G, o.col));
+          if (o.col) { cols.set(o.out, take(G, o.col)); nanBack(G, o.col, cols.get(o.out).data); }
           else if (o.mean) {
             const data = engine.alloc(Float64Array, G.n);
             if (G.n) engine.eval('s / n', { s: G.cols.get(`${o.mean}s`).data, n: G.cols.get(`${o.mean}n`).data }, data);
+            nanBack(G, `${o.mean}s`, data);
             cols.set(o.out, { data: engine.live(data), dict: null, codes: null });
           } else if (counts[o.distinct].bits) { // each group's bits
             const bm = counts[o.distinct], data = engine.alloc(Float64Array, G.n);
@@ -1479,6 +1545,7 @@ function groupAccumulator(kind, B, engine, ds, derived) {
         return new Table(engine, cols, G.n, { owned });
       } finally {
         G.dispose();
+        if (G0 !== G) G0.dispose();
         for (const C of counts) C.dispose?.();
       }
   }
@@ -1687,12 +1754,20 @@ export async function csvToDatasetAsync(engine, csv, out, opts = {}) {
 // opts.onProgress({ bytes, size, rows }) is called after each piece.
 function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = true, delimiter = ',', types = {}, sampleRows, rowsPerChunk, bitPack, append, onProgress, ...rest } = {}) {
   try {
-    let pos = 0, carry = new Uint8Array(0), head = new Uint8Array(0), kinds = null;
+    let pos = 0, carry = new Uint8Array(0), head = new Uint8Array(0), kinds = null, crOnly = null;
+    const last0 = (at) => at >= size;
     while (true) {
       const want = Math.min(pieceBytes, size - pos);
       const buf = new Uint8Array(carry.length + want);
       buf.set(carry, 0);
       yield { read: buf.subarray(carry.length), pos };
+      // (CR-only line ends, decided on the first piece: every piece's CRs become LFs, see crOnlyToLF)
+      const fresh = buf.subarray(carry.length);
+      if (crOnly === null) { // (on the first piece with an LF, or a CR that isn't its last byte: an LF may follow it)
+        const cr = fresh.indexOf(13);
+        if (fresh.includes(10) || (cr !== -1 && cr < fresh.length - 1) || last0(pos + want)) crOnly = crOnlyToLF(buf); // (the carry too: nothing was parsed yet)
+      }
+      else if (crOnly) for (let i = fresh.indexOf(13); i !== -1; i = fresh.indexOf(13, i + 1)) fresh[i] = 10;
       pos += want;
       const last = pos >= size;
       let start = 0;
@@ -1767,7 +1842,7 @@ export function writeDataset(engine, path, source, opts) {
 // A writer for a path (Node) or a writable file object (browsers), reading
 // the footer first when appending to a file that has one.
 export async function createDatasetAsync(engine, target, opts = {}) {
-  const file = typeof target === 'string' ? need('writing a dataset').openWrite(target, { append: opts.append }) : target;
+  const file = typeof target === 'string' ? need('writing a dataset').openWrite(target, { append: opts.append, atomic: true }) : target;
   let footer = null;
   if (file.existed) try { footer = file.readSync ? readFooter(file) : await readFooterAsync(file); } catch (err) { file.close(); throw err; }
   return new DatasetWriter(engine, file, { ...opts, footer });

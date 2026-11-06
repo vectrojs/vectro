@@ -90,6 +90,7 @@ export function serveSplitWorker(post, listen) {
       for (const name of dates) cols.get(name).date = true;
       const n = base ? base.length : (Object.values(text)[0]?.codes.length ?? 0);
       const t = new Table(engine, cols, n, { owned: [...order] });
+      if (base) base.owned = []; // (its columns are t's now)
       tables.set(id, t);
       return { n: t.length, names: t.columnNames };
     },
@@ -158,8 +159,15 @@ export function serveSplitWorker(post, listen) {
     // This worker's first k rows by `by`, with each expression key's values
     // (text keys are compared by label on the page).
     top({ id, preds, k, by, columns = null }) {
-      const v = view(id, preds);
-      const t = (columns ? v.select(columns) : v).top(k, by);
+      // (each row's place in this worker's rows, __vectro_row: the page breaks ties across workers in table order)
+      const base = table(id), n = base.length, at = engine.alloc(Float64Array, n);
+      { const a = engine.live(at); for (let i = 0; i < n; i++) a[i] = i; }
+      const tagged = new Table(engine, new Map([...base.cols, ['__vectro_row', { data: at, dict: null, codes: null }]]), n, { owned: ['__vectro_row'] });
+      let t;
+      try {
+        const v = preds.reduce((x, p) => x.filter(p.expr, p.params), tagged);
+        t = (columns ? v.select([...[columns].flat(), '__vectro_row']) : v).top(k, by);
+      } finally { tagged.dispose(); }
       try {
         const keys = parseKeys(by, t.cols);
         const values = keys.map((key) => {
@@ -167,7 +175,9 @@ export function serveSplitWorker(post, listen) {
           const d = t.derive('__np_k', key.text);
           try { return Float64Array.from(engine.live(d.cols.get('__np_k').data)); } finally { d.dispose(); }
         });
-        return { rows: t.toRows(), keys: keys.map((key) => (key.column ? { label: key.column, desc: key.desc } : null)), values };
+        const rows = t.toRows(), places = rows.map((r) => r.__vectro_row);
+        for (const r of rows) delete r.__vectro_row;
+        return { rows, places, keys: keys.map((key) => (key.column ? { label: key.column, desc: key.desc } : null)), values };
       } finally {
         t.dispose();
       }
@@ -180,7 +190,7 @@ export function serveSplitWorker(post, listen) {
     // one distinct-count sketch per group (the page merges them).
     distinct({ id, preds, keys, arg, params, sketch }) {
       const v = view(id, preds);
-      const plain = /^[A-Za-z_]\w*$/.test(arg.trim()) && v.cols.has(arg.trim()) && !keys.includes(arg.trim()); // (a key: count a copy)
+      const plain = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(arg.trim()) && v.cols.has(arg.trim()) && !keys.includes(arg.trim()); // (a key: count a copy)
       const t = plain ? v : v.derive('__np_dv', arg, params);
       const name = plain ? arg.trim() : '__np_dv';
       const g = t.groupBy([...keys, name]).agg({ __np_n: 'count()' });

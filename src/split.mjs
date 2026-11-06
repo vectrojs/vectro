@@ -16,7 +16,7 @@
 // filtered table that collect() makes is still spread over every worker.
 // The page remembers rows per block ("segments") to put rows back in order.
 import { Engine as LocalEngine, trackAsyncMethods } from './engine.mjs';
-import { inspectCSV } from './csv.mjs';
+import { inspectCSV, crOnlyToLF } from './csv.mjs';
 import { encode, countByte } from './bytes.mjs';
 import { csvRowEnds, csvTail, CSV_FIELD_START } from './csv-kernel.mjs';
 import { parse, toSource } from './fuse.mjs';
@@ -53,6 +53,7 @@ export class SplitEngine {
         const p = this.pending.get(m.rid);
         if (!p) return;
         this.pending.delete(m.rid);
+        this.#hold();
         if (m.ok) p.resolve(m.value); else p.reject(new Error(m.error));
       });
       w.onError?.((err) => this.#fail(i, err));
@@ -67,6 +68,18 @@ export class SplitEngine {
     if (this.failed[i]) return;
     this.failed[i] = new Error(`vectro: split-table worker ${i} stopped (${err?.message || 'no reason given; the browser may have run out of memory'}). Tables on this engine are incomplete; create a new SplitEngine.`);
     for (const [rid, p] of this.pending) if (p.worker === i) { this.pending.delete(rid); p.reject(this.failed[i]); }
+    this.#hold();
+  }
+
+  // Node: the workers keep the process alive only while an answer is awaited or a stream reads from a
+  // connection (a script that leaves a SplitEngine open, as a plain Engine, still ends by itself).
+  #held = false;
+  connections = 0;
+  #hold() {
+    const want = this.pending.size > 0 || this.connections > 0;
+    if (want === this.#held || this.closed) return;
+    this.#held = want;
+    for (const w of this.workers) (want ? w.ref : w.unref)?.();
   }
 
   _call(i, op, args, transfer = []) {
@@ -84,14 +97,18 @@ export class SplitEngine {
     const rid = ++this.rid;
     return new Promise((resolve, reject) => {
       this.pending.set(rid, { resolve, reject, worker: i, op });
+      this.#hold();
       try {
         this.workers[i].post({ rid, op, args }, transfer);
       } catch (err) { // e.g. out of memory while copying the message
         this.pending.delete(rid);
+        this.#hold();
         reject(err);
       }
     });
   }
+
+  _connected() { this.connections++; this.#hold(); }
 
   // A small single-thread engine on the page for results (group-by tables).
   get local() { return (this.localEngine ??= new LocalEngine()); }
@@ -204,7 +221,8 @@ export class SplitEngine {
 
   async parseCSVAsync(text, opts = {}) {
     await this.ready;
-    const bytes = typeof text === 'string' ? encode(text) : text;
+    let bytes = typeof text === 'string' ? encode(text) : text;
+    if (bytes.indexOf(10) === -1 && bytes.indexOf(13) !== -1) { bytes = Uint8Array.prototype.slice.call(bytes); crOnlyToLF(bytes); } // (CR-only line ends: on a copy, the bytes are the caller's)
     const info = inspectCSV(bytes, opts);
     const f32 = opts.type === Float32Array; // (a guessed free-text column: a category there, as readCSV loads it)
     const types = Object.fromEntries(info.names.map((nm, f) => [nm, f32 && info.kinds[f] === 'string' ? 'category' : info.kinds[f]]));
@@ -557,7 +575,11 @@ export class SplitTable {
     const parts = await this.#all('top', { k, by, columns });
     const keys = parts[0]?.keys ?? [];
     const cand = [];
-    parts.forEach((p, w) => p.rows.forEach((row, i) => cand.push({ row, w, i, vals: p.values.map((v) => v && v[i]) })));
+    // ties in table order: a worker's row at place L is in its block r (blocks are dealt round-robin, see
+    // inOrder), so (r, worker, L) orders rows as the table has them
+    const ends = this.segs.map((sg) => { let e = 0; return Float64Array.from(sg, (x) => (e += x)); }); // (each block's end, per worker)
+    const roundOf = (w, L) => { const E = ends[w]; let lo = 0, hi = E.length; while (lo < hi) { const m = (lo + hi) >> 1; if (E[m] > L) hi = m; else lo = m + 1; } return lo; };
+    parts.forEach((p, w) => p.rows.forEach((row, i) => cand.push({ row, w, i, r: p.places ? roundOf(w, p.places[i]) : 0, L: p.places?.[i] ?? i, vals: p.values.map((v) => v && v[i]) })));
     const cmp = (a, b) => {
       for (let j = 0; j < keys.length; j++) {
         if (keys[j]) { // text: by label
@@ -572,7 +594,7 @@ export class SplitTable {
           return x < y ? -1 : 1;
         }
       }
-      return a.w - b.w || a.i - b.i;
+      return a.r - b.r || a.w - b.w || a.L - b.L;
     };
     const rows = cand.sort(cmp).slice(0, k).map((c) => c.row);
     const names = rows.length ? Object.keys(rows[0]) : (columns ?? this.meta.names);
@@ -650,7 +672,11 @@ export class StreamTable extends SplitTable {
   // unfinished row is kept for the next chunk.
   push(chunk) {
     if (this.format === 'vectro' || this.format === 'arrow') return Promise.reject(new Error("vectro: binary streams take frames over connections: connect each worker to the sender (push() is for 'csv' and 'ndjson')"));
-    const bytes = typeof chunk === 'string' ? encode(chunk) : chunk;
+    let bytes = typeof chunk === 'string' ? encode(chunk) : chunk;
+    if (!this.begun && bytes.length) { // (a UTF-8 BOM before the first row: dropped, it would go into the first value)
+      this.begun = true;
+      if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) bytes = bytes.subarray(3);
+    }
     let last, rows = 0; // last: the last row's newline
     if (this.format === 'csv') {
       const r = csvTail(bytes, 0, bytes.length, COMMA, this.quote);
@@ -664,6 +690,7 @@ export class StreamTable extends SplitTable {
     if (last === -1) { this.partial = this.partial ? join(this.partial, bytes) : Uint8Array.prototype.slice.call(bytes); return Promise.resolve(); }
     const lines = this.partial ? join(this.partial, bytes.subarray(0, last + 1)) : Uint8Array.prototype.slice.call(bytes, 0, last + 1);
     this.partial = last + 1 < bytes.length ? Uint8Array.prototype.slice.call(bytes, last + 1) : null;
+    if (Number.isFinite(this.keepRows)) rows = realRows(lines, this.format); // (keepRows counts rows, not blank lines: the workers skip those)
     const w = this.next;
     this.next = (this.next + 1) % this.counts.length;
     // pos: the place of the chunk's first row in push order; cut: rows placed
@@ -698,7 +725,7 @@ export class StreamTable extends SplitTable {
   // { url: 'wss://…' } for a WebSocket (browsers, Node 22+; each message is
   // whole lines), or { host, port } for raw TCP (Node).
   connect(worker, { url, host = '127.0.0.1', port } = {}) {
-    return this.engine._call(worker, 'streamConnect', { id: this.id, url, host, port });
+    return this.engine._call(worker, 'streamConnect', { id: this.id, url, host, port }).then((v) => { this.engine._connected(); return v; }); // (reading from a connection keeps the process alive, until close())
   }
 
   // Parse whatever every worker has received; returns totals.
@@ -834,3 +861,20 @@ trackAsyncMethods(SplitEngine, (e) => e);
 trackAsyncMethods(SplitTable, (t) => t.engine, ['dispose']);
 trackAsyncMethods(StreamTable, (t) => t.engine, ['dispose', 'push', 'connect']);
 trackAsyncMethods(LiveWindow, (w) => w.stream?.engine, ['dispose']);
+
+// Complete rows in lines (whole CSV rows or JSON lines), blank ones left out.
+function realRows(lines, format) {
+  let n = 0, from = 0;
+  if (format === 'csv') {
+    csvRowEnds(lines, 0, lines.length, COMMA, (at) => { if (!(at - from === 1 || (at - from === 2 && lines[from] === 13))) n++; from = at; });
+    return n;
+  }
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] !== NL) continue;
+    let j = from;
+    while (j < i && (lines[j] === 32 || lines[j] === 9 || lines[j] === 13)) j++;
+    if (j < i) n++;
+    from = i + 1;
+  }
+  return n;
+}

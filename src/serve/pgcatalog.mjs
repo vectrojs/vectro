@@ -222,7 +222,7 @@ export const plainOperators = (text) => text
 // The names of a SELECT's columns, read roughly from its text (for an empty answer).
 export function selectNames(text) {
   return selectItems(text).map((s) => {
-    const as = /\bas\s+("?)([^"\s]+)\1\s*$/i.exec(s) ?? /("?)([A-Za-z_][\w$]*)\1\s*$/.exec(s);
+    const as = /\bas\s+("?)([^"\s]+)\1\s*$/i.exec(s) ?? /("?)([\p{L}_][\p{L}\p{M}\p{N}_$]*)\1\s*$/u.exec(s);
     if (!as) return '?column?';
     return as[1] ? as[2] : as[2].toLowerCase();
   });

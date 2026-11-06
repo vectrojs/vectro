@@ -14,7 +14,7 @@ import { createInterface } from 'node:readline';
 import { Engine, sql } from '../src/node.mjs';
 import { LoadError, safePath as safePathIn, loadFile, columnsOf, kindOf } from '../src/serve/catalog.mjs';
 
-const VERSION = '0.1.4';
+const VERSION = '0.2.0';
 const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const MAX_ROWS = 500, DEFAULT_ROWS = 50;
 
@@ -138,7 +138,7 @@ function getTable(name) {
   return entry;
 }
 
-const clean = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Date ? v.toISOString() : typeof v === 'number' && !Number.isFinite(v) ? null : v])));
+const clean = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Date ? v.toISOString() : typeof v === 'number' && !Number.isFinite(v) ? (v !== v ? null : v > 0 ? 'Infinity' : '-Infinity') : v]))); // (±Infinity as text, as the HTTP server writes it; NaN is missing)
 const handlers = {
   sql({ query }) {
     const all = Object.fromEntries([...tables].map(([n, e]) => [n, e.table]));
@@ -150,7 +150,7 @@ const handlers = {
   },
   async load_file({ path, name, types }) {
     const real = safePath(path);
-    const tname = name || basename(real, extname(real)).replace(/[^A-Za-z0-9_]/g, '_');
+    const tname = name || basename(real, extname(real)).replace(/[^\p{L}\p{M}\p{N}_]/gu, '_');
     const { table, skipped = 0, index = null, embedding = null, onDisk } = await loadFile(engine, real, { types });
     release(tname);
     tables.set(tname, { table, source: path, chain: [table], index });

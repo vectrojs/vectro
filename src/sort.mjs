@@ -6,7 +6,7 @@
 // Several keys: ['region', '-revenue']. Ties keep table order (stable).
 // Missing values (NaN) always come last.
 
-const IDENT = /^\s*(-?)\s*([A-Za-z_][A-Za-z0-9_]*)\s*$/;
+const IDENT = /^\s*(-?)\s*([\p{L}_][\p{L}\p{M}\p{N}_]*)\s*$/u;
 
 // [{ text: expression to compute | null, column: category column | null, desc }]
 export function parseKeys(by, cols) {

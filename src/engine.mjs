@@ -170,8 +170,9 @@ export class Engine {
       this.heapTop = top;
     }
     this.sizes.set(ptr, size);
-    const view = new Type(this.#memoryBuffer(), ptr, n);
-    this.allocInfo.set(view, { ptr, n, Type });
+    const view = new Type(this.#memoryBuffer(), ptr, n), info = { ptr, n, Type };
+    this.allocInfo.set(view, info);
+    this.#blocks.set(ptr, info);
     return view;
   }
 
@@ -200,11 +201,18 @@ export class Engine {
     return fresh;
   }
 
+  #blocks = new Map(); // ptr -> the allocInfo of the array allocated there now
+  // Is this array's allocation still the one at its place (not freed, nor its memory given to
+  // another array since)? For freeing dropped tables (see table.mjs), whose arrays another table
+  // may have taken over and freed.
+  _allocated(ta) { const info = this.allocInfo.get(ta); return !!info && this.#blocks.get(info.ptr) === info; }
+
   free(ta) {
     const ptr = this.allocInfo.get(ta)?.ptr ?? ta.byteOffset;
     const size = this.sizes.get(ptr);
     if (size === undefined || !this.memBuffers.has(ta.buffer)) throw new Error('vectro: free() of an array not allocated by this engine');
     this.sizes.delete(ptr);
+    this.#blocks.delete(ptr);
     if (POISON) new Uint8Array(this.memory.buffer, ptr, size).fill(0xff);
     let i = 0;
     while (i < this.freeList.length && this.freeList[i].ptr < ptr) i++;
@@ -388,6 +396,8 @@ export class Engine {
 
   // True while an async query is running on the worker threads.
   get busy() { return this.#inFlight; }
+  // 'closed', 'busy' (a query is running or queued) or 'idle': when dropped tables may be freed (see table.mjs)
+  get _state() { return this.#closed ? 'closed' : this.#inFlight || this.#running.size ? 'busy' : 'idle'; }
 
   // The control block and scalar slots belong to the running task; touching
   // them while an async run is on the workers would corrupt it.

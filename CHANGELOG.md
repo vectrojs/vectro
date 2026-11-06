@@ -1,5 +1,244 @@
 # Changelog
 
+## 0.2.0
+
+Fixes from audit round 5: 59 bugs found by checking SQL, the dataframe API,
+datasets, streams, loading and the servers against DuckDB and plain
+JavaScript; every fix has a test in `npm test`. Some answers change on
+purpose, to match DuckDB and standard SQL:
+
+**Changed answers**
+- `CAST(x AS INTEGER)` (and the other whole-number types) rounds instead of
+  cutting the fraction off, and is missing when the value doesn't fit.
+- `%` is the exact remainder.
+- `CAST(number AS VARCHAR)` keeps every digit; true / false cast to text are
+  `'true'` / `'false'`.
+- `SELECT *` after a join names columns as SQL does (`id`, then `id_2`; it
+  was `id_right`) and keeps the right key of `ON`.
+- Column names in any script stay as written (`Größe` was `Gr__e`).
+- HTTP and MCP answers write ±Infinity as `"Infinity"` / `"-Infinity"` (it
+  was null).
+- A regular expression whose repeated group repeats itself or has `|` is
+  refused.
+- `column()` returns a new view (over the same memory) each call.
+- `||` keeps SQL's rule (a missing piece makes it missing); CONCAT skips
+  missing pieces.
+
+**SQL**
+- LIKE and ILIKE (in SQL and in `like()` / `ilike()`) match in linear time.
+  They were a backtracking regular expression: `LIKE '%a%e%o%zzz'` on 4 KB of
+  ordinary text took 10 seconds.
+- SQL: a subquery used as a value that returns more than one row (`WHERE
+  price < (SELECT v FROM u)`) is an error, as in DuckDB and PostgreSQL. It
+  silently joined every row to every value, so a SUM came out several times
+  too big.
+- SQL: GREATEST and LEAST of many values, and COALESCE / IFNULL nested in
+  each other, plan in milliseconds. Each value used to be written out two to
+  four times per level: GREATEST of 12 columns took more than 10 seconds and
+  then ran out of memory. Other functions nested many levels deep (ROUND,
+  NULLIF, %) stop at once with "the expression is too large" instead of
+  hanging.
+- SQL: a missing date compared with a date written as text (`d <> '2024-02-29'`,
+  `NOT (d = '…')`, `d NOT IN ('…')`) is unknown, so the row is left out, as with
+  `DATE '…'`. Those rows were kept.
+- Dates stay dates through COALESCE, CASE, GREATEST, LEAST, FULL JOIN ...
+  USING a date column, and a UNION with NULL on one side; they came back as
+  milliseconds. In the dataframe API, `derive('x', 'coalesce(d1, d2)')` and
+  `? :` between dates make date columns too.
+- SQL: CAST to INTEGER, BIGINT, SMALLINT and the other whole-number types
+  rounds, as DuckDB and PostgreSQL do; it cut the fraction off. Text and
+  constants round half away from zero (`CAST('2.5' AS INT)` and
+  `CAST(2.5 AS INT)` are 3, -2.5 is -3); a column or computed number, a
+  DOUBLE there, rounds half to even (2.5 is 2, 3.5 is 4). A value the type can't hold, NaN or
+  ±Infinity becomes missing, as text that isn't a number already did.
+- SQL `%` is the exact remainder, as JavaScript's `%` and DuckDB give it; it
+  was computed as `a - trunc(a / b) * b`, which is wrong whenever `a / b`
+  isn't exact (`7 % 0.1` gave 0, `9007199254740994 % 3` gave 2, `5 % Infinity`
+  gave NULL). Expressions can use it too, as `mod(a, b)`. The kernels compute
+  it in WebAssembly (no remainder instruction there), so `dist/vectro.wasm`
+  is rebuilt.
+- Percentiles: `PERCENTILE_DISC(p) WITHIN GROUP (ORDER BY x DESC)` picks the
+  right value (it took the ascending 1 - p, one value off whenever p × n is
+  whole); `MEDIAN(DISTINCT x)` and the other percentiles with DISTINCT count
+  each value once (DISTINCT was ignored); percentiles of text skip missing
+  text and give a label (MEDIAN of text is the lower middle label, as in
+  DuckDB; it gave a number), and PERCENTILE_CONT of text is an error.
+- PERCENTILE_CONT, MEDIAN and QUANTILE_CONT between an infinite value and
+  another give the infinite one (the median of -Infinity and 5 is -Infinity;
+  it was missing), and between huge values (±1e308) don't overflow.
+- Text holding both `'` and `"` works everywhere: as a PostgreSQL parameter
+  (`O'Brien "Bob"` was refused), in SQL, and in expressions, where `''`
+  inside `'...'` is one `'` (`filter("name == 'O''Brien'")`).
+- (Unchanged, now tested) `||` keeps SQL's rule: a missing piece makes the
+  whole text missing, and empty text is missing text in Vectro, so
+  `'a' || SUBSTRING('a', 2)` is missing. CONCAT skips missing pieces:
+  `CONCAT(UPPER(SUBSTRING(s, 1, 1)), LOWER(SUBSTRING(s, 2)))` capitalizes a
+  one-letter word too.
+- SQL regular expressions (`REGEXP_MATCHES`, `REGEXP_REPLACE`,
+  `REGEXP_EXTRACT`, `~`) refuse a pattern with a repeated group that itself
+  repeats or has `|`, such as `(a+)+$` or `(a|aa)*`. JavaScript's regular
+  expressions backtrack, and `(a+)+$` on 31 characters never finished, so one
+  query could freeze a server. Rewrite such a pattern, for example with a
+  character class (`[ab]+`).
+- SQL: `CAST(x AS DECIMAL(p, s))` rounds to s digits (half away from zero)
+  and is missing when the whole part needs more than p - s digits; plain
+  `DECIMAL` is `DECIMAL(18, 3)`, as in DuckDB. It kept every digit. `CAST(x AS
+  REAL)` (and `FLOAT`, `FLOAT4`) is a 32-bit float; it stayed 64-bit.
+  Expressions can use it as `fround(x)`.
+- SQL: `ROUND(x, -1)` rounds to tens (it was refused), the digits can be a
+  constant expression, `ROUND(1e308, 2)` is 1e308 (it was Infinity), and
+  `ROUND(0.49999999999999994)` is 0 (it was 1).
+- SQL: `CAST(number AS VARCHAR)` keeps every digit (`0.1 + 0.2` is
+  `0.30000000000000004`, as DuckDB writes it; it was rounded to 15 digits), and
+  a true / false value is `'true'` / `'false'` (it was `'1'` / `'0'`).
+- SQL: `CAST('inf' AS DOUBLE)`, `'-inf'`, `'infinity'` and `'nan'` (any case)
+  are read, as DuckDB reads them; they were missing.
+- SQL text: `REVERSE` keeps each visible character whole (an emoji with a skin
+  tone, a letter with an accent); `REGEXP_REPLACE(s, p, r, 'g')` doesn't
+  replace an empty match right after a match (`'aaa'`, `'a*'` gives `'b'`, as
+  DuckDB; it was `'bb'`); `SPLIT_PART(s, '', n)` is the n-th character.
+- SQL: `STRFTIME` writes years below 1000 with 4 digits (`0001-01-01`), and
+  week numbers and days of the year are right for years 1 to 99 (they were
+  worked out as 1901 to 1999).
+- SQL: `LIKE ... ESCAPE '!'` (and `ILIKE`) is read: `'a!%'` matches `a%`
+  exactly. It was refused. In expressions: `like(s, 'a!%', '!')`. LIKE on
+  text in quotes (`'abc' LIKE 'a%'`) is worked out; it failed with an error
+  that showed generated code.
+- SQL: aggregates take `FILTER (WHERE ...)` (`COUNT(*) FILTER (WHERE v > 1)`,
+  `SUM(x) FILTER (...)`); it was a syntax error. An unknown function, also an
+  aggregate such as `STDDEV(v)` in a GROUP BY query, says it is unknown and
+  lists the aggregates; it said "v must be in GROUP BY".
+- SQL: `GROUP BY q, q` (or `q, 1`) groups by q once; it failed with "groupBy
+  got the same key twice".
+- SQL: a text IN list can hold NULL (`s IN ('a', NULL)`), as BI tools write it;
+  it was refused. `s NOT IN ('a', NULL)` keeps nothing, as in SQL.
+- SQL: `LIMIT` and `OFFSET` take a constant expression (`LIMIT 2 + 3`) and
+  round as DuckDB does (`LIMIT 2.5` is 3 rows; it was 2), and `OFFSET` works
+  without `LIMIT` (it was refused).
+- SQL: a query nested more than 400 levels deep (brackets or function calls)
+  fails with that number in the message. Before, about 860 brackets ran out
+  of stack, and the message said "thousands of levels".
+- SQL windows: a RANGE frame with a distance (`RANGE BETWEEN 1 PRECEDING AND
+  CURRENT ROW`) with `NULLS FIRST` keeps missing order keys out of the frames
+  of ±Infinity keys (they were counted together). `LAG` / `LEAD` of text take a
+  text default (`LAG(s, 1, 'none')`); it was refused ("must be a number"), and
+  a number default on text gave a wrong label.
+- SQL joins: `SELECT *` and `b.*` name every column as its table has it, as
+  SQL does: `b.*` is `id, k, s` (it was `id_right, ...`), and a name that two
+  tables have is written once and then `id_2`, as `SELECT a.id, b.id` already
+  did (`SELECT *` gave `id_right`). `SELECT *` after `JOIN ... ON a.k = b.k`
+  keeps b's key (missing where an outer join found no match); it was dropped.
+  A USING key is still once. This changes column names of `SELECT *` joins.
+- SQL joins: `ON a.k + 1 = b.k` (an expression on each side, also `CAST`,
+  `UPPER(...)`) joins on those values; it was refused. A text key joined to a
+  number key names the columns as written (`"b.s" and "c.s"`), not a hidden
+  `__k0`, and `FULL JOIN ... USING (s)` with an empty table's column keeps the
+  other side's text (it gave numbers).
+
+**Dataframe and datasets**
+- On a dataset, `date - date` (and `date - DATE '...'`) gives days, as on a
+  table; it gave milliseconds. Each chunk now records whether a date column
+  holds whole days; files written before are read from their encoding. The
+  PostgreSQL, Flight and OData servers report those columns as `date` too.
+- Datasets read asynchronously through the file descriptor they already hold.
+  On Node 25, a dataset queried with an async call and then dropped without
+  `close()` stopped the whole process at garbage collection ("A FileHandle
+  object was closed during garbage collection"). A dataset dropped without
+  `close()` now has its file closed when it is collected.
+- Writing a dataset over an existing file no longer changes it under a dataset
+  that has it open. `writeDataset`, `csvToDataset` and `createDataset` write a
+  new file beside the path and move it into place when it is complete, so an
+  open dataset keeps reading the old file. Before, it read the new bytes with
+  the old layout: rows mixed old and new values. A writer that fails or is
+  aborted leaves no file behind, and leaves the file it would have replaced
+  as it was.
+- An async dataset query is answered only once the chunks it read ahead are
+  done. When it failed or stopped early (a limit), that reading was still on
+  the worker threads, so the next sync call was sometimes refused with "an
+  async query is running on this engine", although the query was awaited.
+- Datasets: a derive or select whose column nothing uses, followed by a limit
+  or top, no longer fails (`derive('x', 'a + b').limit(2).agg({ s: 'sum(a)' })`
+  said "unknown column b"; `select('id', 'a').top(1, '-a').agg(...)` said "no
+  column id"). Each chunk's plan now keeps only the columns used above it.
+- Datasets: a group whose values in one chunk hold both +Infinity and
+  -Infinity sums to NaN, as on a table; SUM, AVG and group sums left that
+  chunk out (a SUM of 3 instead of NaN, a group sum of 0).
+- Datasets have the documented async versions: `sortAsync`, `topAsync`,
+  `limitAsync`, `joinAsync` (the rows, in a table, as on a table), `sumAsync`,
+  `meanAsync`, `minAsync`, `maxAsync`, `explainAsync`, and
+  `groupBy(...).aggAsync` (also on lazy queries). They were missing
+  (TypeError). `count` / `countAsync` take params.
+- Lazy queries and datasets: a join keeps the left table's column order, as
+  an eager join does (the key came first). On a dataset,
+  `join(...).top(k, 's_right')` (a renamed text column of the right table)
+  works; it failed with "s_right is a text column". `groupBy('s').agg({ s:
+  ... })` (an aggregation named like a key) is refused, as on a table; on a
+  dataset it put the sums where the keys should be.
+- Split tables: `topAsync` keeps table order among tied rows, as `top` on a
+  table does (row 13000 came before row 5000). The values were right.
+
+**Loading data**
+- JSON lines: a numeric string (`{"x":"2"}`, `" 1e3 "`) goes into a number
+  column, as the docs say; one such value made the whole column text. Blank
+  text doesn't change a column's kind (it is missing in a number column), and
+  an escaped `"\u0030"` is 0 (it was missing).
+- A UTF-8 BOM before the first JSON lines record no longer loses that record,
+  and a BOM before the first row pushed or sent to a CSV or JSON lines stream
+  is dropped (it went into the first value, or lost the first row).
+- `writeArrow`: a text column whose first value is null is written as text
+  (it was taken for numbers, and every value was lost), and null text is
+  missing (it was written as the text "null").
+- CSV: a time with a `+hh` offset (`2024-01-02 03:04:05+00`, as PostgreSQL
+  exports a timestamptz) makes a date column; it stayed text.
+- CSV: a file whose lines end in CR alone (old Mac files) loads its rows, in
+  `parseCSV`, `readCSV`, `csvToDataset` and split tables; it loaded as one
+  header line and no rows, with no error.
+- `tableFromRows`: the columns are every key of any row (missing where a row
+  lacks one); keys first seen after the first row were dropped. A number in a
+  text column is its text (`'5'`); it stayed a number.
+- JSON lines files (servers, MCP): every key is a column, as the docs say. A
+  key whose value is nested in some rows keeps its plain values (the whole key
+  was dropped, and with a list of numbers in one row the file was taken for
+  vectors), and a nested value in a text column is its JSON text
+  (`'{"nested":true}'`); a key with only nested values is such a column (it
+  was dropped). A vector field is one that holds a list of numbers of one
+  length in every row. Streams still leave nested values missing.
+- Column names can use letters of any script (`Größe`, `名前`), in
+  expressions, SQL, sorting, the servers and OData; CSV headers and JSON keys
+  keep them (`Größe` became `Gr__e` and `Grüße` `Gr__e_2`). Other signs and
+  spaces still become `_` (`Order Date` is `Order_Date`). Data files named so
+  keep those letters in their table names. This changes the names such files
+  load with.
+
+**Streams**
+- Streams: `keepMs` drops every row older than the newest time minus
+  `keepMs`, also rows that arrived late with an old time. Only the rows at the
+  front were dropped, so a late row from long ago stayed in "the last second"
+  and went into its totals.
+- Streams: a blank line in a CSV stream (a heartbeat newline) is not a row,
+  as JSON lines streams already skipped them; it was a row of missing values,
+  so `count()` grew. `keepRows` counts rows, not blank lines.
+
+**Engine and servers**
+- A script run with `node --input-type=module -e '…'` or piped into node can
+  use worker threads: they inherited `--input-type`, which Node refuses for
+  workers, so the process stopped as soon as the first one started.
+- Tables dropped without `dispose()` have their engine memory freed once
+  they are garbage collected. A table made inside a chain
+  (`t.sort(...).head(20)`) can't be disposed, and was kept until
+  `engine.close()`: 150 such calls held 460 MB, and a long-running app ran out
+  of memory. `dispose()` still frees at once and is still the way to free
+  memory soon. `column()` now returns a new array view each call (over the
+  same memory).
+- HTTP answers (JSON, JSON lines, CSV) and the MCP tools write ±Infinity as
+  the text `"Infinity"` / `"-Infinity"` (`Infinity` / `-Infinity` in CSV).
+  They were null, the same as a missing value, so `MIN(x) = -Infinity` reached
+  Excel or an LLM as "no value". NaN is still missing.
+- Node: a script that leaves a `SplitEngine` open ends by itself, as with a
+  plain `Engine`; its worker threads kept it running forever. The workers keep
+  the process alive only while an answer is awaited, or while a stream reads
+  from a connection (`connect()`), until `close()`.
+
 ## 0.1.4
 
 Fixes from four more audit rounds: streams, SQL against DuckDB, the

@@ -58,7 +58,16 @@ export function loadBytesAsync(engine, bytes, opts) { return engine._driveAsync(
 //              'throw': a clear error instead (pieces parsed separately)
 //   trimEnd    false: the bytes are a piece of a file, not its end, so blank lines at their end
 //              are rows (of missing values), as in the middle of a file
+// A file whose lines end in CR alone (old Mac files: no LF anywhere, a CR somewhere): its CRs become
+// LFs, in place. It loaded as one header line and no rows, with no error. Returns whether it was one.
+export function crOnlyToLF(b) {
+  if (b.indexOf(10) !== -1 || b.indexOf(13) === -1) return false;
+  for (let i = b.indexOf(13); i !== -1; i = b.indexOf(13, i + 1)) b[i] = 10;
+  return true;
+}
+
 function* loadBytesG(engine, bytes, opts = {}) {
+  crOnlyToLF(engine.live(bytes));
   const { delimiter = ',', header = true, types = {}, columns: only = null, type = Float64Array, sampleRows = 1000, chunkBytes = CHUNK_BYTES, pieces = null, onPieceRows = null, checkTypes = null, badType = 'retype', trimEnd = true } = opts;
   const temp = [bytes];
   try {
@@ -305,7 +314,7 @@ function fieldText(bytes, f) {
 // Column names must work in expressions: "Order Date" -> Order_Date.
 export function cleanNames(raw) {
   const base = raw.map((r, i) => {
-    let nm = r.trim().replace(/[^A-Za-z0-9_]/g, '_') || `col${i}`;
+    let nm = r.trim().replace(/[^\p{L}\p{M}\p{N}_]/gu, '_') || `col${i}`;
     if (/^\d/.test(nm)) nm = `_${nm}`;
     if (RESERVED.has(nm)) nm = `${nm}_`;
     return nm;

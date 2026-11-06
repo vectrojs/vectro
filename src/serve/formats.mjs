@@ -47,7 +47,9 @@ function cells(col, d, format) {
   }
   if (col.type === 'text') return (i) => (d[i] === '' ? missing : quote(d[i]));
   if (col.type === 'date') return format === 'csv' ? (i) => (dateOK(d[i]) ? iso(d[i]) : missing) : (i) => (dateOK(d[i]) ? `"${iso(d[i])}"` : missing);
-  return (i) => { const v = d[i]; return v === v && v !== Infinity && v !== -Infinity ? `${v}` : missing; };
+  // (±Infinity as the text "Infinity" / "-Infinity": JSON has no infinity, and null is missing; NaN is missing)
+  const inf = format === 'csv' ? ['Infinity', '-Infinity'] : ['"Infinity"', '"-Infinity"'];
+  return (i) => { const v = d[i]; return v !== v ? missing : v === Infinity ? inf[0] : v === -Infinity ? inf[1] : `${v}`; };
 }
 
 // The body as chunks (strings or bytes), for res.write one after another.

@@ -74,7 +74,9 @@ function frames(n, b, frame, hasOrder, orderKey, desc) {
     const sign = desc ? -1 : 1, off = (e) => (e.kind === 'preceding' ? -e.n : e.kind === 'following' ? e.n : 0);
     for (let s = 0; s < n; s = pe[s]) {
       const end = pe[s];
-      let a = s, z = s;
+      let a = s;
+      while (a < end && orderKey[a] !== orderKey[a]) a++; // (NULLS FIRST: missing keys first, never in a present key's frame)
+      let z = a;
       for (let i = s; i < end; i++) {
         const v = sign * orderKey[i];
         if (v !== v) { if (f.start.n !== undefined) lo[i] = qs[i]; if (f.end.n !== undefined) hi[i] = qe[i]; continue; } // (missing keys: their ties, on the sides with a distance)
@@ -112,11 +114,16 @@ export function windowValues(n, b, item, hasOrder, orderKey, desc) {
         const e = pe[s];
         let a = s, z = e; // present values: NaN sort last
         while (z > a && x[z - 1] !== x[z - 1]) z--;
-        const m = z - a;
+        let xs = x, m = z - a;
+        if (item.distinct && m) { // (each value once; sorted, so equal values sit together, -0 with 0)
+          xs = [x[a]];
+          for (let i = a + 1; i < z; i++) if (x[i] !== x[i - 1]) xs.push(x[i]);
+          a = 0; m = xs.length;
+        }
         let v = NaN;
         if (m) {
-          if (item.fn === 'percentile_disc') v = x[a + Math.max(0, Math.ceil(item.p * m) - 1)];
-          else { const r = item.p * (m - 1), lo = Math.floor(r); v = x[a + lo] + (r - lo) * ((x[a + Math.min(m - 1, lo + 1)]) - x[a + lo]); }
+          if (item.fn === 'percentile_disc') v = xs[a + discRank(item.p, m, item.desc)];
+          else { const r = item.p * (m - 1), lo = Math.floor(r); v = between(xs[a + lo], xs[a + Math.min(m - 1, lo + 1)], r - lo); }
         }
         out.fill(v, s, e);
         s = e;
@@ -160,3 +167,10 @@ export function windowValues(n, b, item, hasOrder, orderKey, desc) {
   }
   throw new Error(`vectro: unknown window function ${item.fn}`);
 }
+
+// PERCENTILE_DISC(p): the rank (0 = the smallest of m values present) of the
+// first value, in the ORDER BY direction, whose share of the values reaches p
+export const discRank = (p, m, desc = false) => (desc ? m - Math.max(1, Math.ceil(p * m)) : Math.max(0, Math.ceil(p * m) - 1));
+// PERCENTILE_CONT between two neighbours, f of the way from x to y: as x * (1 - f) + y * f, which can't
+// overflow (±1e308) and keeps an infinite neighbour (x + (y - x) * f gives NaN there, -Infinity + Infinity)
+export const between = (x, y, f) => (f === 0 || x === y ? x : x * (1 - f) + y * f);

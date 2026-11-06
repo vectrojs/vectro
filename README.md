@@ -5,7 +5,7 @@ and compiles each query, filter included, into one SIMD WebAssembly loop, then
 runs it on every CPU core. It runs in Node, in browsers (any page) and on
 Cloudflare Workers, with no native addon, compiler or server.
 
-> Version 0.1.4. Node 20+ and modern browsers. MIT license.
+> Version 0.2.0. Node 20+ and modern browsers. MIT license.
 
 **Website and docs: [vectrojs.dev](https://vectrojs.dev)**. [Quick start](https://vectrojs.dev/docs/quick-start) · [API reference](https://vectrojs.dev/api) · [Race it in your browser](https://vectrojs.dev/live) · [Benchmarks](https://vectrojs.dev/benchmarks)
 
@@ -167,10 +167,14 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   HAVING, ORDER BY ... ASC/DESC [NULLS FIRST | LAST], LIMIT / OFFSET / FETCH
   FIRST; COUNT(*), COUNT(x), COUNT(DISTINCT x), SUM, AVG, MIN, MAX,
   APPROX_COUNT_DISTINCT, MEDIAN, PERCENTILE_CONT / PERCENTILE_DISC WITHIN GROUP
-  (ORDER BY x), QUANTILE_CONT anywhere in SELECT / HAVING / ORDER BY; BETWEEN,
-  IN, LIKE, IS [NOT] NULL, CASE, %, COALESCE, NULLIF, ROUND, LEAST, GREATEST,
-  CAST, DATE / TIMESTAMP literals, INTERVAL '7 days', EXTRACT, DATE_TRUNC,
-  YEAR(), MONTH()... It compiles to the planner below, so SQL gets every
+  (ORDER BY x), QUANTILE_CONT anywhere in SELECT / HAVING / ORDER BY, and
+  `FILTER (WHERE ...)` on aggregates; BETWEEN, IN, LIKE (and `ESCAPE`), IS
+  [NOT] NULL, CASE, % (the exact remainder), COALESCE, NULLIF, ROUND (to
+  negative digits too), LEAST, GREATEST, CAST (to integers rounding as DuckDB
+  does, missing when out of range; DECIMAL(p, s) rounds to s digits; REAL is
+  32-bit), DATE / TIMESTAMP literals, INTERVAL '7 days', EXTRACT, DATE_TRUNC,
+  YEAR(), MONTH()... JOIN ... ON takes an expression on each side (`ON a.k +
+  1 = b.k`), and column names can use any script (`Größe`). It compiles to the planner below, so SQL gets every
   optimization, on tables and on datasets bigger than memory.
 
   **Subqueries and set operations:** WITH (CTEs, with column names too),
@@ -202,7 +206,9 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   s)`), SUBSTRING / SUBSTR (and `FROM ... FOR`), LEFT, RIGHT, LENGTH,
   REPLACE, REVERSE, REPEAT, LPAD, RPAD, SPLIT_PART, STRPOS / POSITION(a IN
   b), STARTS_WITH, ENDS_WITH, CONTAINS, CONCAT, CONCAT_WS, `||`, ASCII, CHR,
-  REGEXP_MATCHES / REGEXP_REPLACE / REGEXP_EXTRACT, STRFTIME, ILIKE, text
+  REGEXP_MATCHES / REGEXP_REPLACE / REGEXP_EXTRACT (JavaScript syntax; a
+  pattern whose repeated group itself repeats or has `|`, such as `(a+)+$`, is
+  refused, as it could take very long), STRFTIME, ILIKE, text
   CASE / COALESCE / NULLIF, `CAST(x AS VARCHAR)` and text to numbers or
   dates, and comparing text with `<` / `>`. Each function runs once per
   distinct value, not per row (a category column has few labels), and the
@@ -423,7 +429,7 @@ curl -G http://127.0.0.1:8787/sql --data-urlencode 'q=SELECT region, COUNT(*) AS
 
 | Endpoint | Gives |
 |---|---|
-| `GET /sql?q=...` or `POST /sql` (the SQL as the body, or JSON `{ "sql": ... }`) | the answer; `format=json` (default: `{ columns, rows }`), `csv`, `ndjson` or `arrow`; `limit=n` |
+| `GET /sql?q=...` or `POST /sql` (the SQL as the body, or JSON `{ "sql": ... }`) | the answer; `format=json` (default: `{ columns, rows }`), `csv`, `ndjson` or `arrow`; `limit=n`. Missing values are `null` (empty in CSV); ±Infinity is `"Infinity"` / `"-Infinity"` |
 | `GET /tables`, `GET /tables/<name>` | table names, rows, column types |
 | `GET /tables/<name>/rows?format=csv` | a whole table |
 | `POST /reload` | reads the data folder again (new files become tables) |
@@ -837,4 +843,5 @@ tables (not split tables or streams yet). Split tables
 have `topAsync` but no full sort.
 Binary streams have number and category columns only; Arrow ZSTD compression isn't supported.
 Streams take flat records only (no nested JSON fields), and windows group by
-at most one category column. Memory is capped at 4 GB per engine (datasets go past it) and freed with `dispose()`.
+at most one category column. Memory is capped at 4 GB per engine (datasets go past it) and freed with `dispose()`;
+a table dropped without it is freed once JavaScript collects it, which can be much later.

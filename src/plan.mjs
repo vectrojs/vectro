@@ -26,7 +26,7 @@
 // explain() prints the optimized plan.
 
 import { parse, toSource, walk, isMask, checkSpec } from './fuse.mjs';
-import { DATE_RESULT } from './dates.mjs';
+import { DATE_RESULT, isDateAst } from './dates.mjs';
 import { trackAsyncMethods } from './engine.mjs';
 
 export const vars = (ast) => { const out = new Set(); walk(ast, (n) => { if (n.t === 'var') out.add(n.name); }); return out; };
@@ -78,7 +78,7 @@ function inline(ast, derived) {
 }
 
 // Sort keys: '-name' or an expression.
-const IDENT = /^\s*(-?)\s*([A-Za-z_]\w*)\s*$/;
+const IDENT = /^\s*(-?)\s*([\p{L}_][\p{L}\p{M}\p{N}_]*)\s*$/u;
 const keyList = (by) => (Array.isArray(by) ? by : [by]);
 
 export class Query {
@@ -108,7 +108,12 @@ export class Query {
   // only after that join ran (an earlier input of the same union).
   static unmatched(state, names) { return new Query({ op: 'unmatched', state, names }); }
   groupBy(keys) {
-    return { agg: (spec, params = {}) => new Query({ op: 'aggregate', input: this.node, keys: keyList(keys), spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) }) };
+    const agg = (spec, params = {}) => {
+      for (const k of Object.keys(spec)) if (keyList(keys).includes(k)) throw new Error(`vectro: aggregation "${k}" has the same name as a key`); // (as a table says; a dataset put the sums in the key)
+      return aggQuery(spec, params);
+    };
+    const aggQuery = (spec, params = {}) => new Query({ op: 'aggregate', input: this.node, keys: keyList(keys), spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) });
+    return { agg, aggAsync: (spec, params) => agg(spec, params).collectAsync() }; // (aggAsync: the groups, in a table)
   }
 
   // ---- running --------------------------------------------------------------------
@@ -267,7 +272,7 @@ function* execG(node, needed, temps) {
     case 'derive': {
       if (needed && !needed.has(node.name)) return yield* execG(node.input, needed, temps); // nobody uses it
       const s = yield* execG(node.input, union(minus(needed, node.name), vars(node.ast)), temps);
-      const derived = new Map(s.derived).set(node.name, { ast: inline(node.ast, s.derived), date: isDateExpr(node) || (node.ast.t === 'var' && !!s.table.cols.get(node.ast.name)?.date) });
+      const derived = new Map(s.derived).set(node.name, { ast: inline(node.ast, s.derived), date: isDateAst(node.ast, (name) => (s.derived.has(name) ? !!s.derived.get(name).date : !!s.table.cols.get(name)?.date)) });
       return { ...s, derived, visible: [...s.visible.filter((n) => n !== node.name), node.name] };
     }
     case 'select': {
@@ -306,8 +311,9 @@ function* execG(node, needed, temps) {
           if (same?.t === 'var') return `${m[1]}${same.name}`; // a copy of a column: sorted as that column (text by label)
           return toSource(inline(parse(String(b)), s.derived));
         });
-        r = yield { table: base, method: k === null ? 'sort' : 'top', args: k === null ? [by] : [k, by] };
-      } else r = yield { table: base, method: 'head', args: [k] };
+        const all = k === null || k === Infinity; // (OFFSET without LIMIT: every row after the offset)
+        r = yield { table: base, method: all ? 'sort' : 'top', args: all ? [by] : [k, by] };
+      } else r = k === Infinity ? base : yield { table: base, method: 'head', args: [k] };
       if (node.offset) r = yield { table: r, method: 'slice', args: [node.offset] };
       r = yield* deriveAllG(r, keep.filter((n) => s.derived.has(n)), s.derived);
       return { table: r, derived: new Map(), visible: keep };
@@ -422,7 +428,9 @@ function* materializeG(s, names, temps, exprs = [], keepVisibleOrder = false) {
   for (const n of derivedNames) for (const v of vars(s.derived.get(n).ast)) base.add(v);
   for (const e of exprs) for (const v of vars(inline(e, s.derived))) if (s.table.cols.has(v)) base.add(v);
   for (const n of base) if (!s.table.cols.has(n)) throw new Error(`vectro: no column "${n}"`);
-  let t = base.size ? s.table.select(...base) : s.table;
+  // (keepVisibleOrder: the columns in the order the query shows them, so a join keeps the left table's order)
+  const order = keepVisibleOrder ? [...s.visible.filter((n) => base.has(n)), ...[...base].filter((n) => !s.visible.includes(n))] : [...base];
+  let t = base.size ? s.table.select(...order) : s.table;
   if (!derivedNames.length) return t;
   if (t.pred) t = yield { table: t, method: 'collect', args: [] };
   return yield* deriveAllG(t, derivedNames, s.derived);
@@ -546,7 +554,7 @@ function describe(node, depth = 0) {
     case 'select': return `${describe(node.input, depth)}\n${pad}select ${node.names.join(', ')}`;
     case 'aggregate': return `${describe(node.input, depth)}\n${pad}groupBy ${node.keys.join(', ')}: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}${node.pushed ? ` (${node.pushed} filter(s) on keys moved below)` : ''}`;
     case 'sort': return `${describe(node.input, depth)}\n${pad}sort ${node.by.join(', ')}`;
-    case 'limit': return node.input.op === 'sort'
+    case 'limit': return node.input.op === 'sort' && node.n !== Infinity
       ? `${describe(node.input.input, depth)}\n${pad}top ${node.n + (node.offset ?? 0)} by ${node.input.by.join(', ')} (sort + limit)${node.offset ? `, then skip ${node.offset}` : ''}`
       : `${describe(node.input, depth)}\n${pad}limit ${node.n}${node.offset ? ` offset ${node.offset}` : ''}`;
     case 'join': return `${pad}join ${JSON.stringify(node.opts.on)} ${node.opts.how ?? 'inner'}\n${pad}  left:\n${describe(node.left, depth + 2)}\n${pad}  right:\n${describe(node.right, depth + 2)}`;

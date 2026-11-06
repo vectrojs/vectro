@@ -9,6 +9,7 @@ import { parseKeys, labelRanks, sortIndex } from './sort.mjs';
 import { trackAsyncMethods } from './engine.mjs';
 import { ZONE_ROWS, computeZones, zoneRange } from './zones.mjs';
 import { parse, toSource, walk, analyze, isMask, fold, checkSpec } from './fuse.mjs';
+import { likeMatcher } from './like.mjs';
 import { generateGroupBy, generateCompact, generateHashGroups, generateMarkPairs, generateStridedKeys } from './table-kernels.mjs';
 import { decodeString } from './csv-kernel.mjs';
 import { maxUnits } from './kernels.mjs';
@@ -17,15 +18,15 @@ import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { partitionedGroupsG, estimateGroups, PARTITION_ROWS, PARTITION_GROUPS, DIRECT_SLOTS } from './partition.mjs';
 import { joinTablesG, joinViewG, lookupGroupsG } from './join.mjs';
 import { Query } from './plan.mjs';
-import { bounds, windowValues, readsPeers } from './window.mjs';
+import { bounds, windowValues, readsPeers, discRank, between } from './window.mjs';
 import { copyRows } from './rows.mjs';
 import { textmapRows } from './textmap.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
-import { DATE_FNS, DATE_RESULT, parseDateText, toMillis, f32Dates } from './dates.mjs';
+import { DATE_FNS, DATE_RESULT, isDateAst, parseDateText, toMillis, f32Dates } from './dates.mjs';
 import { chooseEncoding, encodingCandidates, packInto, decodeOne, KINDS } from './pack.mjs';
 
-const IDENT = /^[A-Za-z_]\w*$/;
+const IDENT = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u; // (letters of any script, digits and _)
 const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count', 'countDistinct', 'approxDistinct']);
 const DISTINCT = new Set(['countDistinct', 'approxDistinct']); // exact on a table (see #distinctCountsG)
 const IDENTITY = { sum: 0, count: 0, mean: 0, min: Infinity, max: -Infinity };
@@ -47,10 +48,16 @@ export class Table {
     this.n = n;
     this.pred = pred;       // filter, as bound expression source (or null)
     this.params = params;   // scalar values the filter refers to
-    this.owned = owned;     // columns this table allocated (freed by dispose)
-    this.ownedBuffers = ownedBuffers; // e.g. CSV bytes that free-text columns point into
+    this.#own = { cols, owned, ownedBuffers }; // (freed when the table is collected, see track)
     this.zones = zones;     // may zone maps narrow filtered queries (see zones.mjs)
+    track(this, this.#own);
   }
+
+  #own;
+  get owned() { return this.#own.owned; }     // columns this table allocated (freed by dispose)
+  set owned(v) { this.#own.owned = v; }
+  get ownedBuffers() { return this.#own.ownedBuffers; } // e.g. CSV bytes that free-text columns point into
+  set ownedBuffers(v) { this.#own.ownedBuffers = v; }
 
   // With a filter, the rows that can match it according to the zone maps
   // (min and max per block, kept on each column and computed on first use),
@@ -107,20 +114,22 @@ export class Table {
     return compress ? t.compress() : t;
   }
 
-  // Convert an array of objects. Column types come from the first row.
+  // Convert an array of objects. The columns are every key of any row (in the order they first appear;
+  // missing where a row lacks one), each typed by its first value that isn't null.
   static fromRows(engine, rows, { type = Float64Array } = {}) {
     if (!rows.length) throw new TypeError('vectro: no rows');
     const n = rows.length;
     const cols = new Map();
-    for (const name of Object.keys(rows[0])) checkName(name); // (checked before anything is copied)
+    const names = [...new Set(rows.flatMap((r) => Object.keys(r)))]; // (keys first seen after row 1 were dropped)
+    for (const name of names) checkName(name); // (checked before anything is copied)
     try {
-      for (const name of Object.keys(rows[0])) {
+      for (const name of names) {
         const data = engine.alloc(type, n);
         const first = firstPresent(rows.map((r) => r[name]));
         if (typeof first === 'string') {
           const codes = new Map(), dict = [];
           for (let i = 0; i < n; i++) {
-            const s = rows[i][name] ?? ''; // (null / undefined: missing text)
+            const v = rows[i][name], s = v === null || v === undefined ? '' : v instanceof Date ? v.toISOString() : String(v); // (null / undefined: missing text; a number among text is its text)
             let c = codes.get(s);
             if (c === undefined) { c = dict.length; dict.push(s); codes.set(s, c); }
             data[i] = c;
@@ -146,7 +155,7 @@ export class Table {
   column(name) {
     const c = this.cols.get(name);
     if (!c) throw new Error(`vectro: no column "${name}"`);
-    return this.engine.live(c.data);
+    return handOut(this.engine, this.engine.live(c.data));
   }
 
   // ---- expressions ----------------------------------------------------------------
@@ -272,6 +281,27 @@ export class Table {
 
   #hasPacked() { for (const c of this.cols.values()) if (c.enc) return true; return false; }
 
+  // This table with its packed columns decoded, in plain JavaScript (callable inside a running query);
+  // the columns it owned move to the new table, the packed arrays stay with this one (freed by its dispose).
+  _plain() {
+    if (!this.#hasPacked()) return this;
+    const { engine } = this, f32 = this.type === Float32Array;
+    const cols = new Map(), decoded = [];
+    for (const [name, c] of this.cols) {
+      if (!c.enc) { cols.set(name, c); continue; }
+      const out = engine.alloc(c.plainType, this.n), codes = engine.live(c.data), o = engine.live(out);
+      for (let i = 0; i < this.n; i++) o[i] = decodeOne(c.enc, codes[i], f32);
+      const { enc, plainType, rows, ...rest } = c;
+      cols.set(name, { ...rest, data: out });
+      decoded.push(name);
+    }
+    for (const c of cols.values()) c.data = engine.live(c.data);
+    const owned = [...decoded, ...this.owned.filter((n) => !decoded.includes(n))], ownedBuffers = this.ownedBuffers;
+    this.owned = this.owned.filter((n) => decoded.includes(n));
+    this.ownedBuffers = [];
+    return new Table(engine, cols, this.n, { pred: this.pred, params: this.params, owned, ownedBuffers, zones: this.zones });
+  }
+
   // The same rows with packed columns decoded (new arrays, owned): all of
   // them, or those in `names` (the others stay packed).
   *#decodedG(names = null) {
@@ -376,7 +406,7 @@ export class Table {
     const out = this.engine.alloc(this.type, this.n);
     yield* this.engine.evalG(src, this.#vars(merged), out);
     const top = parse(expr);
-    const date = (top.t === 'call' && DATE_RESULT.has(top.fn)) || (top.t === 'var' && !!this.cols.get(top.name)?.date); // dayStart(ts), monthStart(ts)...: still dates
+    const date = isDateAst(top, (name) => !!this.cols.get(name)?.date); // dayStart(ts), coalesce(d1, d2)...: still dates
     const kinds = valueKinds(top, this.cols), dict = kinds.size === 1 ? kinds.values().next().value : 'number';
     const same = dict === 'number' ? null : [...this.cols.values()].find((c) => c.dict === dict); // a copy of a text column stays text (through ? : and coalesce too)
     const cols = new Map(this.cols).set(name, { data: out, dict: same?.dict ?? null, codes: same?.dict ? same.codes : null, date });
@@ -1111,7 +1141,7 @@ export class Table {
     const { engine, n } = this;
     const counts = new Float64Array(K);
     if (!n) return counts;
-    const plain = /^[A-Za-z_]\w*$/.test(arg.trim()) ? this.cols.get(arg.trim()) : null;
+    const plain = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(arg.trim()) ? this.cols.get(arg.trim()) : null;
     let own = null;
     if (!plain) { own = engine.alloc(this.type, n); yield* engine.evalG(arg, this.#vars(merged), own); }
     if (engine.jit) { // whole numbers in a small range: a byte per (group, value) instead of the hash table
@@ -1424,7 +1454,7 @@ export class Table {
 
   *#windowG({ partition = [], order = [], items, firstRanks = null }) {
     const { engine } = this;
-    if (items.length && order.length === 1 && !order[0].desc && items.every((it) => (it.fn === 'percentile_cont' || it.fn === 'percentile_disc') && it.arg === order[0].name) && !this.cols.get(order[0].name)?.dict) return yield* this.#percentilesG(partition, items); // (text: by its sorted labels, below)
+    if (items.length && order.length === 1 && !order[0].desc && items.every((it) => (it.fn === 'percentile_cont' || it.fn === 'percentile_disc') && it.arg === order[0].name && !it.distinct) && !this.cols.get(order[0].name)?.dict) return yield* this.#percentilesG(partition, items); // (text: by its sorted labels, below)
     if (firstRanks && order.length) { // only rows that can rank in the first k (see plan.mjs firstRanks)
       const few = yield* this.#firstRowsG(partition, order[0], firstRanks);
       if (few) { try { return yield* few.#windowG({ partition, order, items }); } finally { few.dispose(); } }
@@ -1441,7 +1471,9 @@ export class Table {
       return out;
     };
     const b = bounds(n, partition.map(values), order.map((o) => values(o.name)), readsPeers(items));
-    const orderKey = order.length === 1 ? values(order[0].name) : null;
+    // (the one order key a RANGE distance measures; a NULLS FIRST flag before it (missing ones first) doesn't count)
+    const keyOrder = order.length === 1 ? order[0] : order.length === 2 && order[0].nullsFlag ? order[1] : null;
+    const orderKey = keyOrder ? values(keyOrder.name) : null;
     const cols = new Map(t.cols), owned = t === this ? [] : [...t.owned];
     if (t !== this) t.owned = [];
     const KEEPS_KIND = new Set(['lag', 'lead', 'first_value', 'last_value', 'nth_value', 'min', 'max', 'percentile_disc']);
@@ -1449,18 +1481,22 @@ export class Table {
       if (cols.has(it.name)) throw new Error(`vectro: column "${it.name}" already exists`);
       const src = it.arg && KEEPS_KIND.has(it.fn) ? t.cols.get(it.arg) : null; // (text stays text, dates stay dates)
       let arg = it.arg ? values(it.arg) : null, codeOf = null;
-      if ((it.fn === 'min' || it.fn === 'max') && src?.dict) { // text: by its labels' order (missing text skipped), then back to codes
+      if ((it.fn === 'min' || it.fn === 'max' || it.fn === 'percentile_disc') && src?.dict) { // text: by its labels' order (missing text skipped), then back to codes
         const rank = labelRanks(src.dict);
         codeOf = new Float64Array(src.dict.length);
         rank.forEach((r, code) => { if (r === r) codeOf[r] = code; });
         arg = arg.map((code) => (code === code ? rank[code] : NaN));
       }
-      let vals = windowValues(n, b, { ...it, arg }, order.length > 0, orderKey, order[0]?.desc);
+      const textDef = typeof it.def === 'string'; // (LAG(s, 1, 'none'): filled in below, as a label)
+      if (textDef && !src?.dict) throw new Error(`vectro: ${it.fn}(): a text default needs a text column, not "${it.arg}"`);
+      if (!textDef && it.def !== undefined && src?.dict) throw new Error(`vectro: ${it.fn}(): the default of the text column "${it.arg}" must be text`);
+      let vals = windowValues(n, b, { ...it, arg, def: textDef ? undefined : it.def }, order.length > 0, orderKey, keyOrder?.desc);
       if (codeOf) vals = vals.map((r) => (r === r ? codeOf[r] : NaN));
       let dict = src?.dict ?? null, codes = src?.codes ?? null;
-      if (dict && vals.includes(NaN)) { // no row (LAG past the start, an empty frame): missing text, ''
-        let e = codes.get('');
-        if (e === undefined) { dict = [...dict, '']; codes = new Map(codes).set('', dict.length - 1); e = dict.length - 1; }
+      if (dict && vals.includes(NaN)) { // no row (LAG past the start, an empty frame): the default, or missing text ''
+        const fill = textDef ? it.def : '';
+        let e = codes.get(fill);
+        if (e === undefined) { dict = [...dict, fill]; codes = new Map(codes).set(fill, dict.length - 1); e = dict.length - 1; }
         for (let i = 0; i < n; i++) if (vals[i] !== vals[i]) vals[i] = e;
       }
       const data = engine.alloc(t.type, n);
@@ -1650,7 +1686,14 @@ export class Table {
     // rows in one part only (an outer join's unmatched rows are often none): that part as it is
     const full = parts.filter((p) => p.n > 0);
     const keep = full.length === 1 ? full[0] : null;
-    try { return keep ?? copyRows(this.engine, parts.map((t) => [t, 0, t.n])); } finally { for (const p of parts) if (p !== keep && p.owned.length) p.dispose(); }
+    try {
+      const out = keep ?? copyRows(this.engine, parts.map((t) => [t, 0, t.n]));
+      for (const nm of names) { // (a date column on any side, NULL on another: dates)
+        const c = out.cols.get(nm);
+        if (!c.date && !c.dict && parts.some((p) => p.cols.get(nm).date)) out.cols.set(nm, { ...c, date: true });
+      }
+      return out;
+    } finally { for (const p of parts) if (p !== keep && p.owned.length) p.dispose(); }
   }
   async _concatAsync(others) { return this._concat(others); }
 
@@ -1942,6 +1985,7 @@ export class Table {
 
   // Free the columns this table allocated (shared columns stay alive).
   dispose() {
+    DROPPED.get(this.engine)?.registry.unregister(this.#own);
     for (const name of this.owned) {
       const c = this.cols.get(name);
       if (c?.data) this.engine.free(c.data);
@@ -1952,6 +1996,91 @@ export class Table {
     this.owned = [];
     this.ownedBuffers = [];
   }
+}
+
+// A table dropped without dispose() (one made inside a chain, as in t.sort(...).head(20), can't
+// be disposed) has its engine memory freed once it is collected: before, it stayed until
+// engine.close(). The JS heap doesn't see engine memory, so this is a backstop and dispose()
+// still frees at once. A view shares its source's arrays without referencing the source, so a
+// block is freed only when no live table's column and no array column() handed out lies in it;
+// otherwise it waits for the next try. An array is freed only while its allocation is still the
+// one at its place: a table that gave its columns to another (and still lists them) doesn't free
+// them a second time, or free memory given to something else since. Nothing is freed while a
+// query runs.
+const DROPPED = new WeakMap(); // engine -> { registry, tables: Set<WeakRef<Table>>, handed: Set<WeakRef<array>>, pending, timer }
+function dropState(engine) {
+  let s = DROPPED.get(engine);
+  if (!s) {
+    s = { tables: new Set(), handed: new Set(), pending: [], timer: null };
+    s.registry = new FinalizationRegistry((own) => { s.pending.push(own); later(engine, s, 0); });
+    DROPPED.set(engine, s);
+  }
+  return s;
+}
+function track(table, own) {
+  const s = dropState(table.engine);
+  s.tables.add(new WeakRef(table));
+  if (s.tables.size > 2 * (s.seen ?? 64)) prune(s); // (dead references, also between collections)
+  if (own.owned.length || own.ownedBuffers.length) s.registry.register(table, own, own);
+}
+function handOut(engine, ta) {
+  // (its own view object, not the table's: the table's record holds those, so a reference to
+  // one couldn't tell whether the caller still uses it)
+  const view = new ta.constructor(ta.buffer, ta.byteOffset, ta.length);
+  const info = engine.allocInfo?.get(ta);
+  if (info) engine.allocInfo.set(view, info);
+  dropState(engine).handed.add(new WeakRef(view));
+  return view;
+}
+function prune(s) {
+  for (const r of s.tables) if (!r.deref()) s.tables.delete(r);
+  for (const r of s.handed) if (!r.deref()) s.handed.delete(r);
+  s.seen = s.tables.size;
+}
+function later(engine, s, ms) {
+  if (s.timer && s.due <= Date.now() + ms) return;
+  clearTimeout(s.timer);
+  s.due = Date.now() + ms;
+  s.timer = setTimeout(() => { s.timer = null; sweep(engine, s); }, ms);
+  s.timer.unref?.();
+}
+function sweep(engine, s) {
+  const state = engine._state;
+  if (state === 'closed') { s.pending = []; return; }
+  if (state === 'busy') return later(engine, s, 50);
+  const blocks = []; // [array, start, end] the dropped tables own
+  const span = (ta) => {
+    const info = engine.allocInfo.get(ta), start = info?.ptr ?? ta.byteOffset;
+    return [start, start + (info ? info.n * info.Type.BYTES_PER_ELEMENT : ta.byteLength)];
+  };
+  const waiting = [];
+  for (const own of s.pending) {
+    for (const name of own.owned) {
+      const data = own.cols.get(name)?.data;
+      if (!data) continue;
+      blocks.push([data, ...span(data)]);
+      for (const m of MASKS.get(data)?.values() ?? []) blocks.push([m, ...span(m)]);
+      MASKS.delete(data);
+    }
+    for (const b of own.ownedBuffers) blocks.push([b, ...span(b)]);
+  }
+  s.pending = [];
+  if (!blocks.length) return;
+  prune(s);
+  const used = [];
+  for (const r of s.tables) {
+    const t = r.deref();
+    if (t) for (const c of t.cols.values()) { if (c.data) used.push(span(c.data)); if (c.strings) used.push(span(c.strings)); }
+  }
+  for (const r of s.handed) { const a = r.deref(); if (a) used.push(span(a)); }
+  for (const [ta, start, end] of blocks) {
+    if (!engine._allocated(ta)) continue; // (freed already: another table took it over; or not one allocation, which is left alone)
+    if (used.some(([a, b]) => a < end && start < b)) waiting.push(ta);
+    else engine.free(ta);
+  }
+  // (still in use: tried again later, less often while it stays in use)
+  s.wait = waiting.length ? Math.min(2 * (s.wait || 500), 60000) : 0;
+  if (waiting.length) { s.pending.push({ cols: new Map(), owned: [], ownedBuffers: waiting }); later(engine, s, s.wait); }
 }
 
 // A view over slices (a stream's rows for one query): free the filter masks made for it and
@@ -1974,7 +2103,7 @@ function hiddenView(c) {
 
 const RESERVED = new Set(['Infinity', 'NaN']); // (function names are fine: sum(...) is a call, sum a column)
 function checkName(name) {
-  if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _)`);
+  if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _, starting with a letter or _)`);
 }
 
 // A category column used as a number (city > 0, price + city, -city) would use its codes, which
@@ -2112,8 +2241,8 @@ const TEXT_FNS = {
   endsWith: (label, [p]) => label.endsWith(p),
   contains: (label, [p]) => label.includes(p),
   in: (label, list) => list.includes(label),
-  like: (label, [pattern], re) => re.test(label),
-  ilike: (label, [pattern], re) => re.test(lowerAll(label)), // (both lowercased, as DuckDB's ILIKE: the pattern below)
+  like: (label, [pattern], matches) => matches(label),
+  ilike: (label, [pattern], matches) => matches(lowerAll(label)), // (both lowercased, as DuckDB's ILIKE: the pattern below)
 };
 // lowercase one character at a time, as DuckDB's lower(): 'İ' is 'i', a final 'Σ' is 'σ'
 export const lowerAll = (s) => s.replace(/[\u0130\u03a3]/g, (c) => (c === '\u0130' ? 'i' : '\u03c3')).toLowerCase();
@@ -2129,10 +2258,11 @@ function textCall(n, cols, src) {
   if (c?.strings) throw new Error(`vectro: "${colNode.name}" is a free-text column; ${n.fn}() needs a category column (load it as types: { ${colNode.name}: 'category' })`);
   if (!c?.dict) throw new SyntaxError(`vectro: ${n.fn}() needs a text column first, then text in quotes, in "${src}"`);
   if (!rest.length || rest.some((a) => a.t !== 'str')) throw new SyntaxError(`vectro: ${n.fn}(${colNode.name}, …) needs text in quotes after the column, in "${src}"`);
-  if (n.fn !== 'in' && rest.length !== 1) throw new SyntaxError(`vectro: ${n.fn}() takes a column and one text, in "${src}"`);
+  const like = n.fn === 'like' || n.fn === 'ilike'; // (like(s, pattern, escape): the escape is optional)
+  if (n.fn !== 'in' && !(rest.length === 1 || (like && rest.length === 2))) throw new SyntaxError(`vectro: ${n.fn}() takes a column and one text${like ? ' (and, optionally, an escape character)' : ''}, in "${src}"`);
   const args = rest.map((a) => a.v);
-  const re = n.fn === 'like' || n.fn === 'ilike' ? new RegExp(`^${(n.fn === 'ilike' ? lowerAll(args[0]) : args[0]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '[\\s\\S]*').replace(/_/g, '[\\s\\S]')}$`, 'u') : null; // (u: _ is one character, an emoji too)
-  const match = c.dict.map((label) => TEXT_FNS[n.fn](label, args, re));
+  const matches = like ? (n.fn === 'ilike' ? likeMatcher(lowerAll(args[0]), lowerAll(args[1] ?? '')) : likeMatcher(args[0], args[1] ?? '')) : null;
+  const match = c.dict.map((label) => TEXT_FNS[n.fn](label, args, matches));
   // runs of consecutive codes that match (or, if shorter, that don't)
   const runs = (want) => {
     const out = [];
@@ -2272,7 +2402,7 @@ function percentileRanks(sizes, items) {
   const wants = [];
   const plan = items.map((it) => Array.from(sizes, (m, k) => {
     if (!m) return null;
-    if (it.fn === 'percentile_disc') { wants.push([k, Math.max(0, Math.ceil(it.p * m) - 1)]); return { at: wants.length - 1 }; }
+    if (it.fn === 'percentile_disc') { wants.push([k, discRank(it.p, m, it.desc)]); return { at: wants.length - 1 }; }
     const r = it.p * (m - 1), lo = Math.floor(r);
     wants.push([k, lo]);
     if (lo + 1 < m && r > lo) { wants.push([k, lo + 1]); return { at: wants.length - 2, frac: r - lo }; }
@@ -2282,7 +2412,7 @@ function percentileRanks(sizes, items) {
 }
 // Each item's value per partition, from the values found for the wanted ranks.
 function percentileValues(plan, got) {
-  return plan.map((ws) => Float64Array.from(ws, (w) => (!w ? NaN : w.frac ? got[w.at] + w.frac * (got[w.at + 1] - got[w.at]) : got[w.at])));
+  return plan.map((ws) => Float64Array.from(ws, (w) => (!w ? NaN : w.frac ? between(got[w.at], got[w.at + 1], w.frac) : got[w.at])));
 }
 // Key k of each kept group: from keys stored side by side (kv[g * nk + k]),
 // or from a direct group number (g / below % size steps from the offset).

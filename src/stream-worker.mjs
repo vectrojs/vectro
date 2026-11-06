@@ -12,7 +12,7 @@ import { FrameReader } from './frames.mjs';
 import { ArrowReader } from './arrow.mjs';
 import { parse, isMask } from './fuse.mjs';
 import { SKETCH_SIZE, sketchAdd, sketchMerge, hashNumber, hashText } from './sketch.mjs';
-import { csvTail, CSV_FIELD_START } from './csv-kernel.mjs';
+import { csvTail, csvRowEnds, CSV_FIELD_START } from './csv-kernel.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
@@ -103,6 +103,8 @@ export function createStreams(getEngine) {
       return;
     }
     const engine = getEngine();
+    bytes = dropBlankRows(bytes);
+    if (!bytes.length) return;
     const buf = new Uint8Array(s.header.length + bytes.length);
     buf.set(s.header, 0);
     buf.set(bytes, s.header.length);
@@ -112,6 +114,23 @@ export function createStreams(getEngine) {
     } finally {
       t.dispose();
     }
+  }
+
+  // CSV rows that are blank (a heartbeat newline): left out, as JSON lines streams skip blank lines;
+  // parsed, each was a row of missing values. A blank row is "\n" or "\r\n" outside quotes.
+  function dropBlankRows(bytes) {
+    const keep = [];
+    let from = 0, blank = false;
+    csvRowEnds(bytes, 0, bytes.length, COMMA, (at) => {
+      if (at - from === 1 || (at - from === 2 && bytes[from] === 13)) blank = true; else keep.push([from, at]);
+      from = at;
+    });
+    if (!blank) return bytes;
+    if (from < bytes.length) keep.push([from, bytes.length]);
+    const out = new Uint8Array(keep.reduce((a, [x, y]) => a + y - x, 0));
+    let o = 0;
+    for (const [x, y] of keep) { out.set(bytes.subarray(x, y), o); o += y - x; }
+    return out;
   }
 
   // Append m parsed rows. part(k) gives column k's values (and, for
@@ -172,7 +191,28 @@ export function createStreams(getEngine) {
     if (s.keepMs != null) {
       const ts = getEngine().live(s.cols.get(s.timeColumn).data), oldest = Math.max(s.maxTime, s.newest) - s.keepMs;
       while (s.start < s.n && ts[s.start] < oldest) s.start++;
+      dropLate(s, oldest);
     }
+  }
+  // Rows that arrived late with an old time sit behind newer ones, where the
+  // trim above doesn't reach. A block whose smallest time is older than the
+  // cutoff holds one: the rows after it are moved up over such rows, in order.
+  function dropLate(s, oldest) {
+    const engine = getEngine(), z = s.zones.get(s.timeColumn), ts = engine.live(s.cols.get(s.timeColumn).data);
+    let first = -1;
+    for (let b = Math.floor(s.start / ZONE_ROWS); b * ZONE_ROWS < s.n && first < 0; b++) {
+      if (!(z.mins[b] < oldest)) continue;
+      for (let i = Math.max(s.start, b * ZONE_ROWS), e = Math.min(s.n, (b + 1) * ZONE_ROWS); i < e; i++) if (ts[i] < oldest) { first = i; break; }
+    }
+    if (first < 0) return;
+    const keep = [];
+    for (let i = first; i < s.n; i++) if (!(ts[i] < oldest)) keep.push(i); // (missing times are kept, as before)
+    for (const c of s.cols.values()) { const d = engine.live(c.data); keep.forEach((r, j) => { d[first + j] = d[r]; }); }
+    keep.forEach((r, j) => { s.pos[first + j] = s.pos[r]; });
+    s.n = first + keep.length;
+    const b0 = Math.floor(first / ZONE_ROWS); // (zone maps from that block on: rebuilt)
+    for (const zz of s.zones.values()) { zz.mins.length = b0; zz.maxs.length = b0; }
+    updateZones(s, b0 * ZONE_ROWS, s.n - b0 * ZONE_ROWS);
   }
 
   // Parse up to `limit` bytes of queued lines (everything by default).
@@ -223,6 +263,9 @@ export function createStreams(getEngine) {
     schedule(s);
     if (s.pendingBytes > HIGH && !s.paused && s.sockets.length) { s.paused = true; for (const socket of s.sockets) socket.pause(); }
   }
+
+  // (a UTF-8 BOM before a sender's first row: dropped, it would go into the first value)
+  const noBOM = (b) => (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf ? b.subarray(3) : b);
 
   // Bytes cut anywhere: keep what follows the last row end for next time
   // (CSV: the last newline outside quotes, with the quote state carried on).
@@ -372,7 +415,7 @@ export function createStreams(getEngine) {
     const dictBy = w.by ? s.cols.get(w.by).dict : null;
     const derived = [];
     const vals = w.sketches.map(({ arg }, j) => {
-      const name = arg.trim(), c = /^[A-Za-z_]\w*$/.test(name) ? s.cols.get(name) : null;
+      const name = arg.trim(), c = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(name) ? s.cols.get(name) : null;
       if (c) return { data: engine.live(c.data).subarray(from, from + m), dict: c.dict };
       const d = t.derive(`__np_s${j}`, arg);
       derived.push(d);
@@ -464,7 +507,7 @@ export function createStreams(getEngine) {
       return new Promise((resolve, reject) => {
         const socket = net.connect({ host, port }, () => resolve(true));
         if (s.format === 'vectro' || s.format === 'arrow') { const reader = frameReceiver(s); socket.on('data', (chunk) => receiveFrames(s, reader, chunk)); } else
-        socket.on('data', (chunk) => receive(s, chunk));
+        { let first = true; socket.on('data', (chunk) => { if (first && chunk.length) { first = false; chunk = noBOM(chunk); } receive(s, chunk); }); }
         socket.on('end', () => { if (s.partial) { queue(s, concat([s.partial, Uint8Array.of(NL)])); s.partial = null; s.quote = CSV_FIELD_START; } flush(s); });
         socket.on('error', (err) => { s.error ??= err.message; reject(err); });
         s.sockets.push(socket);
@@ -556,7 +599,7 @@ export function createStreams(getEngine) {
       const reader = s.format === 'vectro' || s.format === 'arrow' ? frameReceiver(s) : null;
       ws.onmessage = (ev) => {
         if (reader) { if (typeof ev.data !== 'string') receiveFrames(s, reader, new Uint8Array(ev.data)); return; }
-        const bytes = typeof ev.data === 'string' ? textEncoder.encode(ev.data) : new Uint8Array(ev.data);
+        const bytes = noBOM(typeof ev.data === 'string' ? textEncoder.encode(ev.data) : new Uint8Array(ev.data));
         if (!bytes.length) return;
         queue(s, bytes[bytes.length - 1] === NL ? bytes : concat([bytes, Uint8Array.of(NL)]));
       };

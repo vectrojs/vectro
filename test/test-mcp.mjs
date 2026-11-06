@@ -51,7 +51,7 @@ expect('unknown method', (await rpc('no/such', {})).error?.code === -32601);
 let r = await call('load_file', { path: 'orders.csv' });
 expect('load csv', !r.error && r.data.rows === 5000 && r.data.columns.region === 'category' && r.data.sample.length === 5, r.text);
 r = await call('load_file', { path: 'events.jsonl', name: 'events' });
-expect('load jsonl', !r.error && r.data.rows === 5000 && r.data.skipped_lines === 1 && !('extra' in r.data.columns), r.text);
+expect('load jsonl', !r.error && r.data.rows === 5000 && r.data.skipped_lines === 1 && r.data.columns.extra === 'category' && r.data.sample[0].extra === '{"nested":true}', r.text); // (a nested key: its JSON text)
 
 const sum = (f) => rows.filter(f).reduce((a, x) => a + x.price * x.qty, 0);
 r = await call('query', { table: 'orders', filter: "region == 'EU' && price > 500", aggregates: { revenue: 'sum(price * qty)', n: 'count()' } });

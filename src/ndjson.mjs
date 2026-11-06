@@ -13,14 +13,19 @@ const NL = 10, CR = 13, SPACE = 32, TAB = 9, QUOTE = 34, BACKSLASH = 92, COMMA =
 const LBRACE = 123, RBRACE = 125, LBRACKET = 91, RBRACKET = 93;
 const isSpace = (c) => c === SPACE || c === TAB || c === CR || c === NL;
 const unescapeJSON = (raw) => JSON.parse(`"${raw}"`);
+// The kind a JSON text value asks for: 'number' when Number() reads it ("2", " 1e3 "), 'blank'
+// for blank text (missing in either kind), else 'category'. Numeric strings go into number columns.
+export const textKind = (s) => (!s.trim() ? 'blank' : Number.isNaN(Number(s)) ? 'category' : 'number');
+const RANK = { blank: 0, number: 1, category: 2 };
 
 // names: column names; kinds: 'number' | 'category' | 'date' for each
 // (dates: ISO text or ms numbers, as ms).
 // Returns { rows, cols: Float64Array[], dicts: (string[] | null)[], bad }.
 // report (optional, an object): filled with text (a Uint8Array, 1 for a number column that got
-// text that isn't a number) and extra (a Map: each other key with plain values -> 'number' or
-// 'category', as its values look), so a caller can load the lines again with those kinds.
-export function parseNDJSON(bytes, start, end, names, kinds, report = null) {
+// text that isn't a number) and extra (a Map: each other key with plain values -> 'number',
+// 'category' or 'blank' (only blank text), as its values look), so a caller can load the lines again with those kinds.
+// nestedText: a nested value in a text column is its JSON text (loading a file; streams leave it missing).
+export function parseNDJSON(bytes, start, end, names, kinds, report = null, { nestedText = false } = {}) {
   const k = names.length;
   const keyBytes = names.map((n) => encode(n));
   let cap = 1;
@@ -41,7 +46,7 @@ export function parseNDJSON(bytes, start, end, names, kinds, report = null) {
     extraKeys.push([bytes.slice(s, e), name]);
     return name;
   };
-  const noteExtra = (name, kind) => { if (extra.get(name) !== 'category') extra.set(name, kind); };
+  const noteExtra = (name, kind) => { if (!extra.has(name) || RANK[kind] > RANK[extra.get(name)]) extra.set(name, kind); };
 
   // Which column does the key in bytes[s, e) name? (-1: not wanted)
   const columnOf = (s, e, j) => {
@@ -63,6 +68,7 @@ export function parseNDJSON(bytes, start, end, names, kinds, report = null) {
     let eol = i;
     while (eol < end && bytes[eol] !== NL) eol++;
     let p = i;
+    if (bytes[p] === 0xef && bytes[p + 1] === 0xbb && bytes[p + 2] === 0xbf && p + 2 < eol) p += 3; // (a UTF-8 BOM: at the start of a file, or of one joined onto another)
     while (p < eol && isSpace(bytes[p])) p++;
     if (p === eol) { i = eol + 1; continue; } // blank line
     const row = rows;
@@ -98,15 +104,19 @@ export function parseNDJSON(bytes, start, end, names, kinds, report = null) {
           if (dicts[c]) cols[c][row] = dicts[c].code(vs, p, esc);
           else if (isDate[c]) cols[c][row] = parseDateBytes(bytes, vs, p);
           else {
-            cols[c][row] = esc ? Number(unescapeJSON(decodeLatin(bytes, vs, p))) || NaN : parseNumber(bytes, vs, p);
+            const x = esc ? unescapeJSON(decodeLatin(bytes, vs, p)) : null;
+            cols[c][row] = esc ? (x.trim() ? Number(x) : NaN) : parseNumber(bytes, vs, p);
             if (text && p > vs && cols[c][row] !== cols[c][row]) text[c] = 1; // (text that isn't a number)
           }
           seen[c] = 1;
-        } else if (extra) noteExtra(extraName(ks, kEnd, kEsc), 'category');
+        } else if (extra) noteExtra(extraName(ks, kEnd, kEsc), textKind(esc ? unescapeJSON(decodeLatin(bytes, vs, p)) : decodeLatin(bytes, vs, p)));
         p++;
-      } else if (b === LBRACE || b === LBRACKET) { // nested: skip it
+      } else if (b === LBRACE || b === LBRACKET) { // nested: missing (nestedText: its JSON text in a text column)
+        const vs = p;
         p = skipNested(bytes, p, eol);
         if (p < 0) { ok = false; break; }
+        if (c >= 0 && dicts[c] && nestedText) { cols[c][row] = dicts[c].code(vs, p, false); seen[c] = 1; }
+        else if (c < 0 && extra) noteExtra(extraName(ks, kEnd, kEsc), 'category'); // (a key first seen so, after the first lines)
       } else {
         const vs = p;
         while (p < eol && bytes[p] !== COMMA && bytes[p] !== RBRACE && !isSpace(bytes[p])) p++;

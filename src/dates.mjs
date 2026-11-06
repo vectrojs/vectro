@@ -83,7 +83,7 @@ export function parseDateText(s) {
 }
 
 // Does this text look like an ISO date (for guessing CSV column types)?
-export const looksLikeDate = (s) => /^\s*"?[+-]?\d{4,}-\d\d-\d\d([Tt ]\d\d:\d\d(:\d\d([.,]\d+)?)?([Zz]|[+-]\d\d:?\d\d)?)?"?\s*$/.test(s) && !Number.isNaN(parseDateText(s));
+export const looksLikeDate = (s) => /^\s*"?[+-]?\d{4,}-\d\d-\d\d([Tt ]\d\d:\d\d(:\d\d([.,]\d+)?)?([Zz]|[+-]\d\d(:?\d\d)?)?)?"?\s*$/.test(s) && !Number.isNaN(parseDateText(s));
 
 // A value given for a date: Date object, ISO text or milliseconds.
 export function toMillis(v) {
@@ -136,6 +136,22 @@ export const DATE_FNS = {
 };
 // functions whose result is itself a date
 export const DATE_RESULT = new Set(['dayStart', 'hourStart', 'weekStart', 'monthStart', 'yearStart', 'date']);
+// Is an expression's value a date? A date column, a function above, or a choice
+// among dates: coalesce, min, max or ? : whose every value is a date or a missing
+// / infinite constant (and one at least a date). isDateVar(name): is that column one.
+export function isDateAst(n, isDateVar) {
+  const kind = (x) => { // 'date', 'none' (NaN or ±Infinity: no kind of its own) or null (a number)
+    if (x.t === 'var') return isDateVar(x.name) ? 'date' : null;
+    if (x.t === 'call' && DATE_RESULT.has(x.fn)) return 'date';
+    if (x.t === 'num') return Number.isFinite(x.v) ? null : 'none';
+    if (x.t === 'un' && x.op === '-' && x.x.t === 'num') return Number.isFinite(x.x.v) ? null : 'none'; // (-Infinity)
+    const parts = x.t === 'cond' ? [x.x, x.y] : x.t === 'call' && (x.fn === 'coalesce' || x.fn === 'min' || x.fn === 'max') ? x.args : null;
+    if (!parts) return null;
+    const ks = parts.map(kind);
+    return ks.includes(null) ? null : ks.includes('date') ? 'date' : 'none';
+  };
+  return kind(n) === 'date';
+}
 
 // Times in milliseconds need about 41 bits; float32 keeps 24, so a date column
 // in a Float32Array table would be off by seconds to minutes: refused.
