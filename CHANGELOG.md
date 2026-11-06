@@ -7,6 +7,10 @@ Fixes from audit round 5 (the six worst bugs first).
 - LIKE and ILIKE (in SQL and in `like()` / `ilike()`) match in linear time.
   They were a backtracking regular expression: `LIKE '%a%e%o%zzz'` on 4 KB of
   ordinary text took 10 seconds.
+- On a dataset, `date - date` (and `date - DATE '...'`) gives days, as on a
+  table; it gave milliseconds. Each chunk now records whether a date column
+  holds whole days; files written before are read from their encoding. The
+  PostgreSQL, Flight and OData servers report those columns as `date` too.
 
 ## 0.1.4
 

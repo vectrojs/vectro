@@ -236,10 +236,13 @@ export class DatasetWriter {
         plainInto(engine, c, lo, hi, out, f32);
         if (m.kind === 'category') remapCodes(out, c.dict, this.labels.get(m.name));
       }
+      const dates = new Set(this.meta.columns.filter((m) => m.kind === 'date').map((m) => m.name));
       for (const [name, c] of cols) {
         c.data = engine.live(c.data);
-        const [min, max, missing] = n ? engine.eval(['min(v == v ? v : Infinity)', 'max(v == v ? v : -Infinity)', 'count(v != v)'], { v: c.data }) : [Infinity, -Infinity, 0];
+        const date = dates.has(name);
+        const [min, max, missing, offDay = 0] = n ? engine.eval(['min(v == v ? v : Infinity)', 'max(v == v ? v : -Infinity)', 'count(v != v)', ...(date ? ['count(v == v && v != floor(v / 86400000) * 86400000)'] : [])], { v: c.data }) : [Infinity, -Infinity, 0];
         chunk.cols[name] = { min: jsonNumber(min), max: jsonNumber(max), missing };
+        if (date) chunk.cols[name].day = offDay === 0; // (every time at midnight: a column of days, so DATE - DATE is days)
         if (n > BLOCK) { const z = computeZones(engine.live(c.data), n, BLOCK); chunk.cols[name].blocks = { min: Array.from(z.mins, jsonNumber), max: Array.from(z.maxs, jsonNumber) }; }
       }
       if (n && cols.size) ct.compress(); // (no number or category columns: nothing to pack)

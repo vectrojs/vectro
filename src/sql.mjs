@@ -558,7 +558,7 @@ function columnType(t, name) {
   else if (c.dict || c.strings) type = 'text';
   else if (t.isDataset) { // from the chunks' encodings: whole-number codes
     const enc = (t.meta?.chunks ?? []).map((ch) => ch.cols?.[name]);
-    if (c.date) type = 'date';
+    if (c.date) type = enc.length && enc.every((z) => z && (z.day ?? (z.missing === z.rows || (z.enc && !z.enc.div && (z.enc.mul ?? 1) % 86_400_000 === 0 && (z.enc.base ?? 0) % 86_400_000 === 0)))) ? 'day' : 'date'; // (files written before the day flag: from the encoding)
     else type = enc.length && enc.every((z) => z && (z.missing === z.rows || (z.enc && !z.enc.div && Number.isInteger(z.enc.mul ?? 1) && Number.isInteger(z.enc.base ?? 0)))) ? 'int' : 'float';
   } else if (t.engine?.busy) type = scanType(t, c); // (a sync agg() can't run now)
   else if (c.date) type = t.length && t.agg({ n: `count(${name} == ${name} && ${name} != dayStart(${name}))` }).n === 0 ? 'day' : 'date';
