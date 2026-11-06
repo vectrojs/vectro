@@ -181,6 +181,12 @@ Fixes from audit round 5.
   works; it failed with "s_right is a text column". `groupBy('s').agg({ s:
   ... })` (an aggregation named like a key) is refused, as on a table; on a
   dataset it put the sums where the keys should be.
+- CSV: a file whose lines end in CR alone (old Mac files) loads its rows, in
+  `parseCSV`, `readCSV`, `csvToDataset` and split tables; it loaded as one
+  header line and no rows, with no error.
+- `tableFromRows`: the columns are every key of any row (missing where a row
+  lacks one); keys first seen after the first row were dropped. A number in a
+  text column is its text (`'5'`); it stayed a number.
 
 ## 0.1.4
 

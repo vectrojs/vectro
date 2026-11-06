@@ -38,7 +38,7 @@ import { KINDS, decodeOne } from './pack.mjs';
 import { conditions, mayMatch, computeZones } from './zones.mjs';
 import { STR_SHIFT, STR_ESCAPED, csvRowEnds } from './csv-kernel.mjs';
 import { trackAsyncMethods } from './engine.mjs';
-import { inspectCSV, loadBytes, loadBytesAsync } from './csv.mjs';
+import { inspectCSV, loadBytes, loadBytesAsync, crOnlyToLF } from './csv.mjs';
 import { freeBuild } from './join.mjs';
 import { copyRows, plainInto, remapCodes, textLength } from './rows.mjs';
 export { copyRows };
@@ -1752,12 +1752,20 @@ export async function csvToDatasetAsync(engine, csv, out, opts = {}) {
 // opts.onProgress({ bytes, size, rows }) is called after each piece.
 function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = true, delimiter = ',', types = {}, sampleRows, rowsPerChunk, bitPack, append, onProgress, ...rest } = {}) {
   try {
-    let pos = 0, carry = new Uint8Array(0), head = new Uint8Array(0), kinds = null;
+    let pos = 0, carry = new Uint8Array(0), head = new Uint8Array(0), kinds = null, crOnly = null;
+    const last0 = (at) => at >= size;
     while (true) {
       const want = Math.min(pieceBytes, size - pos);
       const buf = new Uint8Array(carry.length + want);
       buf.set(carry, 0);
       yield { read: buf.subarray(carry.length), pos };
+      // (CR-only line ends, decided on the first piece: every piece's CRs become LFs, see crOnlyToLF)
+      const fresh = buf.subarray(carry.length);
+      if (crOnly === null) { // (on the first piece with an LF, or a CR that isn't its last byte: an LF may follow it)
+        const cr = fresh.indexOf(13);
+        if (fresh.includes(10) || (cr !== -1 && cr < fresh.length - 1) || last0(pos + want)) crOnly = crOnlyToLF(buf); // (the carry too: nothing was parsed yet)
+      }
+      else if (crOnly) for (let i = fresh.indexOf(13); i !== -1; i = fresh.indexOf(13, i + 1)) fresh[i] = 10;
       pos += want;
       const last = pos >= size;
       let start = 0;

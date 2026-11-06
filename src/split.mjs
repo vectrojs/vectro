@@ -16,7 +16,7 @@
 // filtered table that collect() makes is still spread over every worker.
 // The page remembers rows per block ("segments") to put rows back in order.
 import { Engine as LocalEngine, trackAsyncMethods } from './engine.mjs';
-import { inspectCSV } from './csv.mjs';
+import { inspectCSV, crOnlyToLF } from './csv.mjs';
 import { encode, countByte } from './bytes.mjs';
 import { csvRowEnds, csvTail, CSV_FIELD_START } from './csv-kernel.mjs';
 import { parse, toSource } from './fuse.mjs';
@@ -204,7 +204,8 @@ export class SplitEngine {
 
   async parseCSVAsync(text, opts = {}) {
     await this.ready;
-    const bytes = typeof text === 'string' ? encode(text) : text;
+    let bytes = typeof text === 'string' ? encode(text) : text;
+    if (bytes.indexOf(10) === -1 && bytes.indexOf(13) !== -1) { bytes = Uint8Array.prototype.slice.call(bytes); crOnlyToLF(bytes); } // (CR-only line ends: on a copy, the bytes are the caller's)
     const info = inspectCSV(bytes, opts);
     const f32 = opts.type === Float32Array; // (a guessed free-text column: a category there, as readCSV loads it)
     const types = Object.fromEntries(info.names.map((nm, f) => [nm, f32 && info.kinds[f] === 'string' ? 'category' : info.kinds[f]]));

@@ -96,6 +96,8 @@ if (MODE === 'node') {
     await st.push(text);
     same(await (await st.snapshotAsync()).toRowsAsync(), [{ a: 1, b: 'x' }, { a: 2, b: 'y' }], `${format} stream: a BOM before the first row`);
   }
+  const cr = await se.parseCSVAsync('a,b\r1,x\r2,y\r');
+  same(await cr.toRowsAsync(), [{ a: 1, b: 'x' }, { a: 2, b: 'y' }], 'split table: CSV with CR-only line ends');
   await se.close();
   rmSync(dir, { recursive: true, force: true });
 }

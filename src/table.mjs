@@ -114,20 +114,22 @@ export class Table {
     return compress ? t.compress() : t;
   }
 
-  // Convert an array of objects. Column types come from the first row.
+  // Convert an array of objects. The columns are every key of any row (in the order they first appear;
+  // missing where a row lacks one), each typed by its first value that isn't null.
   static fromRows(engine, rows, { type = Float64Array } = {}) {
     if (!rows.length) throw new TypeError('vectro: no rows');
     const n = rows.length;
     const cols = new Map();
-    for (const name of Object.keys(rows[0])) checkName(name); // (checked before anything is copied)
+    const names = [...new Set(rows.flatMap((r) => Object.keys(r)))]; // (keys first seen after row 1 were dropped)
+    for (const name of names) checkName(name); // (checked before anything is copied)
     try {
-      for (const name of Object.keys(rows[0])) {
+      for (const name of names) {
         const data = engine.alloc(type, n);
         const first = firstPresent(rows.map((r) => r[name]));
         if (typeof first === 'string') {
           const codes = new Map(), dict = [];
           for (let i = 0; i < n; i++) {
-            const s = rows[i][name] ?? ''; // (null / undefined: missing text)
+            const v = rows[i][name], s = v === null || v === undefined ? '' : v instanceof Date ? v.toISOString() : String(v); // (null / undefined: missing text; a number among text is its text)
             let c = codes.get(s);
             if (c === undefined) { c = dict.length; dict.push(s); codes.set(s, c); }
             data[i] = c;
