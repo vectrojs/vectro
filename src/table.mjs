@@ -1974,7 +1974,10 @@ export class Table {
 // engine.close(). The JS heap doesn't see engine memory, so this is a backstop and dispose()
 // still frees at once. A view shares its source's arrays without referencing the source, so a
 // block is freed only when no live table's column and no array column() handed out lies in it;
-// otherwise it waits for the next try. Nothing is freed while a query runs.
+// otherwise it waits for the next try. An array is freed only while its allocation is still the
+// one at its place: a table that gave its columns to another (and still lists them) doesn't free
+// them a second time, or free memory given to something else since. Nothing is freed while a
+// query runs.
 const DROPPED = new WeakMap(); // engine -> { registry, tables: Set<WeakRef<Table>>, handed: Set<WeakRef<array>>, pending, timer }
 function dropState(engine) {
   let s = DROPPED.get(engine);
@@ -2042,6 +2045,7 @@ function sweep(engine, s) {
   }
   for (const r of s.handed) { const a = r.deref(); if (a) used.push(span(a)); }
   for (const [ta, start, end] of blocks) {
+    if (!engine._allocated(ta)) continue; // (freed already: another table took it over; or not one allocation, which is left alone)
     if (used.some(([a, b]) => a < end && start < b)) waiting.push(ta);
     else engine.free(ta);
   }

@@ -90,6 +90,7 @@ export function serveSplitWorker(post, listen) {
       for (const name of dates) cols.get(name).date = true;
       const n = base ? base.length : (Object.values(text)[0]?.codes.length ?? 0);
       const t = new Table(engine, cols, n, { owned: [...order] });
+      if (base) base.owned = []; // (its columns are t's now)
       tables.set(id, t);
       return { n: t.length, names: t.columnNames };
     },
