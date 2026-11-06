@@ -1,16 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
-Fixes from audit round 5.
+Fixes from audit round 5: 59 bugs found by checking SQL, the dataframe API,
+datasets, streams, loading and the servers against DuckDB and plain
+JavaScript; every fix has a test in `npm test`. Some answers change on
+purpose, to match DuckDB and standard SQL:
 
+**Changed answers**
+- `CAST(x AS INTEGER)` (and the other whole-number types) rounds instead of
+  cutting the fraction off, and is missing when the value doesn't fit.
+- `%` is the exact remainder.
+- `CAST(number AS VARCHAR)` keeps every digit; true / false cast to text are
+  `'true'` / `'false'`.
+- `SELECT *` after a join names columns as SQL does (`id`, then `id_2`; it
+  was `id_right`) and keeps the right key of `ON`.
+- Column names in any script stay as written (`Größe` was `Gr__e`).
+- HTTP and MCP answers write ±Infinity as `"Infinity"` / `"-Infinity"` (it
+  was null).
+- A regular expression whose repeated group repeats itself or has `|` is
+  refused.
+- `column()` returns a new view (over the same memory) each call.
+- `||` keeps SQL's rule (a missing piece makes it missing); CONCAT skips
+  missing pieces.
+
+**SQL**
 - LIKE and ILIKE (in SQL and in `like()` / `ilike()`) match in linear time.
   They were a backtracking regular expression: `LIKE '%a%e%o%zzz'` on 4 KB of
   ordinary text took 10 seconds.
-- On a dataset, `date - date` (and `date - DATE '...'`) gives days, as on a
-  table; it gave milliseconds. Each chunk now records whether a date column
-  holds whole days; files written before are read from their encoding. The
-  PostgreSQL, Flight and OData servers report those columns as `date` too.
 - SQL: a subquery used as a value that returns more than one row (`WHERE
   price < (SELECT v FROM u)`) is an error, as in DuckDB and PostgreSQL. It
   silently joined every row to every value, so a SUM came out several times
@@ -21,18 +38,6 @@ Fixes from audit round 5.
   then ran out of memory. Other functions nested many levels deep (ROUND,
   NULLIF, %) stop at once with "the expression is too large" instead of
   hanging.
-- Datasets read asynchronously through the file descriptor they already hold.
-  On Node 25, a dataset queried with an async call and then dropped without
-  `close()` stopped the whole process at garbage collection ("A FileHandle
-  object was closed during garbage collection"). A dataset dropped without
-  `close()` now has its file closed when it is collected.
-- Writing a dataset over an existing file no longer changes it under a dataset
-  that has it open. `writeDataset`, `csvToDataset` and `createDataset` write a
-  new file beside the path and move it into place when it is complete, so an
-  open dataset keeps reading the old file. Before, it read the new bytes with
-  the old layout: rows mixed old and new values. A writer that fails or is
-  aborted leaves no file behind, and leaves the file it would have replaced
-  as it was.
 - SQL: a missing date compared with a date written as text (`d <> '2024-02-29'`,
   `NOT (d = '…')`, `d NOT IN ('…')`) is unknown, so the row is left out, as with
   `DATE '…'`. Those rows were kept.
@@ -69,50 +74,6 @@ Fixes from audit round 5.
   `'a' || SUBSTRING('a', 2)` is missing. CONCAT skips missing pieces:
   `CONCAT(UPPER(SUBSTRING(s, 1, 1)), LOWER(SUBSTRING(s, 2)))` capitalizes a
   one-letter word too.
-- A script run with `node --input-type=module -e '…'` or piped into node can
-  use worker threads: they inherited `--input-type`, which Node refuses for
-  workers, so the process stopped as soon as the first one started.
-- An async dataset query is answered only once the chunks it read ahead are
-  done. When it failed or stopped early (a limit), that reading was still on
-  the worker threads, so the next sync call was sometimes refused with "an
-  async query is running on this engine", although the query was awaited.
-- Datasets: a derive or select whose column nothing uses, followed by a limit
-  or top, no longer fails (`derive('x', 'a + b').limit(2).agg({ s: 'sum(a)' })`
-  said "unknown column b"; `select('id', 'a').top(1, '-a').agg(...)` said "no
-  column id"). Each chunk's plan now keeps only the columns used above it.
-- Datasets: a group whose values in one chunk hold both +Infinity and
-  -Infinity sums to NaN, as on a table; SUM, AVG and group sums left that
-  chunk out (a SUM of 3 instead of NaN, a group sum of 0).
-- Datasets have the documented async versions: `sortAsync`, `topAsync`,
-  `limitAsync`, `joinAsync` (the rows, in a table, as on a table), `sumAsync`,
-  `meanAsync`, `minAsync`, `maxAsync`, `explainAsync`, and
-  `groupBy(...).aggAsync` (also on lazy queries). They were missing
-  (TypeError). `count` / `countAsync` take params.
-- Streams: `keepMs` drops every row older than the newest time minus
-  `keepMs`, also rows that arrived late with an old time. Only the rows at the
-  front were dropped, so a late row from long ago stayed in "the last second"
-  and went into its totals.
-- Tables dropped without `dispose()` have their engine memory freed once
-  they are garbage collected. A table made inside a chain
-  (`t.sort(...).head(20)`) can't be disposed, and was kept until
-  `engine.close()`: 150 such calls held 460 MB, and a long-running app ran out
-  of memory. `dispose()` still frees at once and is still the way to free
-  memory soon. `column()` now returns a new array view each call (over the
-  same memory).
-- JSON lines: a numeric string (`{"x":"2"}`, `" 1e3 "`) goes into a number
-  column, as the docs say; one such value made the whole column text. Blank
-  text doesn't change a column's kind (it is missing in a number column), and
-  an escaped `"\u0030"` is 0 (it was missing).
-- A UTF-8 BOM before the first JSON lines record no longer loses that record,
-  and a BOM before the first row pushed or sent to a CSV or JSON lines stream
-  is dropped (it went into the first value, or lost the first row).
-- `writeArrow`: a text column whose first value is null is written as text
-  (it was taken for numbers, and every value was lost), and null text is
-  missing (it was written as the text "null").
-- HTTP answers (JSON, JSON lines, CSV) and the MCP tools write ±Infinity as
-  the text `"Infinity"` / `"-Infinity"` (`Infinity` / `-Infinity` in CSV).
-  They were null, the same as a missing value, so `MIN(x) = -Infinity` reached
-  Excel or an LLM as "no value". NaN is still missing.
 - SQL regular expressions (`REGEXP_MATCHES`, `REGEXP_REPLACE`,
   `REGEXP_EXTRACT`, `~`) refuse a pattern with a repeated group that itself
   repeats or has `|`, such as `(a+)+$` or `(a|aa)*`. JavaScript's regular
@@ -143,8 +104,6 @@ Fixes from audit round 5.
   exactly. It was refused. In expressions: `like(s, 'a!%', '!')`. LIKE on
   text in quotes (`'abc' LIKE 'a%'`) is worked out; it failed with an error
   that showed generated code.
-- CSV: a time with a `+hh` offset (`2024-01-02 03:04:05+00`, as PostgreSQL
-  exports a timestamptz) makes a date column; it stayed text.
 - SQL: aggregates take `FILTER (WHERE ...)` (`COUNT(*) FILTER (WHERE v > 1)`,
   `SUM(x) FILTER (...)`); it was a syntax error. An unknown function, also an
   aggregate such as `STDDEV(v)` in a GROUP BY query, says it is unknown and
@@ -175,12 +134,62 @@ Fixes from audit round 5.
   number key names the columns as written (`"b.s" and "c.s"`), not a hidden
   `__k0`, and `FULL JOIN ... USING (s)` with an empty table's column keeps the
   other side's text (it gave numbers).
+
+**Dataframe and datasets**
+- On a dataset, `date - date` (and `date - DATE '...'`) gives days, as on a
+  table; it gave milliseconds. Each chunk now records whether a date column
+  holds whole days; files written before are read from their encoding. The
+  PostgreSQL, Flight and OData servers report those columns as `date` too.
+- Datasets read asynchronously through the file descriptor they already hold.
+  On Node 25, a dataset queried with an async call and then dropped without
+  `close()` stopped the whole process at garbage collection ("A FileHandle
+  object was closed during garbage collection"). A dataset dropped without
+  `close()` now has its file closed when it is collected.
+- Writing a dataset over an existing file no longer changes it under a dataset
+  that has it open. `writeDataset`, `csvToDataset` and `createDataset` write a
+  new file beside the path and move it into place when it is complete, so an
+  open dataset keeps reading the old file. Before, it read the new bytes with
+  the old layout: rows mixed old and new values. A writer that fails or is
+  aborted leaves no file behind, and leaves the file it would have replaced
+  as it was.
+- An async dataset query is answered only once the chunks it read ahead are
+  done. When it failed or stopped early (a limit), that reading was still on
+  the worker threads, so the next sync call was sometimes refused with "an
+  async query is running on this engine", although the query was awaited.
+- Datasets: a derive or select whose column nothing uses, followed by a limit
+  or top, no longer fails (`derive('x', 'a + b').limit(2).agg({ s: 'sum(a)' })`
+  said "unknown column b"; `select('id', 'a').top(1, '-a').agg(...)` said "no
+  column id"). Each chunk's plan now keeps only the columns used above it.
+- Datasets: a group whose values in one chunk hold both +Infinity and
+  -Infinity sums to NaN, as on a table; SUM, AVG and group sums left that
+  chunk out (a SUM of 3 instead of NaN, a group sum of 0).
+- Datasets have the documented async versions: `sortAsync`, `topAsync`,
+  `limitAsync`, `joinAsync` (the rows, in a table, as on a table), `sumAsync`,
+  `meanAsync`, `minAsync`, `maxAsync`, `explainAsync`, and
+  `groupBy(...).aggAsync` (also on lazy queries). They were missing
+  (TypeError). `count` / `countAsync` take params.
 - Lazy queries and datasets: a join keeps the left table's column order, as
   an eager join does (the key came first). On a dataset,
   `join(...).top(k, 's_right')` (a renamed text column of the right table)
   works; it failed with "s_right is a text column". `groupBy('s').agg({ s:
   ... })` (an aggregation named like a key) is refused, as on a table; on a
   dataset it put the sums where the keys should be.
+- Split tables: `topAsync` keeps table order among tied rows, as `top` on a
+  table does (row 13000 came before row 5000). The values were right.
+
+**Loading data**
+- JSON lines: a numeric string (`{"x":"2"}`, `" 1e3 "`) goes into a number
+  column, as the docs say; one such value made the whole column text. Blank
+  text doesn't change a column's kind (it is missing in a number column), and
+  an escaped `"\u0030"` is 0 (it was missing).
+- A UTF-8 BOM before the first JSON lines record no longer loses that record,
+  and a BOM before the first row pushed or sent to a CSV or JSON lines stream
+  is dropped (it went into the first value, or lost the first row).
+- `writeArrow`: a text column whose first value is null is written as text
+  (it was taken for numbers, and every value was lost), and null text is
+  missing (it was written as the text "null").
+- CSV: a time with a `+hh` offset (`2024-01-02 03:04:05+00`, as PostgreSQL
+  exports a timestamptz) makes a date column; it stayed text.
 - CSV: a file whose lines end in CR alone (old Mac files) loads its rows, in
   `parseCSV`, `readCSV`, `csvToDataset` and split tables; it loaded as one
   header line and no rows, with no error.
@@ -194,21 +203,41 @@ Fixes from audit round 5.
   (`'{"nested":true}'`); a key with only nested values is such a column (it
   was dropped). A vector field is one that holds a list of numbers of one
   length in every row. Streams still leave nested values missing.
-- Streams: a blank line in a CSV stream (a heartbeat newline) is not a row,
-  as JSON lines streams already skipped them; it was a row of missing values,
-  so `count()` grew. `keepRows` counts rows, not blank lines.
-- Node: a script that leaves a `SplitEngine` open ends by itself, as with a
-  plain `Engine`; its worker threads kept it running forever. The workers keep
-  the process alive only while an answer is awaited, or while a stream reads
-  from a connection (`connect()`), until `close()`.
-- Split tables: `topAsync` keeps table order among tied rows, as `top` on a
-  table does (row 13000 came before row 5000). The values were right.
 - Column names can use letters of any script (`Größe`, `名前`), in
   expressions, SQL, sorting, the servers and OData; CSV headers and JSON keys
   keep them (`Größe` became `Gr__e` and `Grüße` `Gr__e_2`). Other signs and
   spaces still become `_` (`Order Date` is `Order_Date`). Data files named so
   keep those letters in their table names. This changes the names such files
   load with.
+
+**Streams**
+- Streams: `keepMs` drops every row older than the newest time minus
+  `keepMs`, also rows that arrived late with an old time. Only the rows at the
+  front were dropped, so a late row from long ago stayed in "the last second"
+  and went into its totals.
+- Streams: a blank line in a CSV stream (a heartbeat newline) is not a row,
+  as JSON lines streams already skipped them; it was a row of missing values,
+  so `count()` grew. `keepRows` counts rows, not blank lines.
+
+**Engine and servers**
+- A script run with `node --input-type=module -e '…'` or piped into node can
+  use worker threads: they inherited `--input-type`, which Node refuses for
+  workers, so the process stopped as soon as the first one started.
+- Tables dropped without `dispose()` have their engine memory freed once
+  they are garbage collected. A table made inside a chain
+  (`t.sort(...).head(20)`) can't be disposed, and was kept until
+  `engine.close()`: 150 such calls held 460 MB, and a long-running app ran out
+  of memory. `dispose()` still frees at once and is still the way to free
+  memory soon. `column()` now returns a new array view each call (over the
+  same memory).
+- HTTP answers (JSON, JSON lines, CSV) and the MCP tools write ±Infinity as
+  the text `"Infinity"` / `"-Infinity"` (`Infinity` / `-Infinity` in CSV).
+  They were null, the same as a missing value, so `MIN(x) = -Infinity` reached
+  Excel or an LLM as "no value". NaN is still missing.
+- Node: a script that leaves a `SplitEngine` open ends by itself, as with a
+  plain `Engine`; its worker threads kept it running forever. The workers keep
+  the process alive only while an answer is awaited, or while a stream reads
+  from a connection (`connect()`), until `close()`.
 
 ## 0.1.4
 
