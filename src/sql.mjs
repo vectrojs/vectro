@@ -467,6 +467,11 @@ const call = (fn, ...args) => ({ t: 'call', fn, args });
 const cond = (c, x, y) => ({ t: 'cond', c, x, y });
 const TEXT_TYPES = new Set(['VARCHAR', 'TEXT', 'STRING', 'CHAR', 'BPCHAR', 'NVARCHAR', 'NCHAR', 'CHARACTER', 'NAME', 'CITEXT', 'UUID', 'REGCLASS', 'REGTYPE', 'REGPROC', 'REGNAMESPACE', 'REGROLE']);
 const INT_TYPES = new Set(['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT', 'INT2', 'INT4', 'INT8', 'OID', 'XID', 'CID']);
+// the whole numbers each type holds; CAST rounds half away from zero (2.5 is 3, -2.5 is -3), as DuckDB and
+// PostgreSQL do, and a value outside (or NaN, ±Infinity) is missing
+const INT_RANGE = { TINYINT: [-(2 ** 7), 2 ** 7 - 1], SMALLINT: [-(2 ** 15), 2 ** 15 - 1], INT2: [-(2 ** 15), 2 ** 15 - 1], INT: [-(2 ** 31), 2 ** 31 - 1], INTEGER: [-(2 ** 31), 2 ** 31 - 1], INT4: [-(2 ** 31), 2 ** 31 - 1],
+  BIGINT: [-(2 ** 63), 2 ** 63 - 1024], INT8: [-(2 ** 63), 2 ** 63 - 1024], HUGEINT: [-(2 ** 127), 2 ** 127 - 2 ** 74], OID: [0, 2 ** 32 - 1], XID: [0, 2 ** 32 - 1], CID: [0, 2 ** 32 - 1] }; // (2^63 - 1024: the largest double below 2^63)
+const toWhole = (v, type) => { const r = Math.sign(v) * Math.round(Math.abs(v)), [lo, hi] = INT_RANGE[type]; return r >= lo && r <= hi ? r : NaN; };
 const FLOAT_TYPES = new Set(['DOUBLE', 'DOUBLE PRECISION', 'FLOAT', 'FLOAT4', 'FLOAT8', 'REAL', 'DECIMAL', 'NUMERIC']);
 const BOOL_TYPES = new Set(['BOOL', 'BOOLEAN']);
 const DATE_TYPES = new Set(['DATE', 'TIMESTAMP', 'TIMESTAMPTZ', 'DATETIME']);
@@ -1110,6 +1115,7 @@ function compileSelect(ast, env, outer, tail) {
 
   // a date without a time (a DATE): from the column's values, as opts.types has it
   function isDay(e, ctx) { try { return typeOfExpr(e, ctx) === 'day'; } catch { return false; } }
+  function isInt(e, ctx) { try { return typeOfExpr(e, ctx) === 'int'; } catch { return false; } }
 
   // ---- text: columns computed once per distinct value (Table._textmap) ------------------
   // a column for an AST (an expression becomes a hidden derived column)
@@ -1360,15 +1366,23 @@ function compileSelect(ast, env, outer, tail) {
           if (BOOL_TYPES.has(e.type)) return num(asBool(e.x.v));
           if (!INT_TYPES.has(e.type) && !FLOAT_TYPES.has(e.type)) fail(`CAST to ${e.type} is not supported`);
           const x = textToNumber(e.x.v);
-          return num(INT_TYPES.has(e.type) ? Math.trunc(x) : x);
+          return num(INT_TYPES.has(e.type) ? toWhole(x, e.type) : x);
         }
         if (from === 'text' && e.x.k !== 'str') { // text to a number or a date (missing where it isn't one)
           const whole = INT_TYPES.has(e.type), date = DATE_TYPES.has(e.type), bool = BOOL_TYPES.has(e.type);
           if (!whole && !date && !bool && !FLOAT_TYPES.has(e.type)) fail(`CAST to ${e.type} is not supported`);
-          return valueColumn(ctx, [argOf(e.x, ctx)], ([x]) => { if (bool) return asBool(x); if (date) { const t = textToDate(x); return e.type === 'DATE' ? Math.floor(t / 86_400_000) * 86_400_000 : t; } const v = textToNumber(x); return whole ? Math.trunc(v) : v; }, { text: false, date, label: e.type.toLowerCase() });
+          return valueColumn(ctx, [argOf(e.x, ctx)], ([x]) => { if (bool) return asBool(x); if (date) { const t = textToDate(x); return e.type === 'DATE' ? Math.floor(t / 86_400_000) * 86_400_000 : t; } const v = textToNumber(x); return whole ? toWhole(v, e.type) : v; }, { text: false, date, label: e.type.toLowerCase() });
         }
         const x = V(e.x);
-        if (INT_TYPES.has(e.type)) return cond(bin('>=', x, num(0)), call('floor', x), call('ceil', x));
+        if (INT_TYPES.has(e.type)) {
+          const [lo, hi] = INT_RANGE[e.type];
+          let r = x;
+          if (!isInt(e.x, ctx)) { // floor, and one more when the rest reaches half (away from zero: exactly half rounds down below 0)
+            const f = call('floor', x), d = bin('-', x, f);
+            r = bin('+', f, cond(bin('>=', x, num(0)), bin('>=', d, num(0.5)), bin('>', d, num(0.5))));
+          }
+          return cond(bin('&&', bin('>=', r, num(lo)), bin('<=', r, num(hi))), r, num(NaN));
+        }
         if (FLOAT_TYPES.has(e.type)) return x;
         if (BOOL_TYPES.has(e.type)) return cond(bin('==', x, x), cond(bin('!=', x, num(0)), num(1), num(0)), num(NaN));
         if (DATE_TYPES.has(e.type)) return e.x.k === 'str' ? translate({ k: 'date', v: e.x.v }, ctx) : e.type === 'DATE' ? call('dayStart', x) : x;

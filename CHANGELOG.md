@@ -40,6 +40,10 @@ Fixes from audit round 5.
   USING a date column, and a UNION with NULL on one side; they came back as
   milliseconds. In the dataframe API, `derive('x', 'coalesce(d1, d2)')` and
   `? :` between dates make date columns too.
+- SQL: CAST to INTEGER, BIGINT, SMALLINT and the other whole-number types
+  rounds half away from zero, as DuckDB and PostgreSQL do (2.5 is 3, -2.5 is
+  -3, 3.7 is 4); it cut the fraction off. A value the type can't hold, NaN or
+  ±Infinity becomes missing, as text that isn't a number already did.
 
 ## 0.1.4
 
