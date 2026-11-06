@@ -134,7 +134,13 @@ function parseStatement(src, fold = false) {
   const startsQuery = (o = 0) => isKw('SELECT', o) || isKw('WITH', o);
   const aliasNext = () => peek()?.t === 'id' && !(SOFT.has(peek().v.toUpperCase()) && !peek().quoted && ['OVER', 'WITHIN', 'FETCH', 'FILTER'].includes(peek().v.toUpperCase()));
 
-  function expr() { return or(); }
+  // (each level of brackets or function calls goes through here; a cap below the stack's own limit, which
+  // is about 860 levels in Node, gives a plain message with the number in it)
+  let depth = 0;
+  function expr() {
+    if (++depth > MAX_SQL_DEPTH) fail(`the query is nested too deeply (more than ${MAX_SQL_DEPTH} levels of brackets or function calls); split it up`);
+    try { return or(); } finally { depth--; }
+  }
   function or() { let l = and(); while (eatKw('OR')) l = { k: 'bin', op: 'OR', l, r: and() }; return l; }
   function and() { let l = not(); while (eatKw('AND')) l = { k: 'bin', op: 'AND', l, r: not() }; return l; }
   function not() { if (eatKw('NOT')) return { k: 'not', x: not() }; return cmp(); }
@@ -440,14 +446,22 @@ function parseStatement(src, fold = false) {
     }
     const orderBy = eatKw('ORDER') ? (needKw('BY'), orderItems()) : [];
     let limit = null, offset = 0;
+    // a count of rows: a constant (2 + 3), rounded as DuckDB does (LIMIT 2.5 is 3)
+    const rowCount = (what) => {
+      const t = peek();
+      if (!t || !(t.t === 'num' || isOp('(') || isOp('-') || isOp('+'))) fail(`${what} needs a number`);
+      const v = sqlConst(add());
+      if (v === null || !(v >= 0)) fail(`${what} needs a number of rows (0 or more)`);
+      return v === Infinity ? v : Math.round(v);
+    };
     if (eatKw('LIMIT')) {
       if (eatKw('ALL')) limit = null;
-      else { const t = peek(); if (t?.t !== 'num') fail('LIMIT needs a number'); p++; limit = t.v; }
+      else limit = rowCount('LIMIT');
     }
-    if (eatKw('OFFSET')) { const t = peek(); if (t?.t !== 'num') fail('OFFSET needs a number'); p++; offset = t.v; eatWord('ROWS') || eatWord('ROW'); }
+    if (eatKw('OFFSET')) { offset = rowCount('OFFSET'); eatWord('ROWS') || eatWord('ROW'); }
     if (eatWord('FETCH')) {
       if (!eatKw('FIRST')) needWord('NEXT');
-      const t = peek(); if (t?.t !== 'num') fail('FETCH FIRST needs a number'); p++; limit = t.v;
+      limit = rowCount('FETCH FIRST');
       if (!eatWord('ROWS')) needWord('ROW');
       needWord('ONLY');
     }
@@ -463,6 +477,7 @@ function parseStatement(src, fold = false) {
 // ---- translation ------------------------------------------------------------------------------
 const AGG = { COUNT: 'count', SUM: 'sum', AVG: 'mean', MEAN: 'mean', MIN: 'min', MAX: 'max', APPROX_COUNT_DISTINCT: 'approxDistinct' };
 // the number functions translate() knows (text, date and session functions are listed elsewhere)
+const MAX_SQL_DEPTH = 400;
 const SCALAR_FNS = new Set(['ABS', 'SQRT', 'FLOOR', 'CEIL', 'CEILING', 'ROUND', 'LEAST', 'GREATEST', 'COALESCE', 'IFNULL', 'NVL', 'NULLIF', 'DATE_TRUNC', 'DOW', 'DAYOFWEEK', 'WEEKDAY', 'ISODOW', 'NOW', 'CURRENT_TIMESTAMP', 'EPOCH', 'DATE_PART']);
 const PERCENTILE = new Set(['MEDIAN', 'PERCENTILE_CONT', 'PERCENTILE_DISC', 'QUANTILE_CONT', 'QUANTILE_DISC', 'QUANTILE']);
 const WINDOW_FNS = { ROW_NUMBER: 'row_number', RANK: 'rank', DENSE_RANK: 'dense_rank', PERCENT_RANK: 'percent_rank', CUME_DIST: 'cume_dist', NTILE: 'ntile', LAG: 'lag', LEAD: 'lead', FIRST_VALUE: 'first_value', LAST_VALUE: 'last_value', NTH_VALUE: 'nth_value', SUM: 'sum', AVG: 'avg', MEAN: 'avg', MIN: 'min', MAX: 'max', COUNT: 'count' };
@@ -565,8 +580,8 @@ const andAll = (list) => (list.length ? list.reduce((a, b) => ({ k: 'bin', op: '
 // found by that name; an unqualified name also finds pg_catalog's.
 export function sql(text, tables = {}, opts = {}) {
   try { return compileSQL(text, tables, opts); } catch (err) {
-    // (a generated query nested thousands deep: say so, not "Maximum call stack size exceeded")
-    if (err instanceof RangeError && /call stack/i.test(err.message)) throw new SyntaxError('vectro SQL: the query is nested too deeply (expressions or brackets thousands of levels deep); split it up');
+    // (a generated query nested too deep for the stack: say so, not "Maximum call stack size exceeded")
+    if (err instanceof RangeError && /call stack/i.test(err.message)) throw new SyntaxError('vectro SQL: the query is nested too deeply for this runtime\'s stack; split it up');
     throw err;
   }
 }
@@ -676,8 +691,7 @@ function compileQuery(q, env, outer) {
     }
     out = out.sort(by);
   }
-  if (q.limit !== null) out = out.limit(q.limit, q.offset);
-  else if (q.offset) fail('OFFSET needs LIMIT');
+  if (q.limit !== null || q.offset) out = out.limit(q.limit ?? Infinity, q.offset); // (OFFSET alone: every row after it)
   return { ...rel, query: out.select(...rel.names) };
 }
 
@@ -1798,8 +1812,7 @@ function compileSelect(ast, env, outer, tail) {
   function finish(outs, kindFn, ctx) {
     let out = q;
     if (sortKeys.length) out = out.sort(sortKeys);
-    if (tail.limit !== null && tail.limit !== undefined) out = out.limit(tail.limit, tail.offset);
-    else if (tail.offset) fail('OFFSET needs LIMIT');
+    if ((tail.limit !== null && tail.limit !== undefined) || tail.offset) out = out.limit(tail.limit ?? Infinity, tail.offset); // (OFFSET alone: every row after it)
     const names = outs.map((o) => o.name);
     const outKinds = new Map(outs.map((o) => [o.name, o.e.k === 'null' ? 'null' : kindFn(o) ?? 'number'])); // (a NULL column matches any kind in a UNION)
     if (outs.some((o) => o.col !== o.name)) { // (through fresh names: an output may be named like another's column)

@@ -80,6 +80,18 @@ for (const [opts, source] of [[{}, 'table'], [{ threads: 1 }, 'table'], [{}, 'da
 }
 
 // datasets: the documented ...Async methods, and no crash when a dataset used asynchronously is dropped
+// O4: LIMIT / OFFSET take constant expressions, round as DuckDB (LIMIT 2.5 is 3), and OFFSET works alone
+{
+  const { sql } = await import('../src/sql.mjs');
+  const e = new Engine(), t = e.table({ v: [5, 3, 1, 4, 2] });
+  const v = (q) => { try { return sql(q, { t }).toRows().map((r) => r.v); } catch (err) { return 'error: ' + err.message; } };
+  same(v('SELECT v FROM t LIMIT 2.5'), [5, 3, 1], 'LIMIT 2.5 is 3 rows');
+  same(v('SELECT v FROM t ORDER BY v OFFSET 3'), [4, 5], 'OFFSET without LIMIT');
+  same(v('SELECT v FROM t ORDER BY v LIMIT 2 + 1 OFFSET 1'), [2, 3, 4], 'LIMIT 2 + 1');
+  same(v('SELECT v FROM t UNION SELECT v FROM t ORDER BY v OFFSET 4'), [5], 'OFFSET without LIMIT after a UNION');
+  await e.close();
+}
+
 if (MODE === 'node') {
   const e = new Engine(), path = join(dir, 'async.vectro');
   e.writeDataset(path, { g: ['a', 'b', 'a'], v: [3, 1, 2] });

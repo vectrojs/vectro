@@ -904,7 +904,7 @@ function* runChunksG(plan, path, sink) {
   while (!BLOCKING[path[bi].op]) bi--;
   let B = path[bi], kind = BLOCKING[B.op];
   const below = path.slice(bi + 1, -1); // (the steps between the dataset and B: what each chunk runs)
-  if (B.op === 'sort' && bi > 0 && path[bi - 1].op === 'limit' && path[bi - 1].input === B) { B = path[bi - 1]; kind = 'top'; }
+  if (B.op === 'sort' && bi > 0 && path[bi - 1].op === 'limit' && path[bi - 1].input === B && path[bi - 1].n !== Infinity) { B = path[bi - 1]; kind = 'top'; }
   const top = kind === 'top' ? B.input.input : B.input; // what runs on each chunk
   // columns to read, and the chunks the filters right above the dataset allow
   const need = needs(plan, null, ds);

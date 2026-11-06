@@ -307,8 +307,9 @@ function* execG(node, needed, temps) {
           if (same?.t === 'var') return `${m[1]}${same.name}`; // a copy of a column: sorted as that column (text by label)
           return toSource(inline(parse(String(b)), s.derived));
         });
-        r = yield { table: base, method: k === null ? 'sort' : 'top', args: k === null ? [by] : [k, by] };
-      } else r = yield { table: base, method: 'head', args: [k] };
+        const all = k === null || k === Infinity; // (OFFSET without LIMIT: every row after the offset)
+        r = yield { table: base, method: all ? 'sort' : 'top', args: all ? [by] : [k, by] };
+      } else r = k === Infinity ? base : yield { table: base, method: 'head', args: [k] };
       if (node.offset) r = yield { table: r, method: 'slice', args: [node.offset] };
       r = yield* deriveAllG(r, keep.filter((n) => s.derived.has(n)), s.derived);
       return { table: r, derived: new Map(), visible: keep };
@@ -547,7 +548,7 @@ function describe(node, depth = 0) {
     case 'select': return `${describe(node.input, depth)}\n${pad}select ${node.names.join(', ')}`;
     case 'aggregate': return `${describe(node.input, depth)}\n${pad}groupBy ${node.keys.join(', ')}: ${Object.entries(node.spec).map(([k, a]) => `${k} = ${toSource(a)}`).join(', ')}${node.pushed ? ` (${node.pushed} filter(s) on keys moved below)` : ''}`;
     case 'sort': return `${describe(node.input, depth)}\n${pad}sort ${node.by.join(', ')}`;
-    case 'limit': return node.input.op === 'sort'
+    case 'limit': return node.input.op === 'sort' && node.n !== Infinity
       ? `${describe(node.input.input, depth)}\n${pad}top ${node.n + (node.offset ?? 0)} by ${node.input.by.join(', ')} (sort + limit)${node.offset ? `, then skip ${node.offset}` : ''}`
       : `${describe(node.input, depth)}\n${pad}limit ${node.n}${node.offset ? ` offset ${node.offset}` : ''}`;
     case 'join': return `${pad}join ${JSON.stringify(node.opts.on)} ${node.opts.how ?? 'inner'}\n${pad}  left:\n${describe(node.left, depth + 2)}\n${pad}  right:\n${describe(node.right, depth + 2)}`;

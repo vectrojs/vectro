@@ -153,6 +153,12 @@ Fixes from audit round 5.
   got the same key twice".
 - SQL: a text IN list can hold NULL (`s IN ('a', NULL)`), as BI tools write it;
   it was refused. `s NOT IN ('a', NULL)` keeps nothing, as in SQL.
+- SQL: `LIMIT` and `OFFSET` take a constant expression (`LIMIT 2 + 3`) and
+  round as DuckDB does (`LIMIT 2.5` is 3 rows; it was 2), and `OFFSET` works
+  without `LIMIT` (it was refused).
+- SQL: a query nested more than 400 levels deep (brackets or function calls)
+  fails with that number in the message. Before, about 860 brackets ran out
+  of stack, and the message said "thousands of levels".
 
 ## 0.1.4
 
