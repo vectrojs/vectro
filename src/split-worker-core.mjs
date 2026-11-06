@@ -190,7 +190,7 @@ export function serveSplitWorker(post, listen) {
     // one distinct-count sketch per group (the page merges them).
     distinct({ id, preds, keys, arg, params, sketch }) {
       const v = view(id, preds);
-      const plain = /^[A-Za-z_]\w*$/.test(arg.trim()) && v.cols.has(arg.trim()) && !keys.includes(arg.trim()); // (a key: count a copy)
+      const plain = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(arg.trim()) && v.cols.has(arg.trim()) && !keys.includes(arg.trim()); // (a key: count a copy)
       const t = plain ? v : v.derive('__np_dv', arg, params);
       const name = plain ? arg.trim() : '__np_dv';
       const g = t.groupBy([...keys, name]).agg({ __np_n: 'count()' });

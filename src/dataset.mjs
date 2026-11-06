@@ -1000,7 +1000,7 @@ function smallestColumn(ds) {
 //   finish(): the merged result (a table, or totals for 'total')
 function accumulator(kind, B, engine, sink, ds, derived) {
   if (kind === 'group' || kind === 'total') return groupAccumulator(kind, B, engine, ds, derived);
-  if (kind === 'gather' && sink && B.op === 'sort') { const first = firstSortKey(B.by[0], ds, derived); if (first && /^[A-Za-z_]\w*$/.test(first.expr)) return sortSpillAccumulator(B, engine, ds, derived, first); }
+  if (kind === 'gather' && sink && B.op === 'sort') { const first = firstSortKey(B.by[0], ds, derived); if (first && /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(first.expr)) return sortSpillAccumulator(B, engine, ds, derived, first); }
   const parts = [];
   let rows = 0;
   // top-k: once k rows are kept, a row whose first key is worse than the
@@ -1013,7 +1013,7 @@ function accumulator(kind, B, engine, sink, ds, derived) {
   const zkeys = [];
   if (first) for (const by of B.input.by) {
     const key = firstSortKey(by, ds, derived, true);
-    const c = key && /^[A-Za-z_]\w*$/.test(key.expr) && !derived.has(key.expr) && ds.cols.get(key.expr);
+    const c = key && /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(key.expr) && !derived.has(key.expr) && ds.cols.get(key.expr);
     if (!c || c.dict || c.strings) break;
     zkeys.push(key);
   }
@@ -1290,7 +1290,7 @@ function firstSortKey(by, ds, derived, numeric = false) {
   const src = String(by).trim();
   const desc = src.startsWith('-');
   const expr = desc ? src.slice(1).trim() : src;
-  const ident = /^[A-Za-z_]\w*$/.test(expr);
+  const ident = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(expr);
   if (ident && !derived.has(expr) && (ds.cols.get(expr)?.dict || ds.cols.get(expr)?.strings)) return null;
   if (ident && derived.has(expr) && !(numeric && derived.numeric?.has(expr))) return null; // (a join's text column, or a derived label: be safe)
   return { expr, desc };

@@ -94,7 +94,7 @@ function tokenize(src, fold = false) {
     }
     const num = /^(\d+\.?\d*(e[+-]?\d+)?|\.\d+(e[+-]?\d+)?)/i.exec(src.slice(i));
     if (num) { toks.push({ t: 'num', v: Number(num[0]) }); i += num[0].length; continue; }
-    const id = /^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
+    const id = /^[\p{L}_][\p{L}\p{M}\p{N}_]*/u.exec(src.slice(i)); // (letters of any script: Größe)
     if (id) {
       const up = id[0].toUpperCase();
       const raw = fold ? id[0].toLowerCase() : id[0];
@@ -507,7 +507,7 @@ const SESSION_NAMES = new Set(['current_user', 'session_user', 'user', 'current_
 function astVars(t, out = []) { if (t.t === 'var') out.push(t.name); for (const x of [t.x, t.l, t.r, t.c, t.y, ...(t.args ?? [])]) if (x && typeof x === 'object') astVars(x, out); return out; }
 // Column names that aren't plain names ("sum:price", "Order Date") live under
 // a plain one: __q_ then letters and digits as they are, others as _<hex>_.
-const PLAIN = /^[A-Za-z_]\w*$/;
+const PLAIN = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u;
 export const encodeName = (name) => (PLAIN.test(name) ? name : `__q_${[...name].map((ch) => (/[A-Za-z0-9]/.test(ch) ? ch : `_${ch.codePointAt(0).toString(16)}_`)).join('')}`);
 export const displayName = (name) => (name.startsWith('__q_') ? name.slice(4).replace(/_([0-9a-f]+)_/g, (m, h) => String.fromCodePoint(parseInt(h, 16))) : name);
 // a constant number written in SQL (-1, 2 + 3, 10 / 4), or null
@@ -784,7 +784,7 @@ function compileSelect(ast, env, outer, tail) {
   // a column reference -> its output name (or, if outer resolves it, an outer marker)
   const find = (ref) => {
     if (!PLAIN.test(ref.name)) { // a quoted name with spaces or signs: as an output kept it, or as CSV loading wrote it
-      const enc = { ...ref, name: encodeName(ref.name) }, und = { ...ref, name: ref.name.replace(/[^A-Za-z0-9_]/g, '_') };
+      const enc = { ...ref, name: encodeName(ref.name) }, und = { ...ref, name: ref.name.replace(/[^\p{L}\p{M}\p{N}_]/gu, '_') };
       return find1(enc) ?? find1(und) ?? find1(ref);
     }
     return find1(ref);

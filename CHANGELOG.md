@@ -203,6 +203,12 @@ Fixes from audit round 5.
   from a connection (`connect()`), until `close()`.
 - Split tables: `topAsync` keeps table order among tied rows, as `top` on a
   table does (row 13000 came before row 5000). The values were right.
+- Column names can use letters of any script (`Größe`, `名前`), in
+  expressions, SQL, sorting, the servers and OData; CSV headers and JSON keys
+  keep them (`Größe` became `Gr__e` and `Grüße` `Gr__e_2`). Other signs and
+  spaces still become `_` (`Order Date` is `Order_Date`). Data files named so
+  keep those letters in their table names. This changes the names such files
+  load with.
 
 ## 0.1.4
 

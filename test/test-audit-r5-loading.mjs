@@ -65,6 +65,17 @@ for (const s of [['a', null, 'b'], [null, 'a', 'b'], [undefined, 'x', '']]) {
 }
 await e.close();
 
+// L2: column names in any script stay as they are, in the dataframe API and SQL
+{
+  const { sql } = await import('../src/sql.mjs');
+  const en = new Engine(), t = en.parseCSV('Größe,Grüße,Order Date,名前\n1,2,x,太郎\n3,4,y,花子\n');
+  same(t.columnNames, ['Größe', 'Grüße', 'Order_Date', '名前'], 'CSV headers in any script keep their letters');
+  same(rowsOf(t.filter('Größe > 1').derive('ü2', 'Grüße * 2').select('名前', 'ü2')), [{ 名前: '花子', ü2: 8 }], 'expressions on non-ASCII names');
+  same(sql('SELECT 名前, SUM(Größe) AS größe FROM t GROUP BY 名前 ORDER BY 名前', { t }).toRows(), [{ 名前: '太郎', größe: 1 }, { 名前: '花子', größe: 3 }], 'SQL on non-ASCII names');
+  same(rowsOf(en.tableFromRows([{ n: 1 }, { n: 2, late: 'x', s: 5 }])), [{ n: 1, late: null, s: null }, { n: 2, late: 'x', s: 5 }], 'tableFromRows: keys first seen after row 1');
+  await en.close();
+}
+
 if (MODE === 'node') {
   const dir = mkdtempSync(join(tmpdir(), 'vectro-r5-load-'));
   const en = new Engine(), opened = [];

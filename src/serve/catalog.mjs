@@ -18,7 +18,7 @@ export class LoadError extends Error {}
 
 export const kindOf = (c) => (c.strings ? 'text' : c.dict ? 'category' : c.date ? 'date' : 'number');
 export const columnsOf = (t) => Object.fromEntries([...t.cols].filter(([, c]) => !c.hidden).map(([n, c]) => [n, kindOf(c)]));
-export const tableName = (file) => basename(file, extname(file)).replace(/[^A-Za-z0-9_]/g, '_').replace(/^(\d)/, '_$1');
+export const tableName = (file) => basename(file, extname(file)).replace(/[^\p{L}\p{M}\p{N}_]/gu, '_').replace(/^(\d)/, '_$1');
 
 // A path inside root (symbolic links resolved), or a LoadError.
 export function safePath(root, path) {

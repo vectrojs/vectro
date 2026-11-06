@@ -78,7 +78,7 @@ function inline(ast, derived) {
 }
 
 // Sort keys: '-name' or an expression.
-const IDENT = /^\s*(-?)\s*([A-Za-z_]\w*)\s*$/;
+const IDENT = /^\s*(-?)\s*([\p{L}_][\p{L}\p{M}\p{N}_]*)\s*$/u;
 const keyList = (by) => (Array.isArray(by) ? by : [by]);
 
 export class Query {

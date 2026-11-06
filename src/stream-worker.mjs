@@ -415,7 +415,7 @@ export function createStreams(getEngine) {
     const dictBy = w.by ? s.cols.get(w.by).dict : null;
     const derived = [];
     const vals = w.sketches.map(({ arg }, j) => {
-      const name = arg.trim(), c = /^[A-Za-z_]\w*$/.test(name) ? s.cols.get(name) : null;
+      const name = arg.trim(), c = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(name) ? s.cols.get(name) : null;
       if (c) return { data: engine.live(c.data).subarray(from, from + m), dict: c.dict };
       const d = t.derive(`__np_s${j}`, arg);
       derived.push(d);

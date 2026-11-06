@@ -23,7 +23,7 @@ const bad = (m) => { throw new ODataError(400, m); };
 const xml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const qid = (name) => `"${String(name).replaceAll('"', '""')}"`;
 const sqlText = (s) => `'${String(s).replaceAll("'", "''")}'`;
-const odataName = (n) => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(n) ? n : null); // (OData names: letters, digits, _)
+const odataName = (n) => (/^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(n) ? n : null); // (OData names: letters of any script, digits, _)
 
 function keyOf(table) {
   const ints = table.columnNames.filter((c) => columnType(table, c) === 'int');
@@ -57,7 +57,7 @@ function tokens(src) {
     if (dt) { out.push({ t: dt[1] ? 'datetime' : 'date', v: dt[0] }); i += dt[0].length; continue; }
     const num = /^-?(\d+\.?\d*(e[+-]?\d+)?|\.\d+)[mMdDlLfF]?(?![\w])/.exec(src.slice(i));
     if (num && (c !== '-' || !out.length || ['op', 'kw'].includes(out.at(-1).t) || out.at(-1).v === '(' || out.at(-1).v === ',')) { out.push({ t: 'num', v: num[0].replace(/[mMdDlLfF]$/, '') }); i += num[0].length; continue; }
-    const id = /^[A-Za-z_$][\w$]*/.exec(src.slice(i));
+    const id = /^[\p{L}_$][\p{L}\p{M}\p{N}_$]*/u.exec(src.slice(i));
     if (id) { out.push({ t: 'id', v: id[0] }); i += id[0].length; continue; }
     if ('(),/'.includes(c)) { out.push({ t: 'op', v: c }); i++; continue; }
     bad(`unexpected "${c}" in the expression`);
@@ -161,9 +161,9 @@ const inner = (s, name) => { const m = new RegExp(`^${name}\\s*\\(([\\s\\S]*)\\)
 const METHODS = { sum: 'SUM', min: 'MIN', max: 'MAX', average: 'AVG', countdistinct: 'COUNT' };
 function aggregates(spec, columns) {
   return splitTop(spec, ',').map((a) => {
-    let m = /^\$count\s+as\s+([A-Za-z_]\w*)$/.exec(a);
+    let m = /^\$count\s+as\s+([\p{L}_][\p{L}\p{M}\p{N}_]*)$/u.exec(a);
     if (m) return { sql: `COUNT(*) AS ${qid(m[1])}`, name: m[1] };
-    m = /^([\s\S]+?)\s+with\s+(\w+)\s+as\s+([A-Za-z_]\w*)$/.exec(a);
+    m = /^([\s\S]+?)\s+with\s+(\w+)\s+as\s+([\p{L}_][\p{L}\p{M}\p{N}_]*)$/u.exec(a);
     if (!m) bad(`aggregate(${a}): write "column with sum as name" or "$count as name"`);
     const method = METHODS[m[2]] ?? bad(`aggregate method ${m[2]} is not supported (sum, min, max, average, countdistinct)`);
     const e = filterSql(m[1], columns);

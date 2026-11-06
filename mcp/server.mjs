@@ -150,7 +150,7 @@ const handlers = {
   },
   async load_file({ path, name, types }) {
     const real = safePath(path);
-    const tname = name || basename(real, extname(real)).replace(/[^A-Za-z0-9_]/g, '_');
+    const tname = name || basename(real, extname(real)).replace(/[^\p{L}\p{M}\p{N}_]/gu, '_');
     const { table, skipped = 0, index = null, embedding = null, onDisk } = await loadFile(engine, real, { types });
     release(tname);
     tables.set(tname, { table, source: path, chain: [table], index });

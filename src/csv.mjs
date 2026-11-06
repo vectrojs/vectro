@@ -314,7 +314,7 @@ function fieldText(bytes, f) {
 // Column names must work in expressions: "Order Date" -> Order_Date.
 export function cleanNames(raw) {
   const base = raw.map((r, i) => {
-    let nm = r.trim().replace(/[^A-Za-z0-9_]/g, '_') || `col${i}`;
+    let nm = r.trim().replace(/[^\p{L}\p{M}\p{N}_]/gu, '_') || `col${i}`;
     if (/^\d/.test(nm)) nm = `_${nm}`;
     if (RESERVED.has(nm)) nm = `${nm}_`;
     return nm;

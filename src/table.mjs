@@ -26,7 +26,7 @@ import { interpretGroup, interpretCompact, interpretFilteredReduce } from './int
 import { DATE_FNS, DATE_RESULT, isDateAst, parseDateText, toMillis, f32Dates } from './dates.mjs';
 import { chooseEncoding, encodingCandidates, packInto, decodeOne, KINDS } from './pack.mjs';
 
-const IDENT = /^[A-Za-z_]\w*$/;
+const IDENT = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u; // (letters of any script, digits and _)
 const AGG_FNS = new Set(['sum', 'mean', 'min', 'max', 'count', 'countDistinct', 'approxDistinct']);
 const DISTINCT = new Set(['countDistinct', 'approxDistinct']); // exact on a table (see #distinctCountsG)
 const IDENTITY = { sum: 0, count: 0, mean: 0, min: Infinity, max: -Infinity };
@@ -1120,7 +1120,7 @@ export class Table {
     const { engine, n } = this;
     const counts = new Float64Array(K);
     if (!n) return counts;
-    const plain = /^[A-Za-z_]\w*$/.test(arg.trim()) ? this.cols.get(arg.trim()) : null;
+    const plain = /^[\p{L}_][\p{L}\p{M}\p{N}_]*$/u.test(arg.trim()) ? this.cols.get(arg.trim()) : null;
     let own = null;
     if (!plain) { own = engine.alloc(this.type, n); yield* engine.evalG(arg, this.#vars(merged), own); }
     if (engine.jit) { // whole numbers in a small range: a byte per (group, value) instead of the hash table
@@ -2082,7 +2082,7 @@ function hiddenView(c) {
 
 const RESERVED = new Set(['Infinity', 'NaN']); // (function names are fine: sum(...) is a call, sum a column)
 function checkName(name) {
-  if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _)`);
+  if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _, starting with a letter or _)`);
 }
 
 // A category column used as a number (city > 0, price + city, -city) would use its codes, which
