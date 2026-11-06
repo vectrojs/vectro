@@ -1,6 +1,6 @@
 {
   "name": "vectrojs",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Multi-core analytics engine for JavaScript: columnar tables, SQL and fused SIMD WebAssembly kernels for Node, browsers and edge runtimes, with no native code. Serves tables to Power BI, Tableau, Metabase, Grafana, pandas and Polars.",
   "type": "module",
   "license": "MIT",
