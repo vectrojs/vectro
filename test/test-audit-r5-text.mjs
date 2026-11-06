@@ -87,6 +87,7 @@ for (const [opts, source] of [[{}, 'table'], [{ threads: 1 }, 'table'], [{}, 'da
   // the dataframe helpers
   for (const [x, f] of [["like(s, 'a%')", (s) => likeRef(s, 'a%')], ["ilike(s, 'İ%')", (s) => likeRef(s, 'İ%', true)], ["startsWith(s, 'a')", (s) => s.startsWith('a')], ["endsWith(s, 'c')", (s) => s.endsWith('c')], ["contains(s, 'b')", (s) => s.includes('b')]])
     same([source === 'async' ? (await (await t.filter(x).collectAsync()).toRowsAsync()).length : t.filter(x).count()], [KIT.filter((s) => s !== '' && f(s)).length], `${tag} filter(${x}).count()`);
+  if (t.isDataset) t.close(); // (Windows: open files can't be deleted below)
   await e.close();
 }
 rmSync(dir, { recursive: true, force: true });

@@ -78,6 +78,7 @@ for (const [opts, source] of [[{}, 'table'], [{ threads: 1 }, 'table'], [{}, 'da
   const pairs = (await run('WITH a AS (SELECT k, COUNT(*) AS n FROM t GROUP BY k) SELECT a1.k AS k, a1.n AS n1, a2.n AS n2 FROM a a1 JOIN a a2 ON a1.k = a2.k')).map((r) => [r.k === 0 ? 0 : r.k, r.n1, r.n2]).sort((a, b) => a[0] - b[0]);
   same(pairs.flat(), [...kc].sort((a, b) => a[0] - b[0]).flatMap(([k, n]) => [k, n, n]), `${tag} CTE joined with itself`);
   same((await run('WITH u AS (SELECT id FROM t WHERE id < 10) SELECT COUNT(*) AS n FROM u')).map((r) => r.n), [10], `${tag} CTE named like a table wins`);
+  for (const x of Object.values(V)) if (x?.isDataset) x.close(); // (Windows: open files can't be deleted below)
   await e.close();
 }
 rmSync(dir, { recursive: true, force: true });

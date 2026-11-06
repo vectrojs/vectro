@@ -94,6 +94,7 @@ for (const [opts, source] of [[{}, 'table'], [{ threads: 1 }, 'table'], [{}, 'da
     for (const col of ['rn', 'rank', 'dense', 'nt', 'lag', 'lead2', 'rsum', 'rcount', 'nsum', 'nmin', 'nmax'])
       same(got.map((r) => nul(r[col])), ref.map((r) => r[col]), `${tag} ${name} ${P}${ord}: ${col}`);
   }
+  for (const x of Object.values(V)) if (x?.isDataset) x.close(); // (Windows: open files can't be deleted below)
   await e.close();
 }
 rmSync(dir, { recursive: true, force: true });
