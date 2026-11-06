@@ -44,6 +44,12 @@ Fixes from audit round 5.
   rounds half away from zero, as DuckDB and PostgreSQL do (2.5 is 3, -2.5 is
   -3, 3.7 is 4); it cut the fraction off. A value the type can't hold, NaN or
   ±Infinity becomes missing, as text that isn't a number already did.
+- SQL `%` is the exact remainder, as JavaScript's `%` and DuckDB give it; it
+  was computed as `a - trunc(a / b) * b`, which is wrong whenever `a / b`
+  isn't exact (`7 % 0.1` gave 0, `9007199254740994 % 3` gave 2, `5 % Infinity`
+  gave NULL). Expressions can use it too, as `mod(a, b)`. The kernels compute
+  it in WebAssembly (no remainder instruction there), so `dist/vectro.wasm`
+  is rebuilt.
 
 ## 0.1.4
 

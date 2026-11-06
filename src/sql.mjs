@@ -1296,10 +1296,7 @@ function compileSelect(ast, env, outer, tail) {
         }
         if ((op === '+' || op === '-') && (kindOf(e.l, ctx) === 'date' || kindOf(e.r, ctx) === 'date')) return dateArith(e, op, ctx);
         if (op === '!=') return bin('&&', bin('!=', T(e.l), T(e.r)), bin('&&', present(e.l, ctx), present(e.r, ctx))); // (missing on either side: unknown, so not kept)
-        if (op === '%') { // SQL: the sign of the dividend (truncate the quotient toward 0)
-          const a = V(e.l), b = V(e.r), qt = bin('/', a, b);
-          return bin('-', a, bin('*', cond(bin('>=', qt, num(0)), call('floor', qt), call('ceil', qt)), b));
-        }
+        if (op === '%') return call('mod', V(e.l), V(e.r)); // (the remainder exactly, with the sign of the dividend, as SQL and JavaScript have it)
         return bin(op, V(e.l), V(e.r));
       }
       case 'between': {

@@ -2,7 +2,7 @@
 // `[sum(a), min(a), count(a > 500 && b < 3)]` into ONE WebAssembly SIMD
 // function that reads each array once, instead of one pass per operation.
 
-import { I32, F64, V128, TY, Fn, loops, buildModule, get, set, simd, vload, vstore, memarg } from './wasm.mjs';
+import { I32, F64, V128, TY, Fn, loops, buildModule, get, set, simd, vload, vstore, memarg, emitModScalar, emitModVector } from './wasm.mjs';
 
 // ---- parsing -----------------------------------------------------------------
 
@@ -114,7 +114,7 @@ export function checkSpec(spec) {
 
 const REDUCTIONS = new Set(['sum', 'count', 'mean', 'min', 'max']);
 const UNARY_FN = new Set(['abs', 'sqrt', 'floor', 'ceil']);
-const BINARY_FN = new Set(['min', 'max']);
+const BINARY_FN = new Set(['min', 'max', 'mod']); // (mod(a, b): a % b exactly, as JavaScript's %)
 const CMP = { '==': 'eq', '!=': 'ne', '<': 'lt', '>': 'gt', '<=': 'le', '>=': 'ge' };
 const ARITH = { '+': 'add', '-': 'sub', '*': 'mul', '/': 'div' };
 
@@ -198,7 +198,7 @@ const FOLD_BIN = { '+': (a, b) => a + b, '-': (a, b) => a - b, '*': (a, b) => a 
   // as the kernels compute them: 1 / 0, a comparison with NaN false (but != true), NaN counting as true in && and ||
   '==': (a, b) => +(a === b), '!=': (a, b) => +(a !== b), '<': (a, b) => +(a < b), '<=': (a, b) => +(a <= b), '>': (a, b) => +(a > b), '>=': (a, b) => +(a >= b),
   '&&': (a, b) => +(a !== 0 && b !== 0), '||': (a, b) => +(a !== 0 || b !== 0) };
-const FOLD_FN = { abs: Math.abs, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, min: Math.min, max: Math.max };
+const FOLD_FN = { abs: Math.abs, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, min: Math.min, max: Math.max, mod: (a, b) => a % b };
 export function fold(n) {
   const isNum = (x) => x.t === 'num';
   switch (n.t) {
@@ -305,6 +305,11 @@ export class Emitter {
         if (ARITH[n.op]) { this.vec(n.l, k); this.vec(n.r, k); return f.emit(simd(V[ARITH[n.op]])); }
         break;
       case 'call':
+        if (n.fn === 'mod') { // (no vector remainder: lane by lane)
+          const va = f.local(V128), vb = f.local(V128);
+          this.vec(n.args[0], k); f.emit(set(va)); this.vec(n.args[1], k); f.emit(set(vb));
+          return emitModVector(f, this.t, va, vb);
+        }
         n.args.forEach((a) => this.vec(a, k));
         return f.emit(simd(V[n.fn]));
       case 'cond':
@@ -338,6 +343,7 @@ export class Emitter {
         break;
       case 'call':
         n.args.forEach((a) => this.sca(a));
+        if (n.fn === 'mod') return emitModScalar(f, this.t);
         return f.emit([S[n.fn]]);
       case 'cond':
         this.sca(n.x); this.sca(n.y); this.scaMask(n.c);

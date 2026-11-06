@@ -76,6 +76,51 @@ export class Fn {
   emit(...parts) { for (const p of parts) this.code.push(...p); }
 }
 
+// ---- the remainder a % b (SQL %, the expression function mod) -----------------
+// WebAssembly has no remainder of floats, and a - trunc(a / b) * b is wrong
+// whenever a / b isn't exact (7 % 0.1, 2^53 + 2 % 3). This is the remainder
+// exactly, as JavaScript's %: |b| doubled while it fits under |a|, then taken
+// away and halved back down; each subtraction is exact (the two numbers are
+// within a factor of two). buildModule makes it function 0 of every module
+// with a kernel that calls it.
+export const FMOD = 0;
+const f64c = (v) => [0x44, ...bytesOf(Float64Array, v)];
+const F64_ABS = [0x99], F64_EQ = [0x61], F64_NE = [0x62], F64_LT = [0x63], F64_LE = [0x65], F64_GE = [0x66], F64_ADD = [0xa0], F64_SUB = [0xa1], F64_MUL = [0xa2], F64_COPYSIGN = [0xa6];
+const I32_OR = [0x72], I32_EQZ = [0x45], IF = [0x04, 0x40], RETURN = [0x0f];
+export function fmodFn() {
+  const f = new Fn('__fmod', [F64, F64], [F64]);
+  const [a, b] = [0, 1], r = f.local(F64), B = f.local(F64), t = f.local(F64);
+  // NaN in, a infinite or b 0: NaN
+  f.emit(get(a), get(a), F64_NE, get(a), F64_ABS, f64c(Infinity), F64_EQ, I32_OR, get(b), get(b), F64_NE, I32_OR, get(b), f64c(0), F64_EQ, I32_OR, IF, f64c(NaN), RETURN, end);
+  f.emit(get(b), F64_ABS, set(B), get(B), f64c(Infinity), F64_EQ, IF, get(a), RETURN, end); // (b infinite: a)
+  f.emit(get(a), F64_ABS, set(r), get(r), get(B), F64_LT, IF, get(a), RETURN, end); // (|a| < |b|: a, -0 too)
+  f.emit(get(B), set(t));
+  f.emit(block, loop, get(t), get(t), F64_ADD, get(r), F64_LE, I32_EQZ, brIf(1), get(t), get(t), F64_ADD, set(t), br(0), end, end);
+  f.emit(block, loop, get(t), get(B), F64_LT, brIf(1));
+  f.emit(get(r), get(t), F64_GE, IF, get(r), get(t), F64_SUB, set(r), end);
+  f.emit(get(t), f64c(0.5), F64_MUL, set(t), br(0), end, end);
+  f.emit(get(r), get(a), F64_COPYSIGN); // (the sign of a)
+  return f;
+}
+// a % b for the two values on the stack (scalars of type t); f32 goes through
+// f64, where the remainder is exact and fits f32 again
+const CALL_FMOD = [0x10, FMOD], F64_PROMOTE_F32 = [0xbb], F32_DEMOTE_F64 = [0xb6];
+export function emitModScalar(f, t) {
+  f.usesMod = true;
+  if (t === 'f64') return f.emit(CALL_FMOD);
+  const y = f.local(F32);
+  f.emit(set(y), F64_PROMOTE_F32, get(y), F64_PROMOTE_F32, CALL_FMOD, F32_DEMOTE_F64);
+}
+// a % b lane by lane for two vectors in locals va, vb: a vector on the stack
+export function emitModVector(f, t, va, vb) {
+  f.usesMod = true;
+  const lanes = t === 'f64' ? 2 : 4, extract = t === 'f64' ? 0x21 : 0x1f, replace = t === 'f64' ? 0x22 : 0x20, splat = t === 'f64' ? 0x14 : 0x13;
+  for (let l = 0; l < lanes; l++) {
+    f.emit(get(va), simd(extract, l), ...(t === 'f32' ? [F64_PROMOTE_F32] : []), get(vb), simd(extract, l), ...(t === 'f32' ? [F64_PROMOTE_F32] : []), CALL_FMOD, ...(t === 'f32' ? [F32_DEMOTE_F64] : []));
+    f.emit(l === 0 ? simd(splat) : simd(replace, l));
+  }
+}
+
 // Loop skeleton shared by every kernel. `ptrs` advance together; the main loop
 // handles U vectors (U*16 bytes) per iteration, then a scalar loop does the
 // leftover elements.
@@ -223,6 +268,7 @@ export function buildKernels(shared = true) {
 // Assemble functions into a module that imports env.memory: shared memory
 // when threads use it, plain memory for single-thread and edge builds.
 export function buildModule(fns, shared = true) {
+  if (fns.some((f) => f.usesMod) && fns[0]?.exportName !== '__fmod') fns = [fmodFn(), ...fns]; // (a kernel calls the remainder: function 0)
   const types = [];
   const typeIndex = fns.map((f) => {
     const sig = [0x60, ...vec(f.params.map((x) => [x])), ...vec(f.results.map((x) => [x]))];

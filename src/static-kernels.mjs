@@ -6,7 +6,7 @@
 // for places that forbid compiling WebAssembly at runtime, like Cloudflare
 // Workers. With it, nothing else needs code generation.
 
-import { I32, F64, V128, TY, Fn, loops, buildModule, kernelFns, get, set, i32c, simd, vload, vstore, block, loop, end, br, brIf, i32add, i32geu } from './wasm.mjs';
+import { I32, F64, V128, TY, Fn, loops, buildModule, kernelFns, get, set, i32c, simd, vload, vstore, block, loop, end, br, brIf, i32add, i32geu, emitModScalar, emitModVector } from './wasm.mjs';
 import { VEC, SCA } from './fuse.mjs';
 
 const V128_AND = 0x4e, BITSELECT = 0x52, F64X2_PROMOTE_LOW = 0x5f, F64X2_ADD = 0xf0, SHUFFLE = 0x0d;
@@ -42,6 +42,26 @@ function vbinary(t, op) {
       if (cmp) f.emit([SCA[t].fromBool]);
       f.emit(ty.store);
     },
+  });
+  return f;
+}
+
+// dst = a % b exactly (vmod_f64 / vmod_f32; the remainder is function 0 of the module). (dst, a, b, n)
+function vmod(t) {
+  const ty = TY[t];
+  const f = new Fn(`vmod_${t}`, [I32, I32, I32, I32], []);
+  const [dst, a, b, n] = [0, 1, 2, 3];
+  const va = f.local(V128), vb = f.local(V128);
+  loops(f, ty, {
+    ptrs: [a, b, dst], n, U,
+    body: () => {
+      for (let k = 0; k < U; k++) {
+        f.emit(get(dst), get(a), vload(16 * k), set(va), get(b), vload(16 * k), set(vb));
+        emitModVector(f, t, va, vb);
+        f.emit(vstore(16 * k));
+      }
+    },
+    tail: () => { f.emit(get(dst), get(a), ty.load, get(b), ty.load); emitModScalar(f, t); f.emit(ty.store); },
   });
   return f;
 }
@@ -153,6 +173,7 @@ export function interpreterFns() {
   for (const t of ['f64', 'f32']) {
     for (const op of [...BINARY_OPS, ...COMPARE_OPS]) fns.push(vbinary(t, op));
     for (const op of UNARY_OPS) fns.push(vunary(t, op));
+    fns.push(vmod(t));
     fns.push(vselect(t), compact(t));
     for (const op of ['add', 'min', 'max']) fns.push(groupScatter(t, op, false), groupScatter(t, op, true));
   }
@@ -160,5 +181,5 @@ export function interpreterFns() {
 }
 
 export function buildStaticModule(shared) {
-  return buildModule([...kernelFns(), ...interpreterFns()], shared);
+  return buildModule([...kernelFns(), ...interpreterFns()], shared); // (vmod calls the remainder: buildModule puts it first)
 }
