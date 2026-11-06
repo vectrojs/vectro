@@ -104,8 +104,11 @@ const dir = mkdtempSync(join(tmpdir(), 'vectro-audit-server-'));
   for (const packed of [false, true]) {
     const t = packed ? e.table(cols).compress() : e.table(cols);
     if (packed) check([...t.cols.values()].some((c) => c.enc), 'some columns packed');
-    const busy = Array.from({ length: 8 }, () => load.aggAsync({ s: 'sum(v * v)' }));
-    check(await until(() => e.busy), 'the engine is busy');
+    // (more work until the engine is seen busy: on a slow runner one round can end before the check looks)
+    const busy = [];
+    let seen = false;
+    for (let round = 0; round < 5 && !seen; round++) { busy.push(...Array.from({ length: 8 }, () => load.aggAsync({ s: 'sum(v * v)' }))); seen = await until(() => e.busy, 2000); }
+    check(seen, 'the engine is busy');
     let types = null, wasBusy = false;
     try {
       wasBusy = e.busy;
