@@ -166,6 +166,7 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   | CROSS] JOIN ... ON / USING, WHERE, GROUP BY (columns, expressions, select aliases or positions),
   HAVING, ORDER BY ... ASC/DESC [NULLS FIRST | LAST], LIMIT / OFFSET / FETCH
   FIRST; COUNT(*), COUNT(x), COUNT(DISTINCT x), SUM, AVG, MIN, MAX,
+  STDDEV / VARIANCE (sample and population, exact in two passes),
   APPROX_COUNT_DISTINCT, MEDIAN, PERCENTILE_CONT / PERCENTILE_DISC WITHIN GROUP
   (ORDER BY x), QUANTILE_CONT anywhere in SELECT / HAVING / ORDER BY, and
   `FILTER (WHERE ...)` on aggregates; BETWEEN, IN, LIKE (and `ESCAPE`), IS
@@ -173,8 +174,10 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   negative digits too), LEAST, GREATEST, CAST (to integers rounding as DuckDB
   does, missing when out of range; DECIMAL(p, s) rounds to s digits; REAL is
   32-bit), DATE / TIMESTAMP literals, INTERVAL '7 days', EXTRACT, DATE_TRUNC,
-  YEAR(), MONTH()... JOIN ... ON takes an expression on each side (`ON a.k +
-  1 = b.k`), and column names can use any script (`Größe`). It compiles to the planner below, so SQL gets every
+  YEAR(), MONTH()... JOIN ... ON takes any condition in every kind of join:
+  equalities (hashed; an expression on each side too, `ON a.k + 1 = b.k`),
+  comparisons and BETWEEN (a range join), `IS NOT DISTINCT FROM`, OR. Column
+  names can use any script (`Größe`). It compiles to the planner below, so SQL gets every
   optimization, on tables and on datasets bigger than memory.
 
   **Subqueries and set operations:** WITH (CTEs, with column names too),
