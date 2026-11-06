@@ -23,7 +23,7 @@ import { copyRows } from './rows.mjs';
 import { textmapRows } from './textmap.mjs';
 import { writeArrow } from './arrow.mjs';
 import { interpretGroup, interpretCompact, interpretFilteredReduce } from './interp.mjs';
-import { DATE_FNS, DATE_RESULT, parseDateText, toMillis, f32Dates } from './dates.mjs';
+import { DATE_FNS, DATE_RESULT, isDateAst, parseDateText, toMillis, f32Dates } from './dates.mjs';
 import { chooseEncoding, encodingCandidates, packInto, decodeOne, KINDS } from './pack.mjs';
 
 const IDENT = /^[A-Za-z_]\w*$/;
@@ -377,7 +377,7 @@ export class Table {
     const out = this.engine.alloc(this.type, this.n);
     yield* this.engine.evalG(src, this.#vars(merged), out);
     const top = parse(expr);
-    const date = (top.t === 'call' && DATE_RESULT.has(top.fn)) || (top.t === 'var' && !!this.cols.get(top.name)?.date); // dayStart(ts), monthStart(ts)...: still dates
+    const date = isDateAst(top, (name) => !!this.cols.get(name)?.date); // dayStart(ts), coalesce(d1, d2)...: still dates
     const kinds = valueKinds(top, this.cols), dict = kinds.size === 1 ? kinds.values().next().value : 'number';
     const same = dict === 'number' ? null : [...this.cols.values()].find((c) => c.dict === dict); // a copy of a text column stays text (through ? : and coalesce too)
     const cols = new Map(this.cols).set(name, { data: out, dict: same?.dict ?? null, codes: same?.dict ? same.codes : null, date });
@@ -1651,7 +1651,14 @@ export class Table {
     // rows in one part only (an outer join's unmatched rows are often none): that part as it is
     const full = parts.filter((p) => p.n > 0);
     const keep = full.length === 1 ? full[0] : null;
-    try { return keep ?? copyRows(this.engine, parts.map((t) => [t, 0, t.n])); } finally { for (const p of parts) if (p !== keep && p.owned.length) p.dispose(); }
+    try {
+      const out = keep ?? copyRows(this.engine, parts.map((t) => [t, 0, t.n]));
+      for (const nm of names) { // (a date column on any side, NULL on another: dates)
+        const c = out.cols.get(nm);
+        if (!c.date && !c.dict && parts.some((p) => p.cols.get(nm).date)) out.cols.set(nm, { ...c, date: true });
+      }
+      return out;
+    } finally { for (const p of parts) if (p !== keep && p.owned.length) p.dispose(); }
   }
   async _concatAsync(others) { return this._concat(others); }
 

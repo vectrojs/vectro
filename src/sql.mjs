@@ -1014,6 +1014,7 @@ function compileSelect(ast, env, outer, tail) {
         if (['MIN', 'MAX', 'MEDIAN', 'QUANTILE', 'QUANTILE_CONT', 'QUANTILE_DISC'].includes(e.fn) && e.args[0] && kindOf(e.args[0], ctx) === 'date') return 'date';
         if ((e.fn === 'PERCENTILE_CONT' || e.fn === 'PERCENTILE_DISC') && e.within && kindOf(e.within.e, ctx) === 'date') return 'date';
         if (e.fn === 'DATE_TRUNC') return 'date';
+        if ((e.fn === 'LEAST' || e.fn === 'GREATEST') && e.args.some((a) => kindOf(a, ctx) === 'date')) return 'date';
         if (sessionFn(e)) return sessionFn(e).kind;
         if (extraFn(e)) return extraFn(e).out === 'text' ? 'text' : 'number';
         return 'number';

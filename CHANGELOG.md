@@ -36,6 +36,10 @@ Fixes from audit round 5.
 - SQL: a missing date compared with a date written as text (`d <> '2024-02-29'`,
   `NOT (d = '…')`, `d NOT IN ('…')`) is unknown, so the row is left out, as with
   `DATE '…'`. Those rows were kept.
+- Dates stay dates through COALESCE, CASE, GREATEST, LEAST, FULL JOIN ...
+  USING a date column, and a UNION with NULL on one side; they came back as
+  milliseconds. In the dataframe API, `derive('x', 'coalesce(d1, d2)')` and
+  `? :` between dates make date columns too.
 
 ## 0.1.4
 

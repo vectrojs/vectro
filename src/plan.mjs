@@ -26,7 +26,7 @@
 // explain() prints the optimized plan.
 
 import { parse, toSource, walk, isMask, checkSpec } from './fuse.mjs';
-import { DATE_RESULT } from './dates.mjs';
+import { DATE_RESULT, isDateAst } from './dates.mjs';
 import { trackAsyncMethods } from './engine.mjs';
 
 export const vars = (ast) => { const out = new Set(); walk(ast, (n) => { if (n.t === 'var') out.add(n.name); }); return out; };
@@ -267,7 +267,7 @@ function* execG(node, needed, temps) {
     case 'derive': {
       if (needed && !needed.has(node.name)) return yield* execG(node.input, needed, temps); // nobody uses it
       const s = yield* execG(node.input, union(minus(needed, node.name), vars(node.ast)), temps);
-      const derived = new Map(s.derived).set(node.name, { ast: inline(node.ast, s.derived), date: isDateExpr(node) || (node.ast.t === 'var' && !!s.table.cols.get(node.ast.name)?.date) });
+      const derived = new Map(s.derived).set(node.name, { ast: inline(node.ast, s.derived), date: isDateAst(node.ast, (name) => (s.derived.has(name) ? !!s.derived.get(name).date : !!s.table.cols.get(name)?.date)) });
       return { ...s, derived, visible: [...s.visible.filter((n) => n !== node.name), node.name] };
     }
     case 'select': {
