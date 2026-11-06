@@ -2229,9 +2229,10 @@ function textCall(n, cols, src) {
   if (c?.strings) throw new Error(`vectro: "${colNode.name}" is a free-text column; ${n.fn}() needs a category column (load it as types: { ${colNode.name}: 'category' })`);
   if (!c?.dict) throw new SyntaxError(`vectro: ${n.fn}() needs a text column first, then text in quotes, in "${src}"`);
   if (!rest.length || rest.some((a) => a.t !== 'str')) throw new SyntaxError(`vectro: ${n.fn}(${colNode.name}, …) needs text in quotes after the column, in "${src}"`);
-  if (n.fn !== 'in' && rest.length !== 1) throw new SyntaxError(`vectro: ${n.fn}() takes a column and one text, in "${src}"`);
+  const like = n.fn === 'like' || n.fn === 'ilike'; // (like(s, pattern, escape): the escape is optional)
+  if (n.fn !== 'in' && !(rest.length === 1 || (like && rest.length === 2))) throw new SyntaxError(`vectro: ${n.fn}() takes a column and one text${like ? ' (and, optionally, an escape character)' : ''}, in "${src}"`);
   const args = rest.map((a) => a.v);
-  const matches = n.fn === 'like' || n.fn === 'ilike' ? likeMatcher(n.fn === 'ilike' ? lowerAll(args[0]) : args[0]) : null;
+  const matches = like ? (n.fn === 'ilike' ? likeMatcher(lowerAll(args[0]), lowerAll(args[1] ?? '')) : likeMatcher(args[0], args[1] ?? '')) : null;
   const match = c.dict.map((label) => TEXT_FNS[n.fn](label, args, matches));
   // runs of consecutive codes that match (or, if shorter, that don't)
   const runs = (want) => {

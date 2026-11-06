@@ -163,8 +163,9 @@ function parseStatement(src, fold = false) {
       const e = { k: 'in', x: l, list };
       return neg ? negate(e) : e;
     }
-    if (eatKw('LIKE')) { const e = { k: 'like', x: l, pattern: add() }; return neg ? negate(e) : e; }
-    if (eatWord('ILIKE')) { const e = { k: 'like', x: l, pattern: add(), ci: true }; return neg ? negate(e) : e; }
+    const escape = () => (eatWord('ESCAPE') ? add() : null); // (LIKE 'a!%' ESCAPE '!')
+    if (eatKw('LIKE')) { const e = { k: 'like', x: l, pattern: add() }; e.escape = escape(); return neg ? negate(e) : e; }
+    if (eatWord('ILIKE')) { const e = { k: 'like', x: l, pattern: add(), ci: true }; e.escape = escape(); return neg ? negate(e) : e; }
     const op = ['=', '<>', '!=', '<', '<=', '>', '>=', '~', '~*', '!~', '!~*'].find((o) => isOp(o));
     if (op) { p++; return { k: 'bin', op, l, r: add() }; }
     return l;
@@ -1352,16 +1353,21 @@ function compileSelect(ast, env, outer, tail) {
       case 'like': {
         if (e.pattern.k !== 'str') fail(`${e.ci ? 'ILIKE' : 'LIKE'} needs a pattern in quotes`);
         if (kindOf(e.x, ctx) !== 'text') fail(`${e.ci ? 'ILIKE' : 'LIKE'} works on text`);
+        if (e.escape && e.escape.k !== 'str') fail(`${e.ci ? 'ILIKE' : 'LIKE'} ... ESCAPE needs a character in quotes`);
+        const esc = e.escape?.v ?? '', escArg = esc ? [{ t: 'str', v: esc }] : [];
+        likeMatcher(e.pattern.v, esc); // (a bad pattern or escape fails here, with a plain message)
         const there = present(e.x, ctx); // (missing text matches no pattern: unknown)
+        const tx0 = e.ci ? null : T(e.x);
+        if (tx0?.t === 'str') return num(tx0.v !== '' && likeMatcher(e.pattern.v, esc)(tx0.v) ? 1 : 0); // (text in quotes: worked out now)
         if (e.ci) { // both sides lowercased as DuckDB does ('İ' is 'i'): a column (or text made into one) label by label
           const tx = T(e.x);
-          if (tx.t === 'var') return bin('&&', call('ilike', tx, { t: 'str', v: e.pattern.v }), there);
+          if (tx.t === 'var') return bin('&&', call('ilike', tx, { t: 'str', v: e.pattern.v }, ...escArg), there);
           if (tx.t === 'str') { // (text in quotes: worked out now)
-            return num(tx.v !== '' && likeMatcher(lowerAll(e.pattern.v))(lowerAll(tx.v)) ? 1 : 0);
+            return num(tx.v !== '' && likeMatcher(lowerAll(e.pattern.v), lowerAll(esc))(lowerAll(tx.v)) ? 1 : 0);
           }
-          return bin('&&', T({ k: 'like', x: { k: 'call', fn: 'LOWER', args: [e.x] }, pattern: { k: 'str', v: lowerAll(e.pattern.v) } }), there);
+          return bin('&&', T({ k: 'like', x: { k: 'call', fn: 'LOWER', args: [e.x] }, pattern: { k: 'str', v: lowerAll(e.pattern.v) }, escape: e.escape && { k: 'str', v: lowerAll(esc) } }), there);
         }
-        return bin('&&', call('like', T(e.x), { t: 'str', v: e.pattern.v }), there);
+        return bin('&&', call('like', tx0, { t: 'str', v: e.pattern.v }, ...escArg), there);
       }
       case 'isnull':
         if (isCond(e.x) && e.x.k !== 'num') return { t: 'un', op: '!', x: present(e.x, ctx) }; // (a condition: NULL where unknown)

@@ -83,7 +83,7 @@ export function parseDateText(s) {
 }
 
 // Does this text look like an ISO date (for guessing CSV column types)?
-export const looksLikeDate = (s) => /^\s*"?[+-]?\d{4,}-\d\d-\d\d([Tt ]\d\d:\d\d(:\d\d([.,]\d+)?)?([Zz]|[+-]\d\d:?\d\d)?)?"?\s*$/.test(s) && !Number.isNaN(parseDateText(s));
+export const looksLikeDate = (s) => /^\s*"?[+-]?\d{4,}-\d\d-\d\d([Tt ]\d\d:\d\d(:\d\d([.,]\d+)?)?([Zz]|[+-]\d\d(:?\d\d)?)?)?"?\s*$/.test(s) && !Number.isNaN(parseDateText(s));
 
 // A value given for a date: Date object, ISO text or milliseconds.
 export function toMillis(v) {

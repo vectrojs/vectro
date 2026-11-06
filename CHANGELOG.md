@@ -139,6 +139,12 @@ Fixes from audit round 5.
 - SQL: `STRFTIME` writes years below 1000 with 4 digits (`0001-01-01`), and
   week numbers and days of the year are right for years 1 to 99 (they were
   worked out as 1901 to 1999).
+- SQL: `LIKE ... ESCAPE '!'` (and `ILIKE`) is read: `'a!%'` matches `a%`
+  exactly. It was refused. In expressions: `like(s, 'a!%', '!')`. LIKE on
+  text in quotes (`'abc' LIKE 'a%'`) is worked out; it failed with an error
+  that showed generated code.
+- CSV: a time with a `+hh` offset (`2024-01-02 03:04:05+00`, as PostgreSQL
+  exports a timestamptz) makes a date column; it stayed text.
 
 ## 0.1.4
 
