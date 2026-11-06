@@ -103,8 +103,22 @@ for (const [opts, source] of [[{}, 'table'], [{ threads: 1 }, 'table'], [{}, 'da
   const f = e.table({ g: ['a', 'a', 'b', 'b'], v: [1, 2, 3, 4] });
   same(rowsOf(sql('SELECT g, COUNT(*) FILTER (WHERE v > 1) AS c, SUM(v) FILTER (WHERE v < 4) AS s, MEDIAN(v) FILTER (WHERE v > 1) AS m FROM f GROUP BY g ORDER BY g', { f }).toRows()), [['a', 1, 3, 2], ['b', 2, 3, 3.5]], 'aggregates with FILTER (WHERE ...)');
   same(rowsOf(sql('SELECT COUNT(*) FILTER (WHERE v > 9) AS c FROM f', { f }).toRows()), [[0]], 'COUNT(*) FILTER that keeps nothing is 0');
-  let msg = ''; try { sql('SELECT g, STDDEV(v) AS s FROM f GROUP BY g', { f }).toRows(); } catch (err) { msg = err.message; }
-  same([[/unknown function STDDEV\(\)/.test(msg)]], [[true]], 'an unknown aggregate in a GROUP BY query says it is unknown');
+  let msg = ''; try { sql('SELECT g, BOOL_AND(v > 1) AS s FROM f GROUP BY g', { f }).toRows(); } catch (err) { msg = err.message; }
+  same([[/unknown function BOOL_AND\(\)/.test(msg)]], [[true]], 'an unknown aggregate in a GROUP BY query says it is unknown');
+  // STDDEV / VARIANCE: two passes, exact (the values DuckDB gives), also around 1e9 where one pass loses them
+  {
+    const g = ['a', 'a', 'a', 'b', 'c', 'c', 'd', 'd', 'd', 'd'], x = [1, 2, 4, 5, NaN, 7, 1e9 + 1, 1e9 + 2, 1e9 + 3, 1e9 + 4];
+    const vt = e.table({ g, x });
+    const q = 'SELECT g, STDDEV(x) AS a, STDDEV_POP(x) AS b, VARIANCE(x) AS c, VAR_POP(x) AS d, VAR_SAMP(x) FILTER (WHERE x > 1) AS f FROM v GROUP BY g ORDER BY g';
+    const want = [['a', 1.5275252316519465, 1.247219128924647, 2.333333333333333, 1.5555555555555554, 2], ['b', null, 0, null, 0, null], ['c', null, 0, null, 0, null], ['d', 1.2909944487358056, 1.118033988749895, 1.6666666666666667, 1.25, 1.6666666666666667]];
+    same(rowsOf(sql(q, { v: vt }).toRows()), want, 'STDDEV / VARIANCE by group');
+    same(rowsOf(sql('SELECT STDDEV_SAMP(x) AS a, VAR_POP(x) AS b FROM v', { v: vt }).toRows()), [[527046276.0095697, 246913579604938240]], 'STDDEV / VARIANCE of a whole table');
+    if (e.writeDataset) { // (Node)
+      const vp = join(dir, 'var.vectro'); e.writeDataset(vp, vt, { rowsPerChunk: 3 }); const vd = e.openDataset(vp);
+      same(rowsOf(sql(q, { v: vd }).toRows()), want, 'STDDEV / VARIANCE on a dataset');
+      vd.close();
+    }
+  }
   // S2: NULL in a text IN list
   same(rowsOf(sql("SELECT g FROM f WHERE g IN ('a', NULL)", { f }).toRows()), [['a'], ['a']], "text IN ('a', NULL)");
   same(rowsOf(sql("SELECT g FROM f WHERE g NOT IN ('a', NULL)", { f }).toRows()), [], "text NOT IN ('a', NULL) keeps nothing");

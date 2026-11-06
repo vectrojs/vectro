@@ -479,6 +479,8 @@ const AGG = { COUNT: 'count', SUM: 'sum', AVG: 'mean', MEAN: 'mean', MIN: 'min',
 // the number functions translate() knows (text, date and session functions are listed elsewhere)
 const MAX_SQL_DEPTH = 400;
 const SCALAR_FNS = new Set(['ABS', 'SQRT', 'FLOOR', 'CEIL', 'CEILING', 'ROUND', 'LEAST', 'GREATEST', 'COALESCE', 'IFNULL', 'NVL', 'NULLIF', 'DATE_TRUNC', 'DOW', 'DAYOFWEEK', 'WEEKDAY', 'ISODOW', 'NOW', 'CURRENT_TIMESTAMP', 'EPOCH', 'DATE_PART']);
+// sample (n - 1) or population (n) variance, and whether it's the standard deviation (its square root)
+const VARIANCE = { VARIANCE: { pop: false, sd: false }, VAR_SAMP: { pop: false, sd: false }, VAR_POP: { pop: true, sd: false }, STDDEV: { pop: false, sd: true }, STDDEV_SAMP: { pop: false, sd: true }, STDDEV_POP: { pop: true, sd: true } };
 const PERCENTILE = new Set(['MEDIAN', 'PERCENTILE_CONT', 'PERCENTILE_DISC', 'QUANTILE_CONT', 'QUANTILE_DISC', 'QUANTILE']);
 const WINDOW_FNS = { ROW_NUMBER: 'row_number', RANK: 'rank', DENSE_RANK: 'dense_rank', PERCENT_RANK: 'percent_rank', CUME_DIST: 'cume_dist', NTILE: 'ntile', LAG: 'lag', LEAD: 'lead', FIRST_VALUE: 'first_value', LAST_VALUE: 'last_value', NTH_VALUE: 'nth_value', SUM: 'sum', AVG: 'avg', MEAN: 'avg', MIN: 'min', MAX: 'max', COUNT: 'count' };
 const KEEPS_KIND = new Set(['lag', 'lead', 'first_value', 'last_value', 'nth_value', 'min', 'max']);
@@ -545,7 +547,7 @@ function roundWhole(s) {
   return cond(bin('<', s, num(0)), { t: 'un', op: '-', x: r }, r);
 }
 const constNum = (t) => (t.t === 'num' ? t.v : t.t === 'un' && t.op === '-' && t.x.t === 'num' ? -t.x.v : null);
-const isAgg = (e) => e.k === 'call' && (AGG[e.fn] || PERCENTILE.has(e.fn));
+const isAgg = (e) => e.k === 'call' && (AGG[e.fn] || PERCENTILE.has(e.fn) || VARIANCE[e.fn]);
 const key = (e) => JSON.stringify(e);
 // does e contain a node matching test (not looking inside subqueries or windows' own calls)?
 function has(e, test, intoWindows = false) {
@@ -1506,7 +1508,7 @@ function compileSelect(ast, env, outer, tail) {
         // (before its arguments: in a grouped query an unknown aggregate such as STDDEV(v) said "v must be in GROUP BY")
         if (!SCALAR_FNS.has(e.fn) && !sessionFn(e) && !extraFn(e) && !DATE_PART[e.fn]) {
           if (WINDOW_FNS[e.fn] && !AGG[e.fn]) fail(`${e.fn}() needs OVER (...)`);
-          fail(`unknown function ${e.fn}() (the aggregates are COUNT, SUM, AVG, MIN, MAX, MEDIAN, PERCENTILE_CONT, PERCENTILE_DISC, QUANTILE_CONT, QUANTILE_DISC and APPROX_COUNT_DISTINCT)`);
+          fail(`unknown function ${e.fn}() (the aggregates are COUNT, SUM, AVG, MIN, MAX, STDDEV, STDDEV_POP, VARIANCE, VAR_POP, MEDIAN, PERCENTILE_CONT, PERCENTILE_DISC, QUANTILE_CONT, QUANTILE_DISC and APPROX_COUNT_DISTINCT)`);
         }
         if (['COALESCE', 'IFNULL', 'NVL', 'NULLIF'].includes(e.fn) && kindOf(e, ctx) === 'text') {
           if (e.args.length < 2 || (e.fn === 'NULLIF' && e.args.length !== 2)) fail(`${e.fn}() needs ${e.fn === 'NULLIF' ? 'two values' : 'two values or more'}`);
@@ -1757,6 +1759,25 @@ function compileSelect(ast, env, outer, tail) {
       const name = `__a${aggs.size}_${n.hidden++}`;
       aggs.set(k, name);
       if (e.args.some(hasAgg)) fail('aggregates can\'t contain aggregates');
+      if (VARIANCE[e.fn]) { // two passes, exact: each group's mean on its rows (a window), then the squares around it
+        const { pop, sd } = VARIANCE[e.fn];
+        if (e.distinct) fail(`${e.fn}(DISTINCT ...) is not supported`);
+        if (e.args.length !== 1) fail(`${e.fn}() takes one value`);
+        if (kindOf(e.args[0], plain) !== 'number') fail(`${e.fn}() works on numbers`);
+        const x = hide(valueOf(e.args[0], plain), '__vx'), m = `__vm${n.hidden++}`, d = `__vd${n.hidden++}`;
+        q = q.window({ partition: keys.map((k) => k.name), order: [], items: [{ name: m, fn: 'avg', arg: x }] });
+        q = q.derive(d, `(${x} - ${m}) * (${x} - ${m})`);
+        // (the corrected two-pass sum: S2 - S1² / n cancels the mean's rounding, so equal values give 0)
+        spec[name] = `sum(${d})`;
+        spec[`${name}_e`] = `sum(${x} - ${m})`;
+        spec[`${name}_n`] = `count(${x})`;
+        spec[`${name}_d`] = `count(${d})`; // (fewer than n: an infinite value made a difference NaN)
+        const cnt = v(`${name}_n`), e1 = v(`${name}_e`);
+        const m2 = bin('-', v(name), bin('/', bin('*', e1, e1), cnt));
+        const val = call('max', bin('/', m2, pop ? cnt : bin('-', cnt, num(1))), num(0)); // (never below 0 by rounding)
+        // NULL for too few values; NaN where a value is infinite (overflowing squares give Infinity)
+        return cond(bin('>', cnt, num(pop ? 0 : 1)), cond(bin('==', v(`${name}_d`), cnt), sd ? call('sqrt', val) : val, num(NaN)), num(NaN));
+      }
       if (PERCENTILE.has(e.fn)) {
         const qn = percentileAgg(e, keys.map((x) => x.name), (x) => valueOf(x, plain));
         const arg = e.fn === 'MEDIAN' || e.fn.startsWith('QUANTILE') ? e.args[0] : e.within.e;

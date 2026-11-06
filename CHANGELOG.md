@@ -25,6 +25,11 @@ purpose, to match DuckDB and standard SQL:
   missing pieces.
 
 **SQL**
+- New aggregates: `STDDEV` / `STDDEV_SAMP`, `STDDEV_POP`, `VARIANCE` /
+  `VAR_SAMP` and `VAR_POP`, with or without GROUP BY and with `FILTER`, on
+  tables and datasets. Computed in two passes (each group's mean, then the
+  squares around it), so values far from 0 keep their digits (`1e9 + 1 ...
+  1e9 + 4` gives exactly what DuckDB gives).
 - LIKE and ILIKE (in SQL and in `like()` / `ilike()`) match in linear time.
   They were a backtracking regular expression: `LIKE '%a%e%o%zzz'` on 4 KB of
   ordinary text took 10 seconds.
