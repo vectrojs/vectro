@@ -18,7 +18,7 @@ import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { partitionedGroupsG, estimateGroups, PARTITION_ROWS, PARTITION_GROUPS, DIRECT_SLOTS } from './partition.mjs';
 import { joinTablesG, joinViewG, lookupGroupsG } from './join.mjs';
 import { Query } from './plan.mjs';
-import { bounds, windowValues, readsPeers, discRank } from './window.mjs';
+import { bounds, windowValues, readsPeers, discRank, between } from './window.mjs';
 import { copyRows } from './rows.mjs';
 import { textmapRows } from './textmap.mjs';
 import { writeArrow } from './arrow.mjs';
@@ -2290,7 +2290,7 @@ function percentileRanks(sizes, items) {
 }
 // Each item's value per partition, from the values found for the wanted ranks.
 function percentileValues(plan, got) {
-  return plan.map((ws) => Float64Array.from(ws, (w) => (!w ? NaN : w.frac ? got[w.at] + w.frac * (got[w.at + 1] - got[w.at]) : got[w.at])));
+  return plan.map((ws) => Float64Array.from(ws, (w) => (!w ? NaN : w.frac ? between(got[w.at], got[w.at + 1], w.frac) : got[w.at])));
 }
 // Key k of each kept group: from keys stored side by side (kv[g * nk + k]),
 // or from a direct group number (g / below % size steps from the offset).

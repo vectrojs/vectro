@@ -56,6 +56,9 @@ Fixes from audit round 5.
   each value once (DISTINCT was ignored); percentiles of text skip missing
   text and give a label (MEDIAN of text is the lower middle label, as in
   DuckDB; it gave a number), and PERCENTILE_CONT of text is an error.
+- PERCENTILE_CONT, MEDIAN and QUANTILE_CONT between an infinite value and
+  another give the infinite one (the median of -Infinity and 5 is -Infinity;
+  it was missing), and between huge values (±1e308) don't overflow.
 
 ## 0.1.4
 

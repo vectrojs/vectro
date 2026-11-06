@@ -121,7 +121,7 @@ export function windowValues(n, b, item, hasOrder, orderKey, desc) {
         let v = NaN;
         if (m) {
           if (item.fn === 'percentile_disc') v = xs[a + discRank(item.p, m, item.desc)];
-          else { const r = item.p * (m - 1), lo = Math.floor(r); v = xs[a + lo] + (r - lo) * ((xs[a + Math.min(m - 1, lo + 1)]) - xs[a + lo]); }
+          else { const r = item.p * (m - 1), lo = Math.floor(r); v = between(xs[a + lo], xs[a + Math.min(m - 1, lo + 1)], r - lo); }
         }
         out.fill(v, s, e);
         s = e;
@@ -169,3 +169,6 @@ export function windowValues(n, b, item, hasOrder, orderKey, desc) {
 // PERCENTILE_DISC(p): the rank (0 = the smallest of m values present) of the
 // first value, in the ORDER BY direction, whose share of the values reaches p
 export const discRank = (p, m, desc = false) => (desc ? m - Math.max(1, Math.ceil(p * m)) : Math.max(0, Math.ceil(p * m) - 1));
+// PERCENTILE_CONT between two neighbours, f of the way from x to y: as x * (1 - f) + y * f, which can't
+// overflow (±1e308) and keeps an infinite neighbour (x + (y - x) * f gives NaN there, -Infinity + Infinity)
+export const between = (x, y, f) => (f === 0 || x === y ? x : x * (1 - f) + y * f);
