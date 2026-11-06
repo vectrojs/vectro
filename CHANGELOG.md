@@ -21,6 +21,11 @@ Fixes from audit round 5 (the six worst bugs first).
   then ran out of memory. Other functions nested many levels deep (ROUND,
   NULLIF, %) stop at once with "the expression is too large" instead of
   hanging.
+- Datasets read asynchronously through the file descriptor they already hold.
+  On Node 25, a dataset queried with an async call and then dropped without
+  `close()` stopped the whole process at garbage collection ("A FileHandle
+  object was closed during garbage collection"). A dataset dropped without
+  `close()` now has its file closed when it is collected.
 
 ## 0.1.4
 

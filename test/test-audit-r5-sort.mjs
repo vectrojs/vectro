@@ -8,7 +8,7 @@
 // split-table topAsync keeps table order inside ties.
 import { Engine, MODE } from './test-mode.mjs';
 import { sql } from '../src/sql.mjs';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -93,13 +93,15 @@ if (MODE === 'node') {
     same([await d.sumAsync('v'), await d.minAsync('v'), await d.maxAsync('v')], [6, 1, 3], 'dataset sumAsync / minAsync / maxAsync');
   }
   await e.close();
-  const child = spawnSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', `
+  const script = join(dir, 'drop.mjs'); // (a file: a script given with -e can't start worker threads, X1)
+  writeFileSync(script, `
     import { Engine } from ${JSON.stringify(new URL('../src/node.mjs', import.meta.url).href)};
     const e = new Engine();
-    e.writeDataset(${JSON.stringify(path)}, { v: [1, 2, 3] });
-    for (let i = 0; i < 3; i++) { let d = e.openDataset(${JSON.stringify(path)}); await d.toRowsAsync(2); d = null; }
-    for (let i = 0; i < 5; i++) { gc(); await new Promise((r) => setTimeout(r, 30)); }
-    await e.close(); console.log('survived');`], { encoding: 'utf8' });
+    e.writeDataset(${JSON.stringify(path)}, { v: Float64Array.from({ length: 5000 }, (_, i) => i % 5) }, { rowsPerChunk: 1000 });
+    for (let i = 0; i < 3; i++) { let d = e.openDataset(${JSON.stringify(path)}); await d.toRowsAsync(5); d = null; }
+    for (let i = 0; i < 5; i++) { gc(); await new Promise((r) => setTimeout(r, 50)); }
+    await e.close(); console.log('survived');`);
+  const child = spawnSync(process.execPath, ['--expose-gc', script], { encoding: 'utf8' });
   same([child.stdout.trim(), (child.stderr.match(/FileHandle[^\n]*/) ?? [''])[0].slice(0, 60)], ['survived', ''], 'a dropped dataset used asynchronously does not crash at garbage collection');
 
   const { SplitEngine } = await import('../src/node.mjs');
