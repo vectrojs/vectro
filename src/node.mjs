@@ -114,7 +114,8 @@ export function spawnSplitWorker() {
   w.unref();
   return {
     post: (msg, transfer) => w.postMessage(msg, transfer ?? []),
-    onMessage: (fn) => w.on('message', fn),
+    onMessage: (fn) => { w.on('message', fn); w.unref(); }, // (a listener refs the worker again: a script that never calls close() would never end)
+    ref: () => w.ref(), unref: () => w.unref(), // (SplitEngine keeps the process alive while it waits for answers, see #hold)
     onError: (fn) => { w.on('error', fn); w.on('exit', (code) => fn(new Error(`exited with code ${code}`))); },
     terminate: () => w.terminate(),
   };

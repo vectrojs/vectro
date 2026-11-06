@@ -197,6 +197,10 @@ Fixes from audit round 5.
 - Streams: a blank line in a CSV stream (a heartbeat newline) is not a row,
   as JSON lines streams already skipped them; it was a row of missing values,
   so `count()` grew. `keepRows` counts rows, not blank lines.
+- Node: a script that leaves a `SplitEngine` open ends by itself, as with a
+  plain `Engine`; its worker threads kept it running forever. The workers keep
+  the process alive only while an answer is awaited, or while a stream reads
+  from a connection (`connect()`), until `close()`.
 
 ## 0.1.4
 

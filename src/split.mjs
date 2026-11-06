@@ -53,6 +53,7 @@ export class SplitEngine {
         const p = this.pending.get(m.rid);
         if (!p) return;
         this.pending.delete(m.rid);
+        this.#hold();
         if (m.ok) p.resolve(m.value); else p.reject(new Error(m.error));
       });
       w.onError?.((err) => this.#fail(i, err));
@@ -67,6 +68,18 @@ export class SplitEngine {
     if (this.failed[i]) return;
     this.failed[i] = new Error(`vectro: split-table worker ${i} stopped (${err?.message || 'no reason given; the browser may have run out of memory'}). Tables on this engine are incomplete; create a new SplitEngine.`);
     for (const [rid, p] of this.pending) if (p.worker === i) { this.pending.delete(rid); p.reject(this.failed[i]); }
+    this.#hold();
+  }
+
+  // Node: the workers keep the process alive only while an answer is awaited or a stream reads from a
+  // connection (a script that leaves a SplitEngine open, as a plain Engine, still ends by itself).
+  #held = false;
+  connections = 0;
+  #hold() {
+    const want = this.pending.size > 0 || this.connections > 0;
+    if (want === this.#held || this.closed) return;
+    this.#held = want;
+    for (const w of this.workers) (want ? w.ref : w.unref)?.();
   }
 
   _call(i, op, args, transfer = []) {
@@ -84,14 +97,18 @@ export class SplitEngine {
     const rid = ++this.rid;
     return new Promise((resolve, reject) => {
       this.pending.set(rid, { resolve, reject, worker: i, op });
+      this.#hold();
       try {
         this.workers[i].post({ rid, op, args }, transfer);
       } catch (err) { // e.g. out of memory while copying the message
         this.pending.delete(rid);
+        this.#hold();
         reject(err);
       }
     });
   }
+
+  _connected() { this.connections++; this.#hold(); }
 
   // A small single-thread engine on the page for results (group-by tables).
   get local() { return (this.localEngine ??= new LocalEngine()); }
@@ -704,7 +721,7 @@ export class StreamTable extends SplitTable {
   // { url: 'wss://…' } for a WebSocket (browsers, Node 22+; each message is
   // whole lines), or { host, port } for raw TCP (Node).
   connect(worker, { url, host = '127.0.0.1', port } = {}) {
-    return this.engine._call(worker, 'streamConnect', { id: this.id, url, host, port });
+    return this.engine._call(worker, 'streamConnect', { id: this.id, url, host, port }).then((v) => { this.engine._connected(); return v; }); // (reading from a connection keeps the process alive, until close())
   }
 
   // Parse whatever every worker has received; returns totals.
