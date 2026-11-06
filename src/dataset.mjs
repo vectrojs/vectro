@@ -564,13 +564,13 @@ export class Dataset {
           const g = groups[groups.length - 1];
           if (g && r[1] - g.end <= file.coalesce && r[1] + r[2] - g.start <= (file.pieceBytes ?? READ_PIECE)) { g.items.push(r); g.end = Math.max(g.end, r[1] + r[2]); } else groups.push({ start: r[1], end: r[1] + r[2], items: [r] });
         }
-        await Promise.all(groups.map(async (g) => {
+        await settled(groups.map(async (g) => {
           const buf = new Uint8Array(g.end - g.start);
           await file.read(buf, g.start);
           for (const [arr, off, len] of g.items) view(arr, 0, len).set(buf.subarray(off - g.start, off - g.start + len));
         }));
       } else {
-        await Promise.all(this.#pieces(reads).map(async ([arr, off, len, at]) => { // (in pieces: several reads at once)
+        await settled(this.#pieces(reads).map(async ([arr, off, len, at]) => { // (in pieces: several reads at once)
           if (this.engine.isShared) return file.read(view(arr, at, len), off); // straight into engine memory
           const buf = new Uint8Array(len); // (plain memory may move while the read runs)
           await file.read(buf, off);
@@ -628,6 +628,15 @@ function driveSync(gen) {
   return step.value;
 }
 
+// Promise.all that waits for every promise before failing: a read still writing into an array must
+// end before the chunk's arrays are freed
+async function settled(promises) {
+  const all = await Promise.allSettled(promises);
+  const bad = all.find((r) => r.status === 'rejected');
+  if (bad) throw bad.reason;
+  return all.map((r) => r.value);
+}
+
 async function driveAsync(gen) {
   const pending = new Map(); // chunk -> promise of its table
   try {
@@ -652,7 +661,10 @@ async function driveAsync(gen) {
     }
     return step.value;
   } finally {
-    for (const p of pending.values()) p.then((t) => t.dispose(), () => {});
+    // chunks read ahead and not used (the query failed, or stopped early): wait for them before the answer
+    // is given, so no work of this query is still on the engine's threads when the caller goes on
+    const left = await Promise.allSettled(pending.values());
+    for (const r of left) if (r.status === 'fulfilled') r.value.dispose();
   }
 }
 

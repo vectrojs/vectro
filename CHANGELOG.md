@@ -70,6 +70,10 @@ Fixes from audit round 5.
 - A script run with `node --input-type=module -e '…'` or piped into node can
   use worker threads: they inherited `--input-type`, which Node refuses for
   workers, so the process stopped as soon as the first one started.
+- An async dataset query is answered only once the chunks it read ahead are
+  done. When it failed or stopped early (a limit), that reading was still on
+  the worker threads, so the next sync call was sometimes refused with "an
+  async query is running on this engine", although the query was awaited.
 
 ## 0.1.4
 
