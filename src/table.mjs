@@ -48,10 +48,16 @@ export class Table {
     this.n = n;
     this.pred = pred;       // filter, as bound expression source (or null)
     this.params = params;   // scalar values the filter refers to
-    this.owned = owned;     // columns this table allocated (freed by dispose)
-    this.ownedBuffers = ownedBuffers; // e.g. CSV bytes that free-text columns point into
+    this.#own = { cols, owned, ownedBuffers }; // (freed when the table is collected, see track)
     this.zones = zones;     // may zone maps narrow filtered queries (see zones.mjs)
+    track(this, this.#own);
   }
+
+  #own;
+  get owned() { return this.#own.owned; }     // columns this table allocated (freed by dispose)
+  set owned(v) { this.#own.owned = v; }
+  get ownedBuffers() { return this.#own.ownedBuffers; } // e.g. CSV bytes that free-text columns point into
+  set ownedBuffers(v) { this.#own.ownedBuffers = v; }
 
   // With a filter, the rows that can match it according to the zone maps
   // (min and max per block, kept on each column and computed on first use),
@@ -147,7 +153,7 @@ export class Table {
   column(name) {
     const c = this.cols.get(name);
     if (!c) throw new Error(`vectro: no column "${name}"`);
-    return this.engine.live(c.data);
+    return handOut(this.engine, this.engine.live(c.data));
   }
 
   // ---- expressions ----------------------------------------------------------------
@@ -1950,6 +1956,7 @@ export class Table {
 
   // Free the columns this table allocated (shared columns stay alive).
   dispose() {
+    DROPPED.get(this.engine)?.registry.unregister(this.#own);
     for (const name of this.owned) {
       const c = this.cols.get(name);
       if (c?.data) this.engine.free(c.data);
@@ -1960,6 +1967,87 @@ export class Table {
     this.owned = [];
     this.ownedBuffers = [];
   }
+}
+
+// A table dropped without dispose() (one made inside a chain, as in t.sort(...).head(20), can't
+// be disposed) has its engine memory freed once it is collected: before, it stayed until
+// engine.close(). The JS heap doesn't see engine memory, so this is a backstop and dispose()
+// still frees at once. A view shares its source's arrays without referencing the source, so a
+// block is freed only when no live table's column and no array column() handed out lies in it;
+// otherwise it waits for the next try. Nothing is freed while a query runs.
+const DROPPED = new WeakMap(); // engine -> { registry, tables: Set<WeakRef<Table>>, handed: Set<WeakRef<array>>, pending, timer }
+function dropState(engine) {
+  let s = DROPPED.get(engine);
+  if (!s) {
+    s = { tables: new Set(), handed: new Set(), pending: [], timer: null };
+    s.registry = new FinalizationRegistry((own) => { s.pending.push(own); later(engine, s, 0); });
+    DROPPED.set(engine, s);
+  }
+  return s;
+}
+function track(table, own) {
+  const s = dropState(table.engine);
+  s.tables.add(new WeakRef(table));
+  if (s.tables.size > 2 * (s.seen ?? 64)) prune(s); // (dead references, also between collections)
+  if (own.owned.length || own.ownedBuffers.length) s.registry.register(table, own, own);
+}
+function handOut(engine, ta) {
+  // (its own view object, not the table's: the table's record holds those, so a reference to
+  // one couldn't tell whether the caller still uses it)
+  const view = new ta.constructor(ta.buffer, ta.byteOffset, ta.length);
+  const info = engine.allocInfo?.get(ta);
+  if (info) engine.allocInfo.set(view, info);
+  dropState(engine).handed.add(new WeakRef(view));
+  return view;
+}
+function prune(s) {
+  for (const r of s.tables) if (!r.deref()) s.tables.delete(r);
+  for (const r of s.handed) if (!r.deref()) s.handed.delete(r);
+  s.seen = s.tables.size;
+}
+function later(engine, s, ms) {
+  if (s.timer && s.due <= Date.now() + ms) return;
+  clearTimeout(s.timer);
+  s.due = Date.now() + ms;
+  s.timer = setTimeout(() => { s.timer = null; sweep(engine, s); }, ms);
+  s.timer.unref?.();
+}
+function sweep(engine, s) {
+  const state = engine._state;
+  if (state === 'closed') { s.pending = []; return; }
+  if (state === 'busy') return later(engine, s, 50);
+  const blocks = []; // [array, start, end] the dropped tables own
+  const span = (ta) => {
+    const info = engine.allocInfo.get(ta), start = info?.ptr ?? ta.byteOffset;
+    return [start, start + (info ? info.n * info.Type.BYTES_PER_ELEMENT : ta.byteLength)];
+  };
+  const waiting = [];
+  for (const own of s.pending) {
+    for (const name of own.owned) {
+      const data = own.cols.get(name)?.data;
+      if (!data) continue;
+      blocks.push([data, ...span(data)]);
+      for (const m of MASKS.get(data)?.values() ?? []) blocks.push([m, ...span(m)]);
+      MASKS.delete(data);
+    }
+    for (const b of own.ownedBuffers) blocks.push([b, ...span(b)]);
+  }
+  s.pending = [];
+  if (!blocks.length) return;
+  prune(s);
+  const used = [];
+  for (const r of s.tables) {
+    const t = r.deref();
+    if (t) for (const c of t.cols.values()) { if (c.data) used.push(span(c.data)); if (c.strings) used.push(span(c.strings)); }
+  }
+  for (const r of s.handed) { const a = r.deref(); if (a) used.push(span(a)); }
+  for (const [ta, start, end] of blocks) {
+    if (used.some(([a, b]) => a < end && start < b)) waiting.push(ta);
+    else engine.free(ta);
+  }
+  // (still in use: tried again later, less often while it stays in use)
+  s.wait = waiting.length ? Math.min(2 * (s.wait || 500), 60000) : 0;
+  if (waiting.length) { s.pending.push({ cols: new Map(), owned: [], ownedBuffers: waiting }); later(engine, s, s.wait); }
 }
 
 // A view over slices (a stream's rows for one query): free the filter masks made for it and

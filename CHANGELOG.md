@@ -90,6 +90,13 @@ Fixes from audit round 5.
   `keepMs`, also rows that arrived late with an old time. Only the rows at the
   front were dropped, so a late row from long ago stayed in "the last second"
   and went into its totals.
+- Tables dropped without `dispose()` have their engine memory freed once
+  they are garbage collected. A table made inside a chain
+  (`t.sort(...).head(20)`) can't be disposed, and was kept until
+  `engine.close()`: 150 such calls held 460 MB, and a long-running app ran out
+  of memory. `dispose()` still frees at once and is still the way to free
+  memory soon. `column()` now returns a new array view each call (over the
+  same memory).
 
 ## 0.1.4
 

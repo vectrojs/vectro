@@ -388,6 +388,8 @@ export class Engine {
 
   // True while an async query is running on the worker threads.
   get busy() { return this.#inFlight; }
+  // 'closed', 'busy' (a query is running or queued) or 'idle': when dropped tables may be freed (see table.mjs)
+  get _state() { return this.#closed ? 'closed' : this.#inFlight || this.#running.size ? 'busy' : 'idle'; }
 
   // The control block and scalar slots belong to the running task; touching
   // them while an async run is on the workers would corrupt it.

@@ -26,9 +26,9 @@ const big = (n) => ({ id: Float64Array.from({ length: n }, (_, i) => i), v: Floa
 const live = (e) => { let b = 0; for (const s of e.sizes.values()) b += s; return b; };
 const settle = async () => { for (let i = 0; i < 4; i++) { globalThis.gc(); await new Promise((r) => setTimeout(r, 20)); } };
 const outcome = (p) => p.then(() => 'resolved', (er) => (/closed/.test(er?.message) ? 'rejected: closed' : 'rejected: ' + String(er?.message).slice(0, 60)));\n`;
-const run = (name, body, timeout = 30000) => {
+const run = (name, body, timeout = 30000, env = {}) => {
   const file = join(dir, name + '.mjs'); writeFileSync(file, head + body);
-  const r = spawnSync(process.execPath, ['--expose-gc', file], { encoding: 'utf8', timeout });
+  const r = spawnSync(process.execPath, ['--expose-gc', file], { encoding: 'utf8', timeout, env: { ...process.env, ...env } });
   return { out: r.stdout.trim(), status: r.signal ? 'killed after ' + timeout / 1000 + ' s' : r.status, err: r.stderr.split('\n').filter((l) => /Error|UNHANDLED/.test(l)).slice(0, 2).join(' ') };
 };
 
@@ -56,6 +56,14 @@ t.sort(['g', '-v']).head(20).toRows(); await settle(); const a = live(e);
 for (let i = 0; i < 30; i++) { t.sort(['g', '-v']).head(20).toRows(); t.derive('x', 'v * 2').filter('x > 10').top(5, '-x').toRows(); t.filter('v > 500').groupBy('g').agg({ n: 'count()' }).toRows(); }
 await settle(); console.log(Math.round((live(e) - a) / 2 ** 20)); await e.close();`, 120000);
   same(Number(r.out) <= 20 ? 'freed' : `${r.out} MB still held after 30 chains`, 'freed', 'tables made inside a dataframe chain are freed once dropped');
+}
+{ // (a view shares its source's arrays without referencing the source; freed memory is overwritten here)
+  const r = run('chain-view', `const e = new Engine(), t = e.table(big(300000));
+const v = t.sort(['-v']).filter('v > 990'), s = t.derive('x', 'v * 2').select(['x', 'g']), col = t.sort(['v']).column('v');
+const ask = () => JSON.stringify([v.toRows().length, s.head(3).toRows(), col[299999]]), want = ask();
+await settle(); for (let i = 0; i < 20; i++) { t.sort(['g', '-v']).head(20).toRows(); await new Promise((r) => setTimeout(r, 0)); }
+await settle(); console.log(ask() === want ? 'same' : 'changed'); await e.close();`, 120000, { VECTRO_POISON: '1' });
+  same(r.out, 'same', 'views and column() arrays of a dropped table keep their values');
 }
 // 3. close() while work runs: the work is rejected as closed, nothing is unhandled, the process ends by itself
 const STOP = {
