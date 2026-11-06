@@ -5,8 +5,8 @@
 // ß, right-to-left text, tabs and newlines, 100 KB and near-512 KB strings),
 // checked against plain JS on tables and datasets, sync and async; the answers
 // were checked against DuckDB in vectro-qa-2026-11-05/text. Also: REVERSE keeps
-// emoji and accented letters whole; an empty piece in || doesn't make the whole
-// text missing; LIKE ... ESCAPE; LIKE and ILIKE with several % take linear time
+// emoji and accented letters whole; || keeps SQL's rule (an empty piece, which
+// is missing text, makes it missing) while CONCAT skips it; LIKE ... ESCAPE; LIKE and ILIKE with several % take linear time
 // (they were a backtracking regex: 10 s on 4 KB of English).
 import { Engine, MODE } from './test-mode.mjs';
 import { sql } from '../src/sql.mjs';
@@ -63,8 +63,9 @@ const F = { // SQL -> JS on a present value (missing in gives missing out)
   "s ILIKE 'ABC%'": (s) => +likeRef(s, 'ABC%', true), "s ILIKE 'İ%'": (s) => +likeRef(s, 'İ%', true), "s ILIKE 'σ%'": (s) => +likeRef(s, 'σ%', true),
   "s LIKE 'a$%b' ESCAPE '$'": (s) => +likeRef(s, 'a$%b', false, '$'), "s LIKE 'a!_%' ESCAPE '!'": (s) => +likeRef(s, 'a!_%', false, '!'),
   "s < 'b'": (s) => +(s.codePointAt(0) < 98), // text is compared by code point
-  // an empty piece in || is not missing text
-  'UPPER(SUBSTRING(s, 1, 1)) || LOWER(SUBSTRING(s, 2))': (s) => cs(s)[0].toUpperCase() + F['LOWER(s)'](substr(s, 2)), 's || SUBSTRING(s, 999999)': (s) => s,
+  // || keeps SQL's rule (a missing piece makes it missing, and '' is missing text); CONCAT skips missing pieces
+  'UPPER(SUBSTRING(s, 1, 1)) || LOWER(SUBSTRING(s, 2))': (s) => (cs(s).length > 1 ? cs(s)[0].toUpperCase() + F['LOWER(s)'](substr(s, 2)) : NaN), 's || SUBSTRING(s, 999999)': () => NaN,
+  'CONCAT(UPPER(SUBSTRING(s, 1, 1)), LOWER(SUBSTRING(s, 2)))': (s) => cs(s)[0].toUpperCase() + F['LOWER(s)'](substr(s, 2)), 'CONCAT(s, SUBSTRING(s, 999999))': (s) => s,
 };
 
 const dir = mkdtempSync(join(tmpdir(), 'vectro-r5-text-'));
@@ -76,7 +77,7 @@ for (const [opts, source] of [[{}, 'table'], [{ threads: 1 }, 'table'], [{}, 'da
   const run = async (q) => (source === 'async' ? sql(q, { t }).toRowsAsync() : sql(q, { t }).toRows());
   for (const [x, f] of Object.entries(F)) {
     let got; try { got = (await run(`SELECT id, ${x} AS x FROM t`)).sort((a, b) => a.id - b.id).map((r) => r.x); } catch (err) { got = [err.message]; }
-    same(got, KIT.map((s) => (s === '' ? (x.startsWith('CONCAT(') ? 'x' : null) : f(s))), `${tag} ${x}`); // (CONCAT skips missing pieces)
+    same(got, KIT.map((s) => (s === '' ? (x === "CONCAT(s, NULL, 'x')" ? 'x' : null) : f(s))), `${tag} ${x}`); // (CONCAT skips missing pieces)
   }
   for (const w of ["s LIKE 'a%'", "s ILIKE '%B%'", "s LIKE '%b%_'", "CONTAINS(s, 'é')", "LENGTH(s) = 1"]) {
     let got; try { got = (await run(`SELECT id FROM t WHERE ${w}`)).map((r) => r.id).sort((a, b) => a - b); } catch (err) { got = [err.message]; }

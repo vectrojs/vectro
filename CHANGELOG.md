@@ -62,6 +62,11 @@ Fixes from audit round 5.
 - Text holding both `'` and `"` works everywhere: as a PostgreSQL parameter
   (`O'Brien "Bob"` was refused), in SQL, and in expressions, where `''`
   inside `'...'` is one `'` (`filter("name == 'O''Brien'")`).
+- (Unchanged, now tested) `||` keeps SQL's rule: a missing piece makes the
+  whole text missing, and empty text is missing text in Vectro, so
+  `'a' || SUBSTRING('a', 2)` is missing. CONCAT skips missing pieces:
+  `CONCAT(UPPER(SUBSTRING(s, 1, 1)), LOWER(SUBSTRING(s, 2)))` capitalizes a
+  one-letter word too.
 
 ## 0.1.4
 
