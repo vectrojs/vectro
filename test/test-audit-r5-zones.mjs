@@ -12,6 +12,7 @@
 import { Engine, MODE } from './test-mode.mjs';
 import { sql } from '../src/sql.mjs';
 import { mkdtempSync, rmSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path';
+const OPEN = /can't replace .* while it is open/; // (Windows can't replace a file that is open: vectro's plain error)
 if (MODE !== 'node') { console.log('datasets are Node only: skipped'); process.exit(0); }
 const OPTS = process.env.OPTS ?? 'default';
 const e = new Engine(OPTS === 'serial' ? { threads: 1 } : {});
@@ -94,7 +95,8 @@ for (const [label, n, ch] of SETS) {
   const p1 = join(dir, 'view.vectro');
   try { e.writeDataset(p1, t.filter("s == 'x'")); const d1 = e.openDataset(p1), d2 = e.openDataset(p1); ok([d1.toRows(), d2.count()], [[{ a: 1, s: 'x' }, { a: NaN, s: 'x' }], 2], 'dataset from a filtered view, opened twice'); d1.close(); d2.close(); } catch (er) { err++; bad.push('view dataset ERROR ' + er.message.slice(0, 120)); }
   try { e.writeDataset(p1, t); const d3 = e.openDataset(p1); ok(d3.count(), 4, 'a dataset written over'); d3.close(); } catch (er) { err++; bad.push('overwrite ERROR ' + er.message.slice(0, 120)); }
-  try { const d4 = e.openDataset(p1); e.writeDataset(p1, t.filter('a > 1')); ok([d4.count(), e.openDataset(p1).count()], [4, 2], 'written over while open'); d4.close(); } catch (er) { err++; bad.push('overwrite while open: ' + er.message.slice(0, 120)); }
+  // (Windows can't replace a file that is open: the plain error is the answer there)
+  try { const d4 = e.openDataset(p1); try { e.writeDataset(p1, t.filter('a > 1')); ok([d4.count(), e.openDataset(p1).count()], [4, 2], 'written over while open'); } catch (er) { if (OPEN.test(er.message)) pass++; else throw er; } finally { d4.close(); } } catch (er) { err++; bad.push('overwrite while open: ' + er.message.slice(0, 120)); }
 }
 // a handle left open while its file is written over: the old answers or an error, never a mix
 {
@@ -103,10 +105,9 @@ for (const [label, n, ch] of SETS) {
   e.writeDataset(p, mk(1), { rowsPerChunk: 10000 });
   const d = e.openDataset(p);
   const before = [d.filter('r > 500').agg({ s: 'sum(a)', n: 'count()' }), d.toRows(3)];
-  e.writeDataset(p, mk(3), { rowsPerChunk: 10000 });
-  let after; try { after = [d.filter('r > 500').agg({ s: 'sum(a)', n: 'count()' }), d.toRows(3)]; } catch (er) { after = null; }
-  if (after === null) pass++; else ok(after, before, 'an open dataset whose file is written over gives its old answers (or an error)');
-  d.close();
+  let written = true; try { e.writeDataset(p, mk(3), { rowsPerChunk: 10000 }); } catch (er) { if (!OPEN.test(er.message)) throw er; written = false; } // (Windows: the plain error)
+  let after; if (!written) { pass++; d.close(); } else try { after = [d.filter('r > 500').agg({ s: 'sum(a)', n: 'count()' }), d.toRows(3)]; } catch (er) { after = null; }
+  if (written) { if (after === null) pass++; else ok(after, before, 'an open dataset whose file is written over gives its old answers (or an error)'); d.close(); }
 }
 let failures = fail + err, checks = pass + fail + err;
 for (const b of bad.slice(0, 30)) console.log('FAIL ' + b);
