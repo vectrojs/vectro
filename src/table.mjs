@@ -48,16 +48,19 @@ export class Table {
     this.n = n;
     this.pred = pred;       // filter, as bound expression source (or null)
     this.params = params;   // scalar values the filter refers to
-    this.#own = { cols, owned, ownedBuffers }; // (freed when the table is collected, see track)
+    // owned: columns this table allocated (freed by dispose); ownedBuffers: e.g. CSV bytes that free-text
+    // columns point into. Both kept in a record that is freed when the table is collected (see track),
+    // as accessors of this table (internal, not on the class)
+    const own = (this.#own = { cols, owned, ownedBuffers });
+    Object.defineProperties(this, {
+      owned: { get: () => own.owned, set: (v) => { own.owned = v; } },
+      ownedBuffers: { get: () => own.ownedBuffers, set: (v) => { own.ownedBuffers = v; } },
+    });
     this.zones = zones;     // may zone maps narrow filtered queries (see zones.mjs)
-    track(this, this.#own);
+    track(this, own);
   }
 
   #own;
-  get owned() { return this.#own.owned; }     // columns this table allocated (freed by dispose)
-  set owned(v) { this.#own.owned = v; }
-  get ownedBuffers() { return this.#own.ownedBuffers; } // e.g. CSV bytes that free-text columns point into
-  set ownedBuffers(v) { this.#own.ownedBuffers = v; }
 
   // With a filter, the rows that can match it according to the zone maps
   // (min and max per block, kept on each column and computed on first use),
