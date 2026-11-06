@@ -108,7 +108,8 @@ export class Query {
   // only after that join ran (an earlier input of the same union).
   static unmatched(state, names) { return new Query({ op: 'unmatched', state, names }); }
   groupBy(keys) {
-    return { agg: (spec, params = {}) => new Query({ op: 'aggregate', input: this.node, keys: keyList(keys), spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) }) };
+    const agg = (spec, params = {}) => new Query({ op: 'aggregate', input: this.node, keys: keyList(keys), spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) });
+    return { agg, aggAsync: (spec, params) => agg(spec, params).collectAsync() }; // (aggAsync: the groups, in a table)
   }
 
   // ---- running --------------------------------------------------------------------

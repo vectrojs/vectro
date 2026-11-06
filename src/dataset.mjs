@@ -438,12 +438,21 @@ export class Dataset {
   groupBy(keys) { return this.lazy().groupBy(keys); }
   agg(spec, params) { return this.lazy().agg(spec, params); }
   aggAsync(spec, params) { return this.lazy().aggAsync(spec, params); }
-  count(expr) { return expr ? this.agg({ v: `count(${expr})` }).v : this.lazy().count(); }
-  async countAsync(expr) { return expr ? (await this.aggAsync({ v: `count(${expr})` })).v : this.lazy().countAsync(); }
+  count(expr, params) { return expr ? this.agg({ v: `count(${expr})` }, params).v : this.lazy().count(); }
+  async countAsync(expr, params) { return expr ? (await this.aggAsync({ v: `count(${expr})` }, params)).v : this.lazy().countAsync(); }
   sum(expr, params) { return this.agg({ v: `sum(${expr})` }, params).v; }
   mean(expr, params) { return this.agg({ v: `mean(${expr})` }, params).v; }
   min(expr, params) { return this.agg({ v: `min(${expr})` }, params).v; }
   max(expr, params) { return this.agg({ v: `max(${expr})` }, params).v; }
+  async sumAsync(expr, params) { return (await this.aggAsync({ v: `sum(${expr})` }, params)).v; }
+  async meanAsync(expr, params) { return (await this.aggAsync({ v: `mean(${expr})` }, params)).v; }
+  async minAsync(expr, params) { return (await this.aggAsync({ v: `min(${expr})` }, params)).v; }
+  async maxAsync(expr, params) { return (await this.aggAsync({ v: `max(${expr})` }, params)).v; }
+  // (as a table's: the rows, in a table in memory)
+  sortAsync(by) { return this.lazy().sort(by).collectAsync(); }
+  topAsync(k, by) { return this.lazy().top(k, by).collectAsync(); }
+  limitAsync(n, offset) { return this.lazy().limit(n, offset).collectAsync(); }
+  joinAsync(other, opts) { return this.lazy().join(other, opts).collectAsync(); }
   head(n) { return this.lazy().limit(n).collect(); }
   headAsync(n) { return this.lazy().limit(n).collectAsync(); }
   toRows(limit = Infinity) { return this.lazy().toRows(limit); }
@@ -451,6 +460,7 @@ export class Dataset {
   collect() { return this.lazy().collect(); }        // the whole dataset in memory
   collectAsync() { return this.lazy().collectAsync(); }
   explain() { return this.lazy().explain(); }
+  async explainAsync() { return this.explain(); } // (nothing runs: the plan as text)
 
   // Called by plan.mjs for a plan that reads a dataset.
   runPlan(plan, sync) { return sync ? driveSync(runPlanG(plan)) : driveAsync(runPlanG(plan)); }

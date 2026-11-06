@@ -81,6 +81,11 @@ Fixes from audit round 5.
 - Datasets: a group whose values in one chunk hold both +Infinity and
   -Infinity sums to NaN, as on a table; SUM, AVG and group sums left that
   chunk out (a SUM of 3 instead of NaN, a group sum of 0).
+- Datasets have the documented async versions: `sortAsync`, `topAsync`,
+  `limitAsync`, `joinAsync` (the rows, in a table, as on a table), `sumAsync`,
+  `meanAsync`, `minAsync`, `maxAsync`, `explainAsync`, and
+  `groupBy(...).aggAsync` (also on lazy queries). They were missing
+  (TypeError). `count` / `countAsync` take params.
 
 ## 0.1.4
 
