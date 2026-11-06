@@ -1327,6 +1327,26 @@ function groupAccumulator(kind, B, engine, ds, derived) {
     merge[p] = parse(`${ast.fn === 'count' ? 'sum' : ast.fn}(${p})`);
     outs.push({ out, col: p });
   });
+  // A group's sum over a chunk is NaN where its values hold +Infinity and -Infinity. Summing partial sums skips
+  // NaN (it is missing), so each one's groups where it is NaN are counted in a column of their own, summed
+  // too, and the answer is NaN there
+  const nanOf = (k) => `${k}__nan`;
+  const sums = Object.keys(partial).filter((k) => partial[k].fn === 'sum');
+  for (const k of sums) merge[nanOf(k)] = parse(`sum(${nanOf(k)})`);
+  const markNaN = (t) => {
+    for (const k of sums) {
+      const d = engine.live(t.cols.get(k).data), flag = engine.alloc(Float64Array, t.n), f = engine.live(flag);
+      for (let i = 0; i < t.n; i++) f[i] = d[i] === d[i] ? 0 : 1;
+      t.cols.set(nanOf(k), { data: f, dict: null, codes: null });
+      t.owned = [...t.owned, nanOf(k)];
+    }
+  };
+  const nanBack = (G, k, data) => { // (NaN in the answer where a chunk's sum was)
+    const flag = G.cols.get(nanOf(k));
+    if (!flag) return;
+    const f = engine.live(flag.data), d = engine.live(data);
+    for (let i = 0; i < G.n; i++) if (f[i] > 0) d[i] = NaN;
+  };
   if (!Object.keys(partial).length) { partial.__vectro_rows = parse('count()'); merge.__vectro_rows = parse('sum(__vectro_rows)'); }
   const main = { parts: [], rows: 0, last: 0 };
   const dense = kind === 'group' ? densePlan(ds, derived, keys, partial, engine) : null;
@@ -1372,6 +1392,7 @@ function groupAccumulator(kind, B, engine, ds, derived) {
       } else {
         const r = yield { run: { op: 'output', input: { op: 'aggregate', keys, spec: partial, input: P } } };
         const kept = yield* keep(engine, r, chunk);
+        markNaN(kept);
         main.parts.push(kept);
         main.rows += kept.n;
         chunksDone++;
@@ -1487,10 +1508,11 @@ function groupAccumulator(kind, B, engine, ds, derived) {
         const take = (t, name) => { t.owned = t.owned.filter((n) => n !== name); return t.cols.get(name); };
         for (const k of keys) { cols.set(k, take(G, k)); owned.push(k); }
         for (const o of outs) {
-          if (o.col) cols.set(o.out, take(G, o.col));
+          if (o.col) { cols.set(o.out, take(G, o.col)); nanBack(G, o.col, cols.get(o.out).data); }
           else if (o.mean) {
             const data = engine.alloc(Float64Array, G.n);
             if (G.n) engine.eval('s / n', { s: G.cols.get(`${o.mean}s`).data, n: G.cols.get(`${o.mean}n`).data }, data);
+            nanBack(G, `${o.mean}s`, data);
             cols.set(o.out, { data: engine.live(data), dict: null, codes: null });
           } else if (counts[o.distinct].bits) { // each group's bits
             const bm = counts[o.distinct], data = engine.alloc(Float64Array, G.n);

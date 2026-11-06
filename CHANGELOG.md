@@ -78,6 +78,9 @@ Fixes from audit round 5.
   or top, no longer fails (`derive('x', 'a + b').limit(2).agg({ s: 'sum(a)' })`
   said "unknown column b"; `select('id', 'a').top(1, '-a').agg(...)` said "no
   column id"). Each chunk's plan now keeps only the columns used above it.
+- Datasets: a group whose values in one chunk hold both +Infinity and
+  -Infinity sums to NaN, as on a table; SUM, AVG and group sums left that
+  chunk out (a SUM of 3 instead of NaN, a group sum of 0).
 
 ## 0.1.4
 
