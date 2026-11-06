@@ -650,7 +650,11 @@ export class StreamTable extends SplitTable {
   // unfinished row is kept for the next chunk.
   push(chunk) {
     if (this.format === 'vectro' || this.format === 'arrow') return Promise.reject(new Error("vectro: binary streams take frames over connections: connect each worker to the sender (push() is for 'csv' and 'ndjson')"));
-    const bytes = typeof chunk === 'string' ? encode(chunk) : chunk;
+    let bytes = typeof chunk === 'string' ? encode(chunk) : chunk;
+    if (!this.begun && bytes.length) { // (a UTF-8 BOM before the first row: dropped, it would go into the first value)
+      this.begun = true;
+      if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) bytes = bytes.subarray(3);
+    }
     let last, rows = 0; // last: the last row's newline
     if (this.format === 'csv') {
       const r = csvTail(bytes, 0, bytes.length, COMMA, this.quote);

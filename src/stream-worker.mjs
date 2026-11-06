@@ -245,6 +245,9 @@ export function createStreams(getEngine) {
     if (s.pendingBytes > HIGH && !s.paused && s.sockets.length) { s.paused = true; for (const socket of s.sockets) socket.pause(); }
   }
 
+  // (a UTF-8 BOM before a sender's first row: dropped, it would go into the first value)
+  const noBOM = (b) => (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf ? b.subarray(3) : b);
+
   // Bytes cut anywhere: keep what follows the last row end for next time
   // (CSV: the last newline outside quotes, with the quote state carried on).
   function receive(s, chunk) {
@@ -485,7 +488,7 @@ export function createStreams(getEngine) {
       return new Promise((resolve, reject) => {
         const socket = net.connect({ host, port }, () => resolve(true));
         if (s.format === 'vectro' || s.format === 'arrow') { const reader = frameReceiver(s); socket.on('data', (chunk) => receiveFrames(s, reader, chunk)); } else
-        socket.on('data', (chunk) => receive(s, chunk));
+        { let first = true; socket.on('data', (chunk) => { if (first && chunk.length) { first = false; chunk = noBOM(chunk); } receive(s, chunk); }); }
         socket.on('end', () => { if (s.partial) { queue(s, concat([s.partial, Uint8Array.of(NL)])); s.partial = null; s.quote = CSV_FIELD_START; } flush(s); });
         socket.on('error', (err) => { s.error ??= err.message; reject(err); });
         s.sockets.push(socket);
@@ -577,7 +580,7 @@ export function createStreams(getEngine) {
       const reader = s.format === 'vectro' || s.format === 'arrow' ? frameReceiver(s) : null;
       ws.onmessage = (ev) => {
         if (reader) { if (typeof ev.data !== 'string') receiveFrames(s, reader, new Uint8Array(ev.data)); return; }
-        const bytes = typeof ev.data === 'string' ? textEncoder.encode(ev.data) : new Uint8Array(ev.data);
+        const bytes = noBOM(typeof ev.data === 'string' ? textEncoder.encode(ev.data) : new Uint8Array(ev.data));
         if (!bytes.length) return;
         queue(s, bytes[bytes.length - 1] === NL ? bytes : concat([bytes, Uint8Array.of(NL)]));
       };
