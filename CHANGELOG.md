@@ -201,6 +201,8 @@ Fixes from audit round 5.
   plain `Engine`; its worker threads kept it running forever. The workers keep
   the process alive only while an answer is awaited, or while a stream reads
   from a connection (`connect()`), until `close()`.
+- Split tables: `topAsync` keeps table order among tied rows, as `top` on a
+  table does (row 13000 came before row 5000). The values were right.
 
 ## 0.1.4
 

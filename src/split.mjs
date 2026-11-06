@@ -575,7 +575,11 @@ export class SplitTable {
     const parts = await this.#all('top', { k, by, columns });
     const keys = parts[0]?.keys ?? [];
     const cand = [];
-    parts.forEach((p, w) => p.rows.forEach((row, i) => cand.push({ row, w, i, vals: p.values.map((v) => v && v[i]) })));
+    // ties in table order: a worker's row at place L is in its block r (blocks are dealt round-robin, see
+    // inOrder), so (r, worker, L) orders rows as the table has them
+    const ends = this.segs.map((sg) => { let e = 0; return Float64Array.from(sg, (x) => (e += x)); }); // (each block's end, per worker)
+    const roundOf = (w, L) => { const E = ends[w]; let lo = 0, hi = E.length; while (lo < hi) { const m = (lo + hi) >> 1; if (E[m] > L) hi = m; else lo = m + 1; } return lo; };
+    parts.forEach((p, w) => p.rows.forEach((row, i) => cand.push({ row, w, i, r: p.places ? roundOf(w, p.places[i]) : 0, L: p.places?.[i] ?? i, vals: p.values.map((v) => v && v[i]) })));
     const cmp = (a, b) => {
       for (let j = 0; j < keys.length; j++) {
         if (keys[j]) { // text: by label
@@ -590,7 +594,7 @@ export class SplitTable {
           return x < y ? -1 : 1;
         }
       }
-      return a.w - b.w || a.i - b.i;
+      return a.r - b.r || a.w - b.w || a.L - b.L;
     };
     const rows = cand.sort(cmp).slice(0, k).map((c) => c.row);
     const names = rows.length ? Object.keys(rows[0]) : (columns ?? this.meta.names);
