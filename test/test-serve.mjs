@@ -21,7 +21,7 @@ const orders = {
 };
 
 // answers as JSON would have them: dates as ISO text, missing as null
-const plain = (rows) => rows.map((r) => Object.values(r).map((v) => (v instanceof Date ? v.toISOString() : typeof v === 'number' && !Number.isFinite(v) ? null : v === '' ? null : v)));
+const plain = (rows) => rows.map((r) => Object.values(r).map((v) => (v instanceof Date ? v.toISOString() : typeof v === 'number' && !Number.isFinite(v) ? (v !== v ? null : String(v)) : v === '' ? null : v)));
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 function parseCSV(text) { // RFC 4180, for the test
   const rows = [];

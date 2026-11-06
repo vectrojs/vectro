@@ -107,6 +107,10 @@ Fixes from audit round 5.
 - `writeArrow`: a text column whose first value is null is written as text
   (it was taken for numbers, and every value was lost), and null text is
   missing (it was written as the text "null").
+- HTTP answers (JSON, JSON lines, CSV) and the MCP tools write ±Infinity as
+  the text `"Infinity"` / `"-Infinity"` (`Infinity` / `-Infinity` in CSV).
+  They were null, the same as a missing value, so `MIN(x) = -Infinity` reached
+  Excel or an LLM as "no value". NaN is still missing.
 
 ## 0.1.4
 

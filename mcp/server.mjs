@@ -138,7 +138,7 @@ function getTable(name) {
   return entry;
 }
 
-const clean = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Date ? v.toISOString() : typeof v === 'number' && !Number.isFinite(v) ? null : v])));
+const clean = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Date ? v.toISOString() : typeof v === 'number' && !Number.isFinite(v) ? (v !== v ? null : v > 0 ? 'Infinity' : '-Infinity') : v]))); // (±Infinity as text, as the HTTP server writes it; NaN is missing)
 const handlers = {
   sql({ query }) {
     const all = Object.fromEntries([...tables].map(([n, e]) => [n, e.table]));
