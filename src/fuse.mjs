@@ -6,7 +6,7 @@ import { I32, F64, V128, TY, Fn, loops, buildModule, get, set, simd, vload, vsto
 
 // ---- parsing -----------------------------------------------------------------
 
-const TOKEN = /\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|([A-Za-z_]\w*)|(&&|\|\||==|!=|<=|>=|[-+*/()<>,?:!])|'([^']*)'|"([^"]*)")/y;
+const TOKEN = /\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|([A-Za-z_]\w*)|(&&|\|\||==|!=|<=|>=|[-+*/()<>,?:!])|'((?:[^']|'')*)'|"([^"]*)")/y; // (inside '...', '' is one ')
 
 function tokenize(src) {
   const out = [];
@@ -18,7 +18,7 @@ function tokenize(src) {
     if (m[1] !== undefined) out.push({ t: 'num', v: Number(m[1]) });
     else if (m[2] !== undefined) out.push({ t: 'id', v: m[2] });
     else if (m[3] !== undefined) out.push({ t: 'op', v: m[3] });
-    else out.push({ t: 'str', v: m[4] ?? m[5] });
+    else out.push({ t: 'str', v: m[4] !== undefined ? m[4].replaceAll("''", "'") : m[5] });
   }
   return out;
 }
@@ -122,11 +122,11 @@ const isReduction = (n) => n.t === 'call' && REDUCTIONS.has(n.fn) && n.args.leng
 // Masks are true/false values (comparisons and logic); everything else is a number.
 export const isMask = (n) => (n.t === 'bin' && (CMP[n.op] || n.op === '&&' || n.op === '||')) || (n.t === 'un' && n.op === '!');
 
-// Text as the tokenizer reads it back exactly (no escapes inside quotes).
+// Text as the tokenizer reads it back exactly ('' inside '...' is one ').
 export function quoteText(v) {
   if (!v.includes("'")) return `'${v}'`;
   if (!v.includes('"')) return `"${v}"`;
-  throw new SyntaxError(`vectro: text with both ' and " can't be used in an expression: ${JSON.stringify(v)}`);
+  return `'${v.replaceAll("'", "''")}'`; // (both kinds: ' doubled, as SQL writes it)
 }
 
 // Turn an AST back into source (fully parenthesized), e.g. after rewriting it.

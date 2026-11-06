@@ -59,6 +59,9 @@ Fixes from audit round 5.
 - PERCENTILE_CONT, MEDIAN and QUANTILE_CONT between an infinite value and
   another give the infinite one (the median of -Infinity and 5 is -Infinity;
   it was missing), and between huge values (±1e308) don't overflow.
+- Text holding both `'` and `"` works everywhere: as a PostgreSQL parameter
+  (`O'Brien "Bob"` was refused), in SQL, and in expressions, where `''`
+  inside `'...'` is one `'` (`filter("name == 'O''Brien'")`).
 
 ## 0.1.4
 
