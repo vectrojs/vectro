@@ -7,7 +7,7 @@
 // Workers. With it, nothing else needs code generation.
 
 import { I32, F64, V128, TY, Fn, loops, buildModule, kernelFns, get, set, i32c, simd, vload, vstore, block, loop, end, br, brIf, i32add, i32geu, emitModScalar, emitModVector } from './wasm.mjs';
-import { VEC, SCA } from './fuse.mjs';
+import { VEC, SCA, F32X4_DEMOTE_ZERO, F32_DEMOTE, F64_PROMOTE } from './fuse.mjs';
 
 const V128_AND = 0x4e, BITSELECT = 0x52, F64X2_PROMOTE_LOW = 0x5f, F64X2_ADD = 0xf0, SHUFFLE = 0x0d;
 const SELECT = [0x1b], I32_SUB = [0x6b], I32_SHR_U = [0x76], I32_SHL = [0x74], I32_MUL = [0x6c];
@@ -19,7 +19,7 @@ const U = 2;
 
 export const BINARY_OPS = ['add', 'sub', 'mul', 'div', 'min', 'max'];
 export const COMPARE_OPS = ['eq', 'ne', 'lt', 'gt', 'le', 'ge'];
-export const UNARY_OPS = ['neg', 'abs', 'sqrt', 'floor', 'ceil'];
+export const UNARY_OPS = ['neg', 'abs', 'sqrt', 'floor', 'ceil', 'fround'];
 
 // dst = a OP b; comparisons give 1.0 or 0.0. (dst, a, b, n)
 function vbinary(t, op) {
@@ -71,10 +71,13 @@ function vunary(t, op) {
   const ty = TY[t];
   const f = new Fn(`v${op}_${t}`, [I32, I32, I32], []);
   const [dst, a, n] = [0, 1, 2];
+  // (fround: to a 32-bit float and back; f32 values already are)
+  const vop = op !== 'fround' ? simd(VEC[t][op]) : t === 'f64' ? [...simd(F32X4_DEMOTE_ZERO), ...simd(F64X2_PROMOTE_LOW)] : [];
+  const sop = op !== 'fround' ? [SCA[t][op]] : t === 'f64' ? [F32_DEMOTE, F64_PROMOTE] : [];
   loops(f, ty, {
     ptrs: [a, dst], n, U,
-    body: () => { for (let k = 0; k < U; k++) f.emit(get(dst), get(a), vload(16 * k), simd(VEC[t][op]), vstore(16 * k)); },
-    tail: () => f.emit(get(dst), get(a), ty.load, [SCA[t][op]], ty.store),
+    body: () => { for (let k = 0; k < U; k++) f.emit(get(dst), get(a), vload(16 * k), vop, vstore(16 * k)); },
+    tail: () => f.emit(get(dst), get(a), ty.load, sop, ty.store),
   });
   return f;
 }

@@ -16,7 +16,7 @@ const ARITH = { '+': 'add', '-': 'sub', '*': 'mul', '/': 'div' };
 // folding), with the same results the vector kernels would give.
 const FOLD = {
   add: (a, b) => a + b, sub: (a, b) => a - b, mul: (a, b) => a * b, div: (a, b) => a / b,
-  min: Math.min, max: Math.max, mod: (a, b) => a % b, neg: (a) => -a, abs: Math.abs, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil,
+  min: Math.min, max: Math.max, mod: (a, b) => a % b, neg: (a) => -a, abs: Math.abs, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, fround: Math.fround,
   eq: (a, b) => +(a === b), ne: (a, b) => +(a !== b), lt: (a, b) => +(a < b), gt: (a, b) => +(a > b),
   le: (a, b) => +(a <= b), ge: (a, b) => +(a >= b), sel: (m, a, b) => (m !== 0 ? a : b),
 };

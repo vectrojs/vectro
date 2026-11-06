@@ -191,9 +191,10 @@ function parseStatement(src, fold = false) {
     if (eatOp('-')) return { k: 'neg', x: unary() };
     if (eatOp('+')) return unary();
     let e = primary();
-    while (eatOp('::')) e = { k: 'cast', x: e, type: typeName() };
+    while (eatOp('::')) { const type = typeName(); e = { k: 'cast', x: e, type, args: typeArgs }; }
     return e;
   }
+  let typeArgs = []; // the numbers in the last type's brackets: DECIMAL(10, 2) -> [10, 2]
   function typeName() {
     let t = peek();
     if (!t || (t.t !== 'id' && t.t !== 'kw')) fail(`expected a type ${near()}`);
@@ -202,7 +203,8 @@ function parseStatement(src, fold = false) {
     let name = String(t.v).toUpperCase();
     if (name === 'DOUBLE' && eatWord('PRECISION')) name = 'DOUBLE PRECISION';
     if ((name === 'CHARACTER' || name === 'CHAR') && eatWord('VARYING')) name = 'VARCHAR';
-    if (eatOp('(')) { while (!eatOp(')')) p++; } // DECIMAL(10, 2), VARCHAR(20), TIMESTAMP(3)
+    typeArgs = [];
+    if (eatOp('(')) { while (!eatOp(')')) { const a = peek(); if (!a) fail(`expected ) ${near()}`); if (a.t === 'num') typeArgs.push(a.v); p++; } } // DECIMAL(10, 2), VARCHAR(20), TIMESTAMP(3)
     if (name === 'TIMESTAMP' || name === 'TIME') {
       if (isKw('WITH') && isWord('TIME', 1)) { p++; needWord('TIME'); needWord('ZONE'); name += 'TZ'; }
       else if (eatWord('WITHOUT')) { needWord('TIME'); needWord('ZONE'); }
@@ -272,7 +274,7 @@ function parseStatement(src, fold = false) {
         needKw('END');
         return { k: 'case', base, whens, otherwise };
       }
-      if (eatKw('CAST')) { needOp('('); const x = expr(); needKw('AS'); const type = typeName(); needOp(')'); return { k: 'cast', x, type }; }
+      if (eatKw('CAST')) { needOp('('); const x = expr(); needKw('AS'); const type = typeName(), args = typeArgs; needOp(')'); return { k: 'cast', x, type, args }; }
       if (eatKw('EXTRACT')) {
         needOp('(');
         const part = peek(); p++;
@@ -467,7 +469,8 @@ const call = (fn, ...args) => ({ t: 'call', fn, args });
 const cond = (c, x, y) => ({ t: 'cond', c, x, y });
 const TEXT_TYPES = new Set(['VARCHAR', 'TEXT', 'STRING', 'CHAR', 'BPCHAR', 'NVARCHAR', 'NCHAR', 'CHARACTER', 'NAME', 'CITEXT', 'UUID', 'REGCLASS', 'REGTYPE', 'REGPROC', 'REGNAMESPACE', 'REGROLE']);
 const INT_TYPES = new Set(['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'HUGEINT', 'INT2', 'INT4', 'INT8', 'OID', 'XID', 'CID']);
-// the whole numbers each type holds; CAST rounds half away from zero (2.5 is 3, -2.5 is -3), as DuckDB and
+// the whole numbers each type holds; CAST rounds text and constants half away from zero (2.5 is 3, -2.5 is
+// -3) and other numbers (DOUBLEs) half to even (2.5 is 2), as DuckDB and
 // PostgreSQL do, and a value outside (or NaN, ±Infinity) is missing
 const INT_RANGE = { TINYINT: [-(2 ** 7), 2 ** 7 - 1], SMALLINT: [-(2 ** 15), 2 ** 15 - 1], INT2: [-(2 ** 15), 2 ** 15 - 1], INT: [-(2 ** 31), 2 ** 31 - 1], INTEGER: [-(2 ** 31), 2 ** 31 - 1], INT4: [-(2 ** 31), 2 ** 31 - 1],
   BIGINT: [-(2 ** 63), 2 ** 63 - 1024], INT8: [-(2 ** 63), 2 ** 63 - 1024], HUGEINT: [-(2 ** 127), 2 ** 127 - 2 ** 74], OID: [0, 2 ** 32 - 1], XID: [0, 2 ** 32 - 1], CID: [0, 2 ** 32 - 1] }; // (2^63 - 1024: the largest double below 2^63)
@@ -483,6 +486,40 @@ function astVars(t, out = []) { if (t.t === 'var') out.push(t.name); for (const 
 const PLAIN = /^[A-Za-z_]\w*$/;
 export const encodeName = (name) => (PLAIN.test(name) ? name : `__q_${[...name].map((ch) => (/[A-Za-z0-9]/.test(ch) ? ch : `_${ch.codePointAt(0).toString(16)}_`)).join('')}`);
 export const displayName = (name) => (name.startsWith('__q_') ? name.slice(4).replace(/_([0-9a-f]+)_/g, (m, h) => String.fromCodePoint(parseInt(h, 16))) : name);
+// a constant number written in SQL (-1, 2 + 3, 10 / 4), or null
+const sqlConst = (e) => {
+  if (e.k === 'num' && !e.bool) return e.v;
+  if (e.k === 'neg') { const x = sqlConst(e.x); return x === null ? null : -x; }
+  if (e.k === 'bin' && ['+', '-', '*', '/'].includes(e.op)) {
+    const l = sqlConst(e.l), r = sqlConst(e.r);
+    return l === null || r === null ? null : e.op === '+' ? l + r : e.op === '-' ? l - r : e.op === '*' ? l * r : l / r;
+  }
+  return null;
+};
+// x rounded to d digits (d < 0: to tens, hundreds, ...), half away from zero, as DuckDB. Scaled by
+// dividing for d < 0 (0.1 isn't exact); a value already whole at that scale (|x·10^d| ≥ 2^52),
+// infinite or missing stays as it is (ROUND(1e308, 2) gave Infinity).
+function roundTo(x, d) {
+  if (d === 0 && x.t === 'num') return num(Math.sign(x.v) * Math.round(Math.abs(x.v)));
+  const k = 10 ** Math.abs(d);
+  if (!Number.isFinite(k)) return d > 0 ? x : bin('*', x, num(0));
+  const s = d === 0 ? x : d > 0 ? bin('*', x, num(k)) : bin('/', x, num(k));
+  const r = roundWhole(s), back = d === 0 ? r : d > 0 ? bin('/', r, num(k)) : bin('*', r, num(k));
+  return cond(bin('<', call('abs', s), num(2 ** 52)), back, x);
+}
+// to a whole number, half to even (as rint(); |s| - floor(|s|) is exact, see roundWhole)
+function roundEven(s) {
+  const a = call('abs', s), f = call('floor', a), rest = bin('-', a, f);
+  const odd = bin('==', bin('-', f, bin('*', call('floor', bin('*', f, num(0.5))), num(2))), num(1));
+  const r = bin('+', f, bin('||', bin('>', rest, num(0.5)), bin('&&', bin('==', rest, num(0.5)), odd)));
+  return cond(bin('<', s, num(0)), { t: 'un', op: '-', x: r }, r);
+}
+// to a whole number, half away from zero: on |s|, where |s| - floor(|s|) is exact (s - floor(s) of
+// -0.49999999999999994 rounds to 0.5, giving -1)
+function roundWhole(s) {
+  const a = call('abs', s), f = call('floor', a), r = bin('+', f, bin('>=', bin('-', a, f), num(0.5)));
+  return cond(bin('<', s, num(0)), { t: 'un', op: '-', x: r }, r);
+}
 const constNum = (t) => (t.t === 'num' ? t.v : t.t === 'un' && t.op === '-' && t.x.t === 'num' ? -t.x.v : null);
 const isAgg = (e) => e.k === 'call' && (AGG[e.fn] || PERCENTILE.has(e.fn));
 const key = (e) => JSON.stringify(e);
@@ -1101,7 +1138,7 @@ function compileSelect(ast, env, outer, tail) {
         if (extraFn(e)) return extraFn(e).out === 'text' ? 'text' : extraFn(e).out === 'bool' ? 'bool' : 'int';
         if (TEXT_FUNCTIONS[e.fn]) return TEXT_FUNCTIONS[e.fn].out === 'text' ? 'text' : ['STARTS_WITH', 'ENDS_WITH', 'CONTAINS', 'PREFIX', 'SUFFIX', 'REGEXP_MATCHES', 'REGEXP_LIKE'].includes(e.fn) ? 'bool' : 'int';
         if (DATE_PART[e.fn] || ['DOW', 'DAYOFWEEK', 'WEEKDAY', 'ISODOW', 'FLOOR', 'CEIL', 'CEILING'].includes(e.fn)) return 'int';
-        if (e.fn === 'ROUND') return e.args.length > 1 && !(e.args[1].k === 'num' && e.args[1].v <= 0) ? 'float' : 'int';
+        if (e.fn === 'ROUND') return e.args.length > 1 && !(sqlConst(e.args[1]) <= 0) ? 'float' : 'int';
         if (e.fn === 'ABS') return arg ? (T(arg) === 'int' ? 'int' : 'float') : 'float';
         if (['LEAST', 'GREATEST', 'COALESCE', 'IFNULL', 'NVL'].includes(e.fn)) return merge(e.args.map(T));
         if (e.fn === 'NULLIF') return arg ? T(arg) : 'float';
@@ -1357,7 +1394,22 @@ function compileSelect(ast, env, outer, tail) {
       }
       case 'cast': {
         const from = kindOf(e.x, ctx);
-        if (TEXT_TYPES.has(e.type)) return from === 'text' ? T(e.x) : valueColumn(ctx, [argOf(e.x, ctx)], ([x], [k]) => toText(x, k), { label: 'text' });
+        if (TEXT_TYPES.has(e.type)) {
+          if (from === 'text') return T(e.x);
+          const bool = typeOfExpr(e.x, ctx) === 'bool'; // (true / false, as DuckDB, not 1 / 0)
+          return valueColumn(ctx, [argOf(e.x, ctx)], ([x], [k]) => (bool ? (x ? 'true' : 'false') : toText(x, k)), { label: 'text' });
+        }
+        if (e.type === 'REAL' || e.type === 'FLOAT4' || e.type === 'FLOAT') { // a 32-bit float (FLOAT is REAL in DuckDB)
+          const x = from === 'text' ? translate({ ...e, type: 'DOUBLE' }, ctx) : V(e.x);
+          return call('fround', x);
+        }
+        if (e.type === 'DECIMAL' || e.type === 'NUMERIC') { // rounded to the scale; missing when the whole digits don't fit
+          const [prec = 18, scale = e.args?.length ? 0 : 3] = e.args ?? []; // (DuckDB: DECIMAL is DECIMAL(18, 3))
+          if (!(prec >= 1 && prec <= 38 && scale >= 0 && scale <= prec)) fail(`${e.type}(${prec}, ${scale}): the width must be 1 to 38 and the scale 0 to the width`);
+          const x = from === 'text' ? translate({ ...e, type: 'DOUBLE' }, ctx) : V(e.x);
+          const r = roundTo(x, scale);
+          return cond(bin('<', call('abs', r), num(10 ** (prec - scale))), r, num(NaN));
+        }
         const asBool = (v) => (/^\s*(t|true|y|yes|on|1)\s*$/i.test(v) ? 1 : /^\s*(f|false|n|no|off|0)\s*$/i.test(v) ? 0 : NaN);
         if (e.x.k === 'str' && !DATE_TYPES.has(e.type)) {
           if (BOOL_TYPES.has(e.type)) return num(asBool(e.x.v));
@@ -1374,10 +1426,9 @@ function compileSelect(ast, env, outer, tail) {
         if (INT_TYPES.has(e.type)) {
           const [lo, hi] = INT_RANGE[e.type];
           let r = x;
-          if (!isInt(e.x, ctx)) { // floor, and one more when the rest reaches half (away from zero: exactly half rounds down below 0)
-            const f = call('floor', x), d = bin('-', x, f);
-            r = bin('+', f, cond(bin('>=', x, num(0)), bin('>=', d, num(0.5)), bin('>', d, num(0.5))));
-          }
+          const c = sqlConst(e.x);
+          if (c !== null) r = num(Math.sign(c) * Math.round(Math.abs(c))); // (a constant is a DECIMAL in DuckDB and PostgreSQL: half away from zero, 2.5 is 3)
+          else if (!isInt(e.x, ctx)) r = roundEven(x); // (a DOUBLE: half to even, 2.5 is 2 and 3.5 is 4, as DuckDB and PostgreSQL)
           return cond(bin('&&', bin('>=', r, num(lo)), bin('<=', r, num(hi))), r, num(NaN));
         }
         if (FLOAT_TYPES.has(e.type)) return x;
@@ -1400,9 +1451,10 @@ function compileSelect(ast, env, outer, tail) {
           case 'ABS': case 'SQRT': case 'FLOOR': need(1); return call(e.fn.toLowerCase(), a[0]);
           case 'CEIL': case 'CEILING': need(1); return call('ceil', a[0]);
           case 'ROUND': {
-            const f = a.length > 1 ? 10 ** (e.args[1].k === 'num' ? e.args[1].v : fail('ROUND(x, digits) needs a number of digits')) : 1;
-            const s = bin('*', a[0], num(f));
-            return bin('/', cond(bin('>=', s, num(0)), call('floor', bin('+', s, num(0.5))), call('ceil', bin('-', s, num(0.5)))), num(f));
+            if (a.length < 1 || a.length > 2) fail('ROUND() takes a value and, optionally, a number of digits');
+            const d = a.length > 1 ? sqlConst(e.args[1]) : 0;
+            if (d === null || !Number.isInteger(d)) fail('ROUND(x, digits) needs a whole number of digits');
+            return roundTo(a[0], d);
           }
           case 'LEAST': case 'GREATEST': { // missing values skipped, as in PostgreSQL and DuckDB (NULL only if all are)
             if (a.length < 2) fail(`${e.fn}() needs two values or more`);

@@ -41,8 +41,10 @@ Fixes from audit round 5.
   milliseconds. In the dataframe API, `derive('x', 'coalesce(d1, d2)')` and
   `? :` between dates make date columns too.
 - SQL: CAST to INTEGER, BIGINT, SMALLINT and the other whole-number types
-  rounds half away from zero, as DuckDB and PostgreSQL do (2.5 is 3, -2.5 is
-  -3, 3.7 is 4); it cut the fraction off. A value the type can't hold, NaN or
+  rounds, as DuckDB and PostgreSQL do; it cut the fraction off. Text and
+  constants round half away from zero (`CAST('2.5' AS INT)` and
+  `CAST(2.5 AS INT)` are 3, -2.5 is -3); a column or computed number, a
+  DOUBLE there, rounds half to even (2.5 is 2, 3.5 is 4). A value the type can't hold, NaN or
   ±Infinity becomes missing, as text that isn't a number already did.
 - SQL `%` is the exact remainder, as JavaScript's `%` and DuckDB give it; it
   was computed as `a - trunc(a / b) * b`, which is wrong whenever `a / b`
@@ -117,6 +119,26 @@ Fixes from audit round 5.
   expressions backtrack, and `(a+)+$` on 31 characters never finished, so one
   query could freeze a server. Rewrite such a pattern, for example with a
   character class (`[ab]+`).
+- SQL: `CAST(x AS DECIMAL(p, s))` rounds to s digits (half away from zero)
+  and is missing when the whole part needs more than p - s digits; plain
+  `DECIMAL` is `DECIMAL(18, 3)`, as in DuckDB. It kept every digit. `CAST(x AS
+  REAL)` (and `FLOAT`, `FLOAT4`) is a 32-bit float; it stayed 64-bit.
+  Expressions can use it as `fround(x)`.
+- SQL: `ROUND(x, -1)` rounds to tens (it was refused), the digits can be a
+  constant expression, `ROUND(1e308, 2)` is 1e308 (it was Infinity), and
+  `ROUND(0.49999999999999994)` is 0 (it was 1).
+- SQL: `CAST(number AS VARCHAR)` keeps every digit (`0.1 + 0.2` is
+  `0.30000000000000004`, as DuckDB writes it; it was rounded to 15 digits), and
+  a true / false value is `'true'` / `'false'` (it was `'1'` / `'0'`).
+- SQL: `CAST('inf' AS DOUBLE)`, `'-inf'`, `'infinity'` and `'nan'` (any case)
+  are read, as DuckDB reads them; they were missing.
+- SQL text: `REVERSE` keeps each visible character whole (an emoji with a skin
+  tone, a letter with an accent); `REGEXP_REPLACE(s, p, r, 'g')` doesn't
+  replace an empty match right after a match (`'aaa'`, `'a*'` gives `'b'`, as
+  DuckDB; it was `'bb'`); `SPLIT_PART(s, '', n)` is the n-th character.
+- SQL: `STRFTIME` writes years below 1000 with 4 digits (`0001-01-01`), and
+  week numbers and days of the year are right for years 1 to 99 (they were
+  worked out as 1901 to 1999).
 
 ## 0.1.4
 

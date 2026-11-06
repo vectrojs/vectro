@@ -3,8 +3,9 @@
 // every pair of edge numbers (0, -0, ±Infinity, 1e308, 5e-324, 2^53 + 2, int32
 // limits, x.5 values, NULL), checked against plain JS on tables and datasets,
 // sync and async. The answers were checked against DuckDB in
-// vectro-qa-2026-11-05/expr. Also: CAST of floats and text to whole numbers
-// rounds half away from zero and gives a missing value out of range; DECIMAL(p, s)
+// vectro-qa-2026-11-05/expr. Also: CAST of text and constants to whole numbers
+// rounds half away from zero, of columns half to even, and gives a missing value
+// out of range; DECIMAL(p, s)
 // rounds to s digits; CAST to VARCHAR keeps every digit and writes booleans as
 // true / false; ROUND with negative digits; and nested or many-argument LEAST /
 // GREATEST / COALESCE / ROUND / % plan in milliseconds (they grew 2-4 times per level).
@@ -104,8 +105,11 @@ rmSync(dir, { recursive: true, force: true });
   }
   for (const v of ['\'nan\'', '\'inf\'', '\'-Infinity\'']) same([val(`CAST(CAST(${v} AS DOUBLE) AS INTEGER)`)], [NaN], `CAST(${v} AS INTEGER) is missing`);
   const t = e.table({ a: Float64Array.from([2.5, 3.7, -3.7, 0.5, 1e10, NaN, Infinity]) });
-  same(sql('SELECT CAST(a AS INTEGER) AS x FROM t', { t }).toRows().map((r) => r.x), [3, 4, -4, 1, NaN, NaN, NaN], 'CAST(column AS INTEGER)');
-  same(sql('SELECT a::BIGINT AS x FROM t', { t }).toRows().map((r) => r.x), [3, 4, -4, 1, 1e10, NaN, NaN], 'column::BIGINT');
+  // (a column is DOUBLE: half to even, as DuckDB and PostgreSQL; the constants above are DECIMALs there)
+  same(sql('SELECT CAST(a AS INTEGER) AS x FROM t', { t }).toRows().map((r) => r.x), [2, 4, -4, 0, NaN, NaN, NaN], 'CAST(column AS INTEGER)');
+  same(sql('SELECT a::BIGINT AS x FROM t', { t }).toRows().map((r) => r.x), [2, 4, -4, 0, 1e10, NaN, NaN], 'column::BIGINT');
+  const h = e.table({ a: Float64Array.from([3.5, -2.5, -3.5, 2.4999999999999996, -0.49999999999999994, 4503599627370497]) });
+  same(sql('SELECT CAST(a AS BIGINT) AS x FROM h', { t: h, h }).toRows().map((r) => r.x), [4, -2, -4, 2, -0, 4503599627370497], 'CAST(column AS BIGINT): half to even');
   const ds = [0.125, -0.125, 2.5, 123.456, 1.999, 7, 12345678.994];
   same(ds.map((x) => val(`CAST(${x} AS DECIMAL(10,2))`)), [0.13, -0.13, 2.5, 123.46, 2, 7, 12345678.99], 'CAST(x AS DECIMAL(10,2)) rounds to 2 digits');
   same([val('CAST(123456789.5 AS DECIMAL(10,2))')], [NaN], 'CAST(x AS DECIMAL(10,2)) is missing when it does not fit');
