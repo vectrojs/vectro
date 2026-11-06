@@ -30,6 +30,16 @@ purpose, to match DuckDB and standard SQL:
   tables and datasets. Computed in two passes (each group's mean, then the
   squares around it), so values far from 0 keep their digits (`1e9 + 1 ...
   1e9 + 4` gives exactly what DuckDB gives).
+- SQL joins on any condition, in every kind of join (`JOIN`, `LEFT`, `RIGHT`,
+  `FULL`): comparisons (`ON a.t < b.t`, `BETWEEN b.lo AND b.hi`, expressions
+  on each side), `OR`, `<>`, keys with more conditions (`ON a.id = b.id AND
+  a.t > b.start`), and `IS NOT DISTINCT FROM`, where missing matches missing.
+  Equalities are hashed as before; with none, one comparison pairs the rows
+  by sorting the right side's key and searching it, and otherwise every pair
+  is checked. Before, only equalities worked, and outer joins took no other
+  conditions. RIGHT / FULL joins with conditions other than equalities work on
+  tables in memory, not datasets. In the dataframe API, `join` takes `range`,
+  `where` and `cross`, and `how: 'right' | 'full'`.
 - LIKE and ILIKE (in SQL and in `like()` / `ilike()`) match in linear time.
   They were a backtracking regular expression: `LIKE '%a%e%o%zzz'` on 4 KB of
   ordinary text took 10 seconds.

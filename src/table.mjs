@@ -16,7 +16,7 @@ import { maxUnits } from './kernels.mjs';
 import { topModule, markModule } from './rank-kernels.mjs';
 import { sortPermG, gatherG } from './parallel-sort.mjs';
 import { partitionedGroupsG, estimateGroups, PARTITION_ROWS, PARTITION_GROUPS, DIRECT_SLOTS } from './partition.mjs';
-import { joinTablesG, joinViewG, lookupGroupsG } from './join.mjs';
+import { joinTablesG, joinViewG, lookupGroupsG, anyJoinG } from './join.mjs';
 import { Query } from './plan.mjs';
 import { bounds, windowValues, readsPeers, discRank, between } from './window.mjs';
 import { copyRows } from './rows.mjs';
@@ -1949,7 +1949,25 @@ export class Table {
     return out;
   }
 
+  *#anyJoinG(other, opts) {
+    if (!(other instanceof Table)) throw new TypeError('vectro: join needs another table of the same engine');
+    const a = this.#hasPacked() ? yield* this.#decodedG() : this, b = other.#hasPacked() ? yield* other.#decodedG() : other;
+    let l = null, r = null;
+    try {
+      l = yield* a.#collectG(); r = yield* b.#collectG();
+      const keepG = function* (t, expr) { // (1 where expr holds, per row)
+        const d = yield* t.#deriveG('__vectro_keep', `(${expr}) ? 1 : 0`, {}, true);
+        try { return Float64Array.from(d.engine.live(d.cols.get('__vectro_keep').data).subarray(0, d.n)); } finally { d.dispose(); }
+      };
+      return yield* anyJoinG(l, r, opts, (cols, n) => new Table(this.engine, cols, n, { owned: [...cols.keys()] }), keepG);
+    } finally {
+      for (const t of [l, r, a, b]) if (t && t !== this && t !== other) t.dispose();
+    }
+  }
+
   *#joinG(other, opts) {
+    // (a range, other conditions, no keys or a RIGHT / FULL join: the pairs of rows, see anyJoinG)
+    if (opts && (opts.range || opts.where || opts.cross || opts.how === 'right' || opts.how === 'full')) return yield* this.#anyJoinG(other, opts);
     if (opts?.view && other instanceof Table && !other.pred && !other.#hasPacked()) { // (datasets: unique right keys as a view, see joinViewG)
       let collected = null, view = null;
       try {

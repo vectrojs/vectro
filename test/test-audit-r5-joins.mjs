@@ -102,5 +102,44 @@ rmSync(dir, { recursive: true, force: true });
   await e.close();
 }
 
+// Joins on any condition (<, BETWEEN, OR, keys and a comparison, IS NOT DISTINCT FROM), every join kind,
+// against every pair checked by hand (SQL's rules: a comparison with NULL is never true)
+{
+  const e = new Engine();
+  const A = { id: [1, 2, 3, 4, 5], t: [10, 20, NaN, 20, -Infinity], s: ['x', 'y', '', 'x', 'z'] };
+  const B = { k: [1, 2, NaN, 2, 5], lo: [5, 15, 0, 25, NaN], hi: [12, 30, 100, 26, Infinity], u: ['x', 'q', '', 'y', ''] };
+  const a = e.table(A), b = e.table(B), nA = A.id.length, nB = B.k.length;
+  const N = (x) => x === '' || Number.isNaN(x); // (missing)
+  const lt = (x, y) => !N(x) && !N(y) && x < y, le = (x, y) => !N(x) && !N(y) && x <= y, eq = (x, y) => !N(x) && !N(y) && x === y;
+  const nd = (x, y) => (N(x) && N(y)) || eq(x, y); // IS NOT DISTINCT FROM
+  const CONDS = {
+    'a.t < b.hi': (i, j) => lt(A.t[i], B.hi[j]),
+    'a.t <= b.lo': (i, j) => le(A.t[i], B.lo[j]),
+    'b.lo > a.t': (i, j) => lt(A.t[i], B.lo[j]),
+    'a.t >= b.hi': (i, j) => le(B.hi[j], A.t[i]),
+    'a.t BETWEEN b.lo AND b.hi': (i, j) => le(B.lo[j], A.t[i]) && le(A.t[i], B.hi[j]),
+    'a.id = b.k AND a.t > b.lo': (i, j) => eq(A.id[i], B.k[j]) && lt(B.lo[j], A.t[i]),
+    'a.id = b.k OR a.t > 15': (i, j) => eq(A.id[i], B.k[j]) || lt(15, A.t[i]),
+    'a.t IS NOT DISTINCT FROM b.lo': (i, j) => nd(A.t[i], B.lo[j]),
+    'a.id IS NOT DISTINCT FROM b.k': (i, j) => nd(A.id[i], B.k[j]),
+    'a.s IS NOT DISTINCT FROM b.u': (i, j) => nd(A.s[i], B.u[j]),
+    'a.t + 1 < b.hi * 2': (i, j) => lt(A.t[i] + 1, B.hi[j] * 2),
+    'a.t <> b.lo': (i, j) => !N(A.t[i]) && !N(B.lo[j]) && A.t[i] !== B.lo[j],
+    'a.t < b.hi AND a.s = b.u': (i, j) => lt(A.t[i], B.hi[j]) && eq(A.s[i], B.u[j]),
+  };
+  const row = (i, j) => [i === null ? null : A.id[i], j === null || N(B.k[j]) ? null : B.k[j], j === null || N(B.lo[j]) ? null : B.lo[j]];
+  const sorted = (rows) => rows.map((r) => JSON.stringify(r)).sort();
+  for (const [on, f] of Object.entries(CONDS)) for (const how of ['JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN']) {
+    const want = [], usedA = new Set(), usedB = new Set();
+    for (let i = 0; i < nA; i++) for (let j = 0; j < nB; j++) if (f(i, j)) { want.push(row(i, j)); usedA.add(i); usedB.add(j); }
+    if (how === 'LEFT JOIN' || how === 'FULL JOIN') for (let i = 0; i < nA; i++) if (!usedA.has(i)) want.push(row(i, null));
+    if (how === 'RIGHT JOIN' || how === 'FULL JOIN') for (let j = 0; j < nB; j++) if (!usedB.has(j)) want.push(row(null, j));
+    let got;
+    try { got = sql(`SELECT a.id, b.k, b.lo FROM a ${how} b ON ${on}`, { a, b }).toRows().map((r) => [r.id, r.k, r.lo].map((v) => (Number.isNaN(v) ? null : v))); } catch (err) { got = ['error: ' + err.message]; }
+    same(sorted(got), sorted(want), `${how} ON ${on}`);
+  }
+  await e.close();
+}
+
 console.log(failures ? `${failures} failures out of ${checks} checks` : `all ${checks} round-5 join checks passed`);
 process.exit(failures ? 1 : 0);

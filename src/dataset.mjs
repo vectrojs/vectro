@@ -32,7 +32,7 @@
 // aligned); footer JSON; footer offset and length (f64 each); 'VECTRODS'.
 
 import { Table, rewriteText } from './table.mjs';
-import { Query, execute, findDataset, optimize, vars, namesOf, joinNames } from './plan.mjs';
+import { Query, execute, findDataset, optimize, vars, namesOf, joinNames, joinCondColumns } from './plan.mjs';
 import { parse, toSource, isMask } from './fuse.mjs';
 import { KINDS, decodeOne } from './pack.mjs';
 import { conditions, mayMatch, computeZones } from './zones.mjs';
@@ -727,6 +727,7 @@ function needs(node, need, ds, stop = null) {
     case 'join': {
       const { left } = joinNames(node);
       const needL = new Set(onKeys(node.opts.on)[0]);
+      for (const [x] of joinCondColumns(node)) if (x) needL.add(x); // (a range's left key, what a where reads)
       for (const n of need ?? namesOf(node)) if (left.has(n)) needL.add(n);
       for (const n of namesOf(node.right)) if (left.has(n)) needL.add(n); // (they decide the names of right columns)
       return needs(node.left, needL, ds, stop);
@@ -849,7 +850,7 @@ function* materializeRights(node, temps) {
     const left = yield* materializeRights(node.left, temps);
     let right = node.right;
     const L = findDataset(left), Rds = findDataset(right);
-    if (L && Rds) { // both on disk: too many right rows to hold? then both sides go to disk by key range
+    if (L && Rds && !node.opts.range && !node.opts.where && !node.opts.cross && onKeys(node.opts.on)[0].length) { // both on disk: too many right rows to hold? then both sides go to disk by key range
       const [lk, rk] = onKeys(node.opts.on);
       const textKey = L.cols.get(lk[0])?.dict || Rds.cols.get(rk[0])?.dict; // (codes differ between files: not by range)
       const rows = textKey ? 0 : (yield* runPlanG({ op: 'total', spec: { n: parse('count()') }, input: right })).n;

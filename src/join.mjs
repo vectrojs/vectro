@@ -18,6 +18,7 @@ import { generateHashGroups, generateHashProbe } from './table-kernels.mjs';
 import { gatherG } from './parallel-sort.mjs';
 import { maxUnits } from './kernels.mjs';
 import { I32, F64, Fn, buildModule, get, set, i32c, block, loop, end, br, brIf, i32add, i32geu } from './wasm.mjs';
+import { parse } from './fuse.mjs';
 
 function kernel(engine, name, make) {
   engine._tableKernels ??= new Map();
@@ -80,8 +81,10 @@ export function* joinTablesG(L, R, opts = {}, makeTable) {
     // 3. the pairs (left rows in order, each with its matches in right-table order)
     const left = how === 'left';
     const total = countPairs(engine.live(lid), nL, start, build.rowOf, left);
+    if (total > MAX_PAIRS) throw tooMany(total);
     const li = alloc(Uint32Array, total), ri = alloc(Uint32Array, total);
     makePairs(engine.live(lid), nL, nR, start, rows, build.rowOf, left, engine.live(li), engine.live(ri));
+    if (opts.pairsOnly) return { li: Uint32Array.from(engine.live(li)), ri: Uint32Array.from(engine.live(ri)), n: total }; // (see anyJoinG)
 
     // 4. gather; right columns that share the left keys' names are left out
     const gather = function* (src, idx) {
@@ -548,4 +551,137 @@ const keyOf = (cols, i) => {
 function probeJS(engine, build, leftKeys, lid) {
   const L = leftKeys.map((a) => engine.live(a)), l = engine.live(lid);
   for (let i = 0; i < l.length; i++) { const key = keyOf(L, i); l[i] = key === null ? -1 : build.index.get(key) ?? -1; }
+}
+
+// ---- joins on any condition (SQL: ON a.t < b.t, BETWEEN, OR ..., and outer joins with conditions
+// that aren't keys) -----------------------------------------------------------------------------
+// The pairs of rows (li[i], ri[i]) that meet the condition, then one gather. MISSING as a row number:
+// that side has no row (an outer join's row that matched nothing), its columns missing.
+const MISSING = 0xffffffff, MAX_PAIRS = 2 ** 31;
+const tooMany = (n) => new RangeError(`vectro: join: ${n} pairs of rows is too many (at most 2^31); add an equality, or one comparison such as a.t < b.t, to the ON condition`);
+
+// L, R: tables without filters. opts: { on (keys, may be none), how: 'inner' | 'left' | 'right' | 'full',
+// range: { left, right, op } (op '<', '<=', '>' or '>=': left op right), where (an expression on the output
+// names, true for the pairs to keep), suffix }. keepG(table, expr) gives a 0 / 1 per row of a table.
+export function* anyJoinG(L, R, opts, makeTable, keepG) {
+  const { how = 'inner', range = null, where = null, suffix = '_right' } = opts;
+  const engine = L.engine;
+  if (R.engine !== engine) throw new Error('vectro: join needs two tables of the same engine');
+  if (!['inner', 'left', 'right', 'full'].includes(how)) throw new Error(`vectro: join how must be 'inner', 'left', 'right' or 'full', got "${how}"`);
+  if (L.type !== R.type) throw new Error('vectro: join needs two tables of the same number type (both float64 or both float32)');
+  const [lk, rk] = opts.on ? parseOn(opts.on) : [[], []];
+  const nL = L.n, nR = R.n;
+  // 1. the candidate pairs
+  let { li, ri, n } = lk.length ? yield* joinTablesG(L, R, { on: opts.on, how: 'inner', pairsOnly: true, labels: opts.labels }, makeTable)
+    : range ? rangePairs(engine, L, R, range, opts.labels) : crossPairs(nL, nR);
+  if (range && lk.length) { // (keys and a range: the range checked on the key pairs)
+    const lv = numbers(engine, L, range.left), rv = numbers(engine, R, range.right), cmp = COMPARE[range.op];
+    let m = 0;
+    for (let i = 0; i < n; i++) if (cmp(lv[li[i]], rv[ri[i]])) { li[m] = li[i]; ri[m] = ri[i]; m++; }
+    n = m;
+  }
+  const cols = outputColumns(L, R, lk, rk, suffix);
+  // 2. the other conditions, on a table of the columns they read
+  if (where) {
+    const used = new Set(whereNames(where));
+    const C = gatherPairs(engine, L, R, li, ri, n, cols.filter((c) => used.has(c.out)), makeTable);
+    let keep;
+    try { keep = yield* keepG(C, where); } finally { C.dispose(); }
+    let m = 0;
+    for (let i = 0; i < n; i++) if (keep[i] === 1) { li[m] = li[i]; ri[m] = ri[i]; m++; }
+    n = m;
+  }
+  // 3. outer joins: the rows of one side that no pair kept, the other side missing
+  const extraL = [], extraR = [];
+  if (how === 'left' || how === 'full') { const seen = new Uint8Array(nL); for (let i = 0; i < n; i++) seen[li[i]] = 1; for (let r = 0; r < nL; r++) if (!seen[r]) extraL.push(r); }
+  if (how === 'right' || how === 'full') { const seen = new Uint8Array(nR); for (let i = 0; i < n; i++) seen[ri[i]] = 1; for (let r = 0; r < nR; r++) if (!seen[r]) extraR.push(r); }
+  const total = n + extraL.length + extraR.length;
+  if (total > MAX_PAIRS) throw tooMany(total);
+  const LI = new Uint32Array(total), RI = new Uint32Array(total);
+  LI.set(li.subarray(0, n)); RI.set(ri.subarray(0, n));
+  extraL.forEach((r, k) => { LI[n + k] = r; RI[n + k] = MISSING; });
+  extraR.forEach((r, k) => { LI[n + extraL.length + k] = MISSING; RI[n + extraL.length + k] = r; });
+  return gatherPairs(engine, L, R, LI, RI, total, cols, makeTable);
+}
+
+const COMPARE = { '<': (a, b) => a < b, '<=': (a, b) => a <= b, '>': (a, b) => a > b, '>=': (a, b) => a >= b };
+// a column's values as numbers (a range key: numbers or dates)
+function numbers(engine, T, name) {
+  const c = T.cols.get(name);
+  if (!c) throw new Error(`vectro: join: no column "${name}"`);
+  if (c.dict || c.strings) throw new Error(`vectro: join: a range condition (<, <=, >, >=) needs number or date columns, not the text column "${name}"`);
+  return engine.live(c.data);
+}
+// left op right: the right rows sorted by key, then each left key's run of them found by binary search
+function rangePairs(engine, L, R, { left, right, op }, labels) {
+  const lv = numbers(engine, L, left), rv = numbers(engine, R, right), nL = L.n, nR = R.n;
+  const order = [];
+  for (let r = 0; r < nR; r++) if (rv[r] === rv[r]) order.push(r); // (missing keys never pair)
+  order.sort((a, b) => rv[a] - rv[b] || a - b);
+  const keys = Float64Array.from(order, (r) => rv[r]), m = keys.length;
+  const firstAbove = (x, strict) => { let lo = 0, hi = m; while (lo < hi) { const h = (lo + hi) >> 1; if (strict ? keys[h] > x : keys[h] >= x) hi = h; else lo = h + 1; } return lo; };
+  // each left row's [from, to) in `order`
+  const from = new Uint32Array(nL), to = new Uint32Array(nL);
+  let total = 0;
+  for (let i = 0; i < nL; i++) {
+    const x = lv[i];
+    if (x !== x) continue;
+    let a, b;
+    if (op === '<') { a = firstAbove(x, true); b = m; } // (right > x)
+    else if (op === '<=') { a = firstAbove(x, false); b = m; }
+    else if (op === '>') { a = 0; b = firstAbove(x, false); } // (right < x)
+    else { a = 0; b = firstAbove(x, true); }
+    from[i] = a; to[i] = b; total += b - a;
+  }
+  if (total > MAX_PAIRS) throw tooMany(total);
+  const li = new Uint32Array(total), ri = new Uint32Array(total);
+  let k = 0;
+  for (let i = 0; i < nL; i++) for (let j = from[i]; j < to[i]; j++) { li[k] = i; ri[k] = order[j]; k++; }
+  return { li, ri, n: total };
+}
+function crossPairs(nL, nR) {
+  const total = nL * nR;
+  if (total > MAX_PAIRS) throw tooMany(total);
+  const li = new Uint32Array(total), ri = new Uint32Array(total);
+  for (let i = 0, k = 0; i < nL; i++) for (let j = 0; j < nR; j++, k++) { li[k] = i; ri[k] = j; }
+  return { li, ri, n: total };
+}
+// the names a where expression reads
+function whereNames(src) {
+  const out = [];
+  const visit = (x) => { if (!x || typeof x !== 'object') return; if (x.t === 'var') out.push(x.name); for (const v of Object.values(x)) if (Array.isArray(v)) v.forEach(visit); else if (v && typeof v === 'object') visit(v); };
+  visit(parse(src));
+  return out;
+}
+// output columns, as joinTablesG names them: { out, side, name, key } (key: a right key named like its
+// left key, which goes away: an unmatched right row's value comes from it)
+function outputColumns(L, R, lk, rk, suffix) {
+  const cols = [], names = new Set(), sameKey = new Map(rk.map((name, k) => [lk[k] === name ? name : null, name]).filter(([x]) => x));
+  for (const [name, c] of L.cols) if (!c.hidden) { cols.push({ out: name, side: 'L', name, key: sameKey.get(name) ?? null }); names.add(name); }
+  for (const [name, c] of R.cols) {
+    if (sameKey.has(name) || c.hidden) continue;
+    let out = name;
+    while (names.has(out)) out += suffix;
+    names.add(out);
+    cols.push({ out, side: 'R', name });
+  }
+  return cols;
+}
+// the output table of pairs (li[i], ri[i]); MISSING: that side's columns missing ('' in text)
+function gatherPairs(engine, L, R, li, ri, n, cols, makeTable) {
+  const out = new Map();
+  for (const { out: name, side, name: src, key } of cols) {
+    const T = side === 'L' ? L : R, c = T.cols.get(src), ix = side === 'L' ? li : ri, alt = key ? R.cols.get(key) : null, ax = ri;
+    let { dict, codes } = c;
+    let none = NaN;
+    if (dict) {
+      none = codes.get('');
+      if (none === undefined) { dict = [...dict, '']; codes = new Map(codes).set('', dict.length - 1); none = dict.length - 1; }
+    }
+    const data = engine.alloc(L.type, n), d = engine.live(data), a = engine.live(c.data), b = alt ? engine.live(alt.data) : null;
+    for (let i = 0; i < n; i++) { const r = ix[i]; d[i] = r !== MISSING ? a[r] : b && ax[i] !== MISSING ? b[ax[i]] : none; }
+    out.set(name, { data, dict, codes, strings: c.strings, date: c.date, zones: undefined });
+  }
+  for (const c of out.values()) c.data = engine.live(c.data);
+  return makeTable(out, n);
 }

@@ -856,17 +856,31 @@ function compileSelect(ast, env, outer, tail) {
         return sides.every((x) => x === sides[0]) ? sides[0] : null;
       };
       const exprKeys = [];
-      const cs = conjuncts(j.on).map((c) => {
-        if (!(c.k === 'bin' && c.op === '=') || (c.l.k === 'col' && c.r.k === 'col')) return c;
-        const sl = sideOf(c.l), sr = sideOf(c.r);
-        if (!sl || !sr || sl === sr) return c;
-        const [le, re] = sl === 'left' ? [c.l, c.r] : [c.r, c.l];
+      const apart = (x, y) => { const a = sideOf(x), b = sideOf(y); return a && b && a !== b; };
+      // x BETWEEN lo AND hi across the sides: two comparisons; a IS NOT DISTINCT FROM b: keys where missing
+      // matches missing (numbers: whether it is there, and the value or 0; text: missing as a label of its own)
+      const expanded = conjuncts(j.on).flatMap((c) => {
+        if (c.k === 'between' && apart(c.x, c.lo) && apart(c.x, c.hi)) return [{ k: 'bin', op: '>=', l: c.x, r: c.lo }, { k: 'bin', op: '<=', l: c.x, r: c.hi }];
+        if (c.k === 'bin' && c.op === 'IS' && !(c.r.k === 'num' && c.r.bool) && apart(c.l, c.r)) {
+          if (kindOf(c.l, plain) === 'text') { const none = (x) => ({ k: 'call', fn: 'COALESCE', args: [x, { k: 'str', v: '\u0001' }] }); return [{ k: 'bin', op: '=', l: none(c.l), r: none(c.r) }]; }
+          const flag = (x) => ({ k: 'case', base: null, whens: [{ c: { k: 'isnull', x }, v: { k: 'num', v: 0 } }], otherwise: { k: 'num', v: 1 } });
+          const val = (x) => ({ k: 'call', fn: 'COALESCE', args: [x, { k: 'num', v: 0 }] });
+          return [{ k: 'bin', op: '=', l: flag(c.l), r: flag(c.r) }, { k: 'bin', op: '=', l: val(c.l), r: val(c.r) }];
+        }
+        return [c];
+      });
+      const FLIP_SIDE = { '=': '=', '<': '>', '<=': '>=', '>': '<', '>=': '<=' };
+      const cs = expanded.map((c) => {
+        if (!(c.k === 'bin' && FLIP_SIDE[c.op]) || !apart(c.l, c.r)) return c;
+        const swap = sideOf(c.l) === 'right', op = swap ? FLIP_SIDE[c.op] : c.op; // (the left table's side first)
+        const [le, re] = swap ? [c.r, c.l] : [c.l, c.r];
+        if (le.k === 'col' && re.k === 'col') return swap ? { k: 'bin', op, l: le, r: re } : c;
         const l = le.k === 'col' ? le : { k: 'col', name: `__jl${n.hidden}`, hidden: hide(translate(le, plain), '__jl') };
         let r = re;
         if (re.k !== 'col') { r = { k: 'col', table: j.alias, name: `__jr${n.hidden++}` }; exprKeys.push({ e: re, alias: r.name }); }
-        return { k: 'bin', op: '=', l, r };
+        return { k: 'bin', op, l, r };
       });
-      if (cs.some((c, i) => c !== conjuncts(j.on)[i])) {
+      if (cs.length !== conjuncts(j.on).length || cs.some((c, i) => c !== conjuncts(j.on)[i])) {
         j = { ...j, on: andAll(cs) };
         if (exprKeys.length) {
           const inner = { k: 'query', ctes: [], body: { k: 'select', distinct: false, items: [{ e: { k: 'star' }, alias: null }, ...exprKeys], from: { ...j, alias: j.alias }, joins: [], where: null, groupBy: [], having: null }, orderBy: [], limit: null, offset: 0 };
@@ -878,7 +892,7 @@ function compileSelect(ast, env, outer, tail) {
     const rs = { alias: j.alias, rel: right, names: new Map() };
     const rightHas = (name) => right.names.includes(name);
     const outerJoin = j.how === 'left' || j.how === 'right' || j.how === 'full';
-    let on;
+    let on, joinRange = null, joinCross = false, joinWhere = []; // (see anyJoinG in join.mjs)
     const extra = []; // ON conditions that aren't key equalities (inner joins only)
     let rq = right.query;
     if (j.how === 'cross') { // every pair: both sides on one constant key
@@ -891,19 +905,31 @@ function compileSelect(ast, env, outer, tail) {
       on = { left: j.using.map((c) => resolve({ name: c })), right: j.using };
     } else {
       const lefts = [], rights = [];
-      const conds = [];
+      const conds = [], ranges = []; // ranges: left op right, a column on each side (numbers or dates)
       for (const c of conjuncts(j.on)) {
         const side = (ref) => (ref.k !== 'col' ? null : (ref.table ? ref.table.toLowerCase() === j.alias.toLowerCase() : rightHas(ref.name) && !scope.some((s) => s.names.has(ref.name))) ? 'right' : 'left');
-        if (c.k === 'bin' && c.op === '=' && side(c.l) && side(c.r) && side(c.l) !== side(c.r)) {
+        const across = c.k === 'bin' && side(c.l) && side(c.r) && side(c.l) !== side(c.r);
+        if (across && c.op === '=') {
           const [l, r] = side(c.l) === 'left' ? [c.l, c.r] : [c.r, c.l];
           if (!rightHas(r.name)) fail(`table "${j.name ?? j.alias}" has no column "${r.name}"`);
           lefts.push(l.hidden ?? resolve(l)); rights.push(r.name);
+        } else if (across && ['<', '<=', '>', '>='].includes(c.op) && side(c.l) === 'left' && rightHas(c.r.name)) {
+          const l = c.l.hidden ?? resolve(c.l);
+          if (kinds.get(l) !== 'text' && right.kinds.get(c.r.name) !== 'text') ranges.push({ c, range: { left: l, right: c.r.name, op: c.op } });
+          else conds.push(c);
         } else conds.push(c);
       }
-      if (!lefts.length) fail(`JOIN ${j.name ?? j.alias} needs ON with an equality between the two sides, e.g. ON a.id = b.id (each side may be an expression on its own table: ON a.k + 1 = b.k)`);
-      if (conds.length && outerJoin) fail(`${j.how.toUpperCase()} JOIN ... ON takes key equalities only (move other conditions to WHERE)`);
+      // equalities are the keys; with none, the first comparison pairs the rows (sorted keys), else every
+      // pair; the rest are checked on the pairs (inner joins: a filter after; outer joins: in the join, so
+      // rows that keep no pair still come out)
+      if (!lefts.length && ranges.length) joinRange = ranges.shift().range;
+      conds.push(...ranges.map((x) => x.c));
+      if (!lefts.length && !joinRange) {
+        if (outerJoin) joinCross = true;
+        else { const k = `__x${n.hidden++}`; q = q.derive(k, '0'); rq = rq.derive(k, '0'); lefts.push(k); rights.push(k); } // (as CROSS JOIN)
+      }
       on = { left: lefts, right: rights };
-      extra.push(...conds);
+      if (outerJoin) joinWhere = conds; else extra.push(...conds);
     }
     // outer joins: a right key named like its left key gets a name of its own,
     // so it reads as missing where no right row matched (an inner join keeps one)
@@ -935,8 +961,18 @@ function compileSelect(ast, env, outer, tail) {
     const keys = on.left.every((x, k) => x === on.right[k]) ? on.left : on;
     const leftLabel = new Map(scope.flatMap((sc) => [...sc.names].map(([o, out]) => [out, `${sc.alias}.${o}`])));
     const labels = { left: on.left.map((x) => leftLabel.get(x) ?? x), right: on.right.map((x) => `${j.alias}.${original.get(x) ?? x}`) }; // (for messages)
-    if (j.how === 'right' || j.how === 'full') q = outerJoinG(rq, on, j.how, leftNames, rightCols, rightOut, labels);
-    else q = q.join(rq, { on: keys, how: j.how === 'cross' ? 'inner' : j.how, labels });
+    // an outer join's other ON conditions: one expression on the output names, checked in the join
+    let where = null;
+    if (joinWhere.length) {
+      const q0 = q;
+      scope.push(rs);
+      try { where = joinWhere.map((c) => `(${src(truth(c, plain))})`).join(' && '); } finally { scope.pop(); }
+      if (q !== q0) fail(`${j.how.toUpperCase()} JOIN ... ON: a condition with text functions or subqueries can't be checked in the join; compute it in a subquery first`);
+    }
+    const anyJoin = joinRange || joinCross || where;
+    if (anyJoin && (j.how === 'right' || j.how === 'full') && (findDataset(q.node) || findDataset(rq.node))) fail(`${j.how.toUpperCase()} JOIN with conditions other than equalities works on tables in memory, not datasets`);
+    if ((j.how === 'right' || j.how === 'full') && !anyJoin) q = outerJoinG(rq, on, j.how, leftNames, rightCols, rightOut, labels);
+    else q = q.join(rq, { on: keys, how: j.how === 'cross' ? 'inner' : j.how, labels, ...(joinRange ? { range: joinRange } : {}), ...(joinCross ? { cross: true } : {}), ...(where ? { where } : {}) });
     scope.push(rs);
     if (j.using && !outerJoin) j.using.forEach((c, k) => usingMap.set(c.toLowerCase(), on.left[k])); // (SELECT *: a USING key once)
     if (j.using && outerJoin) {

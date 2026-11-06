@@ -157,6 +157,18 @@ export function namesOf(node) {
   return [];
 }
 
+// The left and right columns a join's range and where read: [[left, null] | [null, right], ...].
+export function joinCondColumns(node) {
+  const out = [];
+  const { range, where } = node.opts;
+  if (range) out.push([range.left, null], [null, range.right]);
+  if (where) {
+    const { left, fromRight } = joinNames(node);
+    for (const n of vars(parse(where))) { if (left.has(n)) out.push([n, null]); else if (fromRight.has(n)) out.push([null, fromRight.get(n)]); }
+  }
+  return out;
+}
+
 // Output names of a join, and where each comes from.
 export function joinNames(node) {
   const left = namesOf(node.left), right = namesOf(node.right);
@@ -209,8 +221,9 @@ function pushFilter(node, cond) {
     }
     case 'join': {
       const { left, fromRight } = joinNames(node);
-      if ([...used].every((n) => left.has(n))) return { ...node, left: pushFilter(node.left, cond) };
-      if (node.opts.how !== 'left' && [...used].every((n) => fromRight.has(n))) return { ...node, right: pushFilter(node.right, rename(cond, fromRight)) };
+      const how = node.opts.how ?? 'inner'; // (a side whose rows an outer join keeps when they match nothing: not below it)
+      if ((how === 'inner' || how === 'left') && [...used].every((n) => left.has(n))) return { ...node, left: pushFilter(node.left, cond) };
+      if ((how === 'inner' || how === 'right') && [...used].every((n) => fromRight.has(n))) return { ...node, right: pushFilter(node.right, rename(cond, fromRight)) };
       break;
     }
   }
@@ -353,6 +366,7 @@ function* execG(node, needed, temps) {
       const { on } = node.opts;
       const [lk, rk] = typeof on === 'string' || Array.isArray(on) ? [[on].flat(), [on].flat()] : [[on?.left].flat(), [on?.right].flat()];
       const needL = new Set(lk), needR = new Set(rk);
+      for (const [x, y] of joinCondColumns(node)) { if (x) needL.add(x); if (y) needR.add(y); } // (a range's keys, the columns a where reads)
       for (const n of needed ?? namesOf(node)) { if (leftNames.has(n)) needL.add(n); else if (fromRight.has(n)) needR.add(fromRight.get(n)); else if (rk.includes(n)) needR.add(n); }
       // (a right column renamed for a name it shares: those names come along, so the join names it the same)
       const suffix = node.opts.suffix ?? '_right';
@@ -396,7 +410,7 @@ function* execG(node, needed, temps) {
 // Table._lookupGroupAgg), no joined rows made. Null when that doesn't apply.
 function* lookupAggregateG(node, temps) {
   const J = node.input;
-  if (J.op !== 'join' || (J.opts.how ?? 'inner') !== 'inner' || !node.keys.length) return null;
+  if (J.op !== 'join' || (J.opts.how ?? 'inner') !== 'inner' || !node.keys.length || J.opts.range || J.opts.where || J.opts.cross) return null;
   const lazyOnly = (n) => n.op === 'scan' || ((n.op === 'filter' || n.op === 'derive' || n.op === 'select') && lazyOnly(n.input)); // (views: cheap to make again if this path declines)
   if (!lazyOnly(J.left) || !lazyOnly(J.right)) return null;
   const { on } = J.opts;
