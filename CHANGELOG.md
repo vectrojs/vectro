@@ -74,6 +74,10 @@ Fixes from audit round 5.
   done. When it failed or stopped early (a limit), that reading was still on
   the worker threads, so the next sync call was sometimes refused with "an
   async query is running on this engine", although the query was awaited.
+- Datasets: a derive or select whose column nothing uses, followed by a limit
+  or top, no longer fails (`derive('x', 'a + b').limit(2).agg({ s: 'sum(a)' })`
+  said "unknown column b"; `select('id', 'a').top(1, '-a').agg(...)` said "no
+  column id"). Each chunk's plan now keeps only the columns used above it.
 
 ## 0.1.4
 

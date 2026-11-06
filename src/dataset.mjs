@@ -689,33 +689,37 @@ function substitute(node, target, repl) {
 
 // The dataset columns a plan reads (null: all of them). Mirrors what the
 // executor in plan.mjs asks of its input.
-function needs(node, need, ds) {
+// The columns of `ds` the plan reads (null: all). With stop, the columns of
+// that node's rows the steps above it use instead (ALL: all of them).
+const ALL = Symbol('all');
+function needs(node, need, ds, stop = null) {
+  if (stop && node === stop) return need ?? ALL;
   switch (node.op) {
     case 'scan': return node.table === ds ? need : undefined;
     case 'unmatched': return undefined;
-    case 'filter': return needs(node.input, need && union(need, vars(node.ast)), ds);
+    case 'filter': return needs(node.input, need && union(need, vars(node.ast)), ds, stop);
     case 'derive':
-      if (!need) return needs(node.input, null, ds);
-      if (!need.has(node.name)) return needs(node.input, need, ds);
-      return needs(node.input, union([...need].filter((n) => n !== node.name), vars(node.ast)), ds);
-    case 'select': return needs(node.input, new Set(need ? node.names.filter((n) => need.has(n)) : node.names), ds);
-    case 'aggregate': return needs(node.input, new Set([...node.keys, ...Object.values(node.spec).flatMap((a) => [...vars(a)])]), ds);
-    case 'total': return needs(node.input, new Set(Object.values(node.spec).flatMap((a) => [...vars(a)])), ds);
-    case 'sort': return needs(node.input, need && union(need, node.by.flatMap((b) => [...vars(parse(String(b)))])), ds);
-    case 'limit': return needs(node.input, need, ds);
-    case 'output': return needs(node.input, null, ds);
-    case 'textmap': return needs(node.input, need && new Set([...[...need].filter((n) => n !== node.name), ...node.inputs]), ds);
+      if (!need) return needs(node.input, null, ds, stop);
+      if (!need.has(node.name)) return needs(node.input, need, ds, stop);
+      return needs(node.input, union([...need].filter((n) => n !== node.name), vars(node.ast)), ds, stop);
+    case 'select': return needs(node.input, new Set(need ? node.names.filter((n) => need.has(n)) : node.names), ds, stop);
+    case 'aggregate': return needs(node.input, new Set([...node.keys, ...Object.values(node.spec).flatMap((a) => [...vars(a)])]), ds, stop);
+    case 'total': return needs(node.input, new Set(Object.values(node.spec).flatMap((a) => [...vars(a)])), ds, stop);
+    case 'sort': return needs(node.input, need && union(need, node.by.flatMap((b) => [...vars(parse(String(b)))])), ds, stop);
+    case 'limit': return needs(node.input, need, ds, stop);
+    case 'output': return needs(node.input, null, ds, stop);
+    case 'textmap': return needs(node.input, need && new Set([...[...need].filter((n) => n !== node.name), ...node.inputs]), ds, stop);
     case 'window': {
       const made = new Set(node.items.map((it) => it.name));
       const inputs = [...node.partition, ...node.order.map((o) => o.name), ...node.items.map((it) => it.arg).filter(Boolean)];
-      return needs(node.input, need && new Set([...[...need].filter((n) => !made.has(n)), ...inputs]), ds);
+      return needs(node.input, need && new Set([...[...need].filter((n) => !made.has(n)), ...inputs]), ds, stop);
     }
     case 'join': {
       const { left } = joinNames(node);
       const needL = new Set(onKeys(node.opts.on)[0]);
       for (const n of need ?? namesOf(node)) if (left.has(n)) needL.add(n);
       for (const n of namesOf(node.right)) if (left.has(n)) needL.add(n); // (they decide the names of right columns)
-      return needs(node.left, needL, ds);
+      return needs(node.left, needL, ds, stop);
     }
   }
   return null;
@@ -911,6 +915,10 @@ function* runChunksG(plan, path, sink) {
   const derived = new Set(below.filter((n) => n.op === 'derive' || n.op === 'textmap' || n.op === 'join').flatMap((n) => (n.op === 'join' ? namesOf(n.right) : [n.name])));
   // derived columns that are arithmetic on number columns of the dataset (a top-k cutoff can compare them)
   derived.numeric = new Set(below.filter((n) => n.op === 'derive' && arithmetic(n.ast, ds)).map((n) => n.name));
+  // the columns of each chunk's rows the steps from B up use: a chunk's plan is cut to them, so a column it
+  // makes (a derive, a select's) that nothing uses isn't made from columns that were never read
+  const above = needs(plan, null, ds, top);
+  if (above instanceof Set) derived.keep = above;
   const acc = accumulator(kind, B, engine, sink, ds, derived);
   let finalTable = null;
   engine._joinRuns = (engine._joinRuns ?? 0) + 1; // joins keep their right side's build while a dataset runs
@@ -1037,6 +1045,12 @@ function accumulator(kind, B, engine, sink, ds, derived) {
     } : null,
     *chunk(P, chunk) {
       let node;
+      if (derived.keep && (kind === 'top' || kind === 'head' || kind === 'gather')) {
+        const have = namesOf(P);
+        let keepNames = have.filter((n) => derived.keep.has(n));
+        if (!keepNames.length) keepNames = [have.find((n) => chunk.cols.has(n)) ?? have[0]]; // (count(): one column read, for the rows)
+        if (keepNames.length < have.length) P = { op: 'select', names: keepNames, input: P };
+      }
       if (kind === 'top') {
         node = { op: 'output', input: { op: 'limit', n: k, offset: 0, input: { ...B.input, input: P } } };
         if (cutoff !== null) { // only rows at least as good as the k-th so far: keep them all (the merge picks the best)
