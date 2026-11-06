@@ -59,7 +59,7 @@ export function* joinTablesG(L, R, opts = {}, makeTable) {
       if (!a) throw new Error(`vectro: join: the left table has no column "${lk[k]}"`);
       if (!b) throw new Error(`vectro: join: the right table has no column "${rk[k]}"`);
       if (a.strings || b.strings) throw new Error(`vectro: join: can't join on free-text column "${a.strings ? lk[k] : rk[k]}" (load it as a category)`);
-      if (!a.dict !== !b.dict && nL && nR) throw new Error(`vectro: join: "${lk[k]}" and "${rk[k]}" must both be text or both numbers`);
+      if (!a.dict !== !b.dict && nL && nR) throw new Error(`vectro: join: "${opts.labels?.left?.[k] ?? lk[k]}" and "${opts.labels?.right?.[k] ?? rk[k]}" must both be text or both numbers`); // (labels: the names SQL wrote, not its hidden ones)
       leftKeys.push(a.data);
     }
     if (!build) {

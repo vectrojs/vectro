@@ -164,6 +164,17 @@ Fixes from audit round 5.
   of ±Infinity keys (they were counted together). `LAG` / `LEAD` of text take a
   text default (`LAG(s, 1, 'none')`); it was refused ("must be a number"), and
   a number default on text gave a wrong label.
+- SQL joins: `SELECT *` and `b.*` name every column as its table has it, as
+  SQL does: `b.*` is `id, k, s` (it was `id_right, ...`), and a name that two
+  tables have is written once and then `id_2`, as `SELECT a.id, b.id` already
+  did (`SELECT *` gave `id_right`). `SELECT *` after `JOIN ... ON a.k = b.k`
+  keeps b's key (missing where an outer join found no match); it was dropped.
+  A USING key is still once. This changes column names of `SELECT *` joins.
+- SQL joins: `ON a.k + 1 = b.k` (an expression on each side, also `CAST`,
+  `UPPER(...)`) joins on those values; it was refused. A text key joined to a
+  number key names the columns as written (`"b.s" and "c.s"`), not a hidden
+  `__k0`, and `FULL JOIN ... USING (s)` with an empty table's column keeps the
+  other side's text (it gave numbers).
 
 ## 0.1.4
 
