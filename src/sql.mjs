@@ -343,6 +343,12 @@ function parseStatement(src, fold = false) {
       e = { k: 'call', fn, args, distinct };
     }
     if (eatWord('WITHIN')) { needKw('GROUP'); needOp('('); needKw('ORDER'); needKw('BY'); const [o] = orderItems(); needOp(')'); e.within = o; }
+    if (isWord('FILTER') && peek(1)?.v === '(') { // agg(x) FILTER (WHERE c) is agg(CASE WHEN c THEN x END); COUNT(*) counts the rows where c
+      p++; needOp('('); needKw('WHERE'); const c = expr(); needOp(')');
+      const only = (x) => ({ k: 'case', base: null, whens: [{ c, v: x }], otherwise: { k: 'null' } });
+      e = e.star ? { k: 'call', fn: e.fn, args: [only({ k: 'num', v: 1 })], distinct: false } : { ...e, args: e.args.length ? [only(e.args[0]), ...e.args.slice(1)] : e.args };
+      if (e.within) e.within = { ...e.within, e: only(e.within.e) };
+    }
     if (eatWord('OVER')) return { k: 'window', call: e, ...windowSpec() };
     return e;
   }
@@ -456,6 +462,8 @@ function parseStatement(src, fold = false) {
 
 // ---- translation ------------------------------------------------------------------------------
 const AGG = { COUNT: 'count', SUM: 'sum', AVG: 'mean', MEAN: 'mean', MIN: 'min', MAX: 'max', APPROX_COUNT_DISTINCT: 'approxDistinct' };
+// the number functions translate() knows (text, date and session functions are listed elsewhere)
+const SCALAR_FNS = new Set(['ABS', 'SQRT', 'FLOOR', 'CEIL', 'CEILING', 'ROUND', 'LEAST', 'GREATEST', 'COALESCE', 'IFNULL', 'NVL', 'NULLIF', 'DATE_TRUNC', 'DOW', 'DAYOFWEEK', 'WEEKDAY', 'ISODOW', 'NOW', 'CURRENT_TIMESTAMP', 'EPOCH', 'DATE_PART']);
 const PERCENTILE = new Set(['MEDIAN', 'PERCENTILE_CONT', 'PERCENTILE_DISC', 'QUANTILE_CONT', 'QUANTILE_DISC', 'QUANTILE']);
 const WINDOW_FNS = { ROW_NUMBER: 'row_number', RANK: 'rank', DENSE_RANK: 'dense_rank', PERCENT_RANK: 'percent_rank', CUME_DIST: 'cume_dist', NTILE: 'ntile', LAG: 'lag', LEAD: 'lead', FIRST_VALUE: 'first_value', LAST_VALUE: 'last_value', NTH_VALUE: 'nth_value', SUM: 'sum', AVG: 'avg', MEAN: 'avg', MIN: 'min', MAX: 'max', COUNT: 'count' };
 const KEEPS_KIND = new Set(['lag', 'lead', 'first_value', 'last_value', 'nth_value', 'min', 'max']);
@@ -1265,7 +1273,7 @@ function compileSelect(ast, env, outer, tail) {
         return { t: 'un', op: '!', x: T(x) }; // (IS: true or false, never unknown)
       case 'between': return T({ k: 'bin', op: 'OR', l: { k: 'bin', op: '<', l: x.x, r: x.lo }, r: { k: 'bin', op: '>', l: x.x, r: x.hi } });
       case 'in':
-        if (kindOf(x.x, ctx) === 'text') return bin('&&', { t: 'un', op: '!', x: T(x) }, present(x.x, ctx));
+        if (kindOf(x.x, ctx) === 'text') return x.list.some((i) => i.k === 'null') ? num(0) : bin('&&', { t: 'un', op: '!', x: T(x) }, present(x.x, ctx)); // (NOT IN a list with NULL: never true, as in SQL)
         return x.list.map((i) => T({ k: 'bin', op: '<>', l: x.x, r: i })).reduce((a, b) => bin('&&', a, b));
       case 'like': return bin('&&', { t: 'un', op: '!', x: T(x) }, present(x.x, ctx));
       case 'insub': return subqueryValue(x, ctx, true);
@@ -1345,8 +1353,9 @@ function compileSelect(ast, env, outer, tail) {
       case 'in': {
         const x = kindOf(e.x, ctx) === 'text' ? T(e.x) : valueOf(e.x, ctx); // (a condition: 1, 0 or NULL)
         if (kindOf(e.x, ctx) === 'text') {
-          if (e.list.some((i) => i.k !== 'str')) fail('IN on a text column takes text values in quotes');
-          return call('in', x, ...e.list.map((i) => ({ t: 'str', v: i.v })));
+          if (e.list.some((i) => i.k !== 'str' && i.k !== 'null')) fail('IN on a text column takes text values in quotes (or NULL)');
+          const items = e.list.filter((i) => i.k === 'str'); // (a NULL in the list never matches: s IN ('a', NULL) is s = 'a', or unknown)
+          return items.length ? call('in', x, ...items.map((i) => ({ t: 'str', v: i.v }))) : num(0);
         }
         return e.list.map((i) => bin('==', x, valueOf(i, ctx))).reduce((a, b) => bin('||', a, b));
       }
@@ -1446,6 +1455,11 @@ function compileSelect(ast, env, outer, tail) {
         if (isAgg(e)) return ctx.agg(e);
         if (FLATTEN[e.fn]) e = { ...e, args: flatArgs(e) }; // (COALESCE(COALESCE(a, b), c) is COALESCE(a, b, c): nesting would repeat the inner one)
         if (TEXT_FUNCTIONS[e.fn]) return textCall(e, ctx);
+        // (before its arguments: in a grouped query an unknown aggregate such as STDDEV(v) said "v must be in GROUP BY")
+        if (!SCALAR_FNS.has(e.fn) && !sessionFn(e) && !extraFn(e) && !DATE_PART[e.fn]) {
+          if (WINDOW_FNS[e.fn] && !AGG[e.fn]) fail(`${e.fn}() needs OVER (...)`);
+          fail(`unknown function ${e.fn}() (the aggregates are COUNT, SUM, AVG, MIN, MAX, MEDIAN, PERCENTILE_CONT, PERCENTILE_DISC, QUANTILE_CONT, QUANTILE_DISC and APPROX_COUNT_DISTINCT)`);
+        }
         if (['COALESCE', 'IFNULL', 'NVL', 'NULLIF'].includes(e.fn) && kindOf(e, ctx) === 'text') {
           if (e.args.length < 2 || (e.fn === 'NULLIF' && e.args.length !== 2)) fail(`${e.fn}() needs ${e.fn === 'NULLIF' ? 'two values' : 'two values or more'}`);
           const args = e.args.map((x) => argOf(x, ctx));
@@ -1669,7 +1683,9 @@ function compileSelect(ast, env, outer, tail) {
       else if (g.k === 'col' && !g.table && items.some((it) => it.alias === g.name) && !scope.some((s) => s.names.has(g.name))) e = items.find((it) => it.alias === g.name).e;
       if (hasAgg(e)) fail('GROUP BY can\'t use aggregates');
       if (hasWindow(e)) fail('GROUP BY can\'t use window functions');
+      if (keys.some((k) => k.sqlKey === key(e))) continue; // (GROUP BY q, q or q, 1: the same key once)
       let t = e.k === 'col' ? colOf(e) : translate(e, plain);
+      if (t.t === 'var' && keys.some((k) => k.name === t.name)) continue;
       if (isCond(e) && e.k !== 'num') t = condValue(e, plain, t); // (GROUP BY a > 0: true, false and NULL groups)
       let name;
       if (t.t === 'var') name = t.name;

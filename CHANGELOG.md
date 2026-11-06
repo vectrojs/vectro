@@ -145,6 +145,14 @@ Fixes from audit round 5.
   that showed generated code.
 - CSV: a time with a `+hh` offset (`2024-01-02 03:04:05+00`, as PostgreSQL
   exports a timestamptz) makes a date column; it stayed text.
+- SQL: aggregates take `FILTER (WHERE ...)` (`COUNT(*) FILTER (WHERE v > 1)`,
+  `SUM(x) FILTER (...)`); it was a syntax error. An unknown function, also an
+  aggregate such as `STDDEV(v)` in a GROUP BY query, says it is unknown and
+  lists the aggregates; it said "v must be in GROUP BY".
+- SQL: `GROUP BY q, q` (or `q, 1`) groups by q once; it failed with "groupBy
+  got the same key twice".
+- SQL: a text IN list can hold NULL (`s IN ('a', NULL)`), as BI tools write it;
+  it was refused. `s NOT IN ('a', NULL)` keeps nothing, as in SQL.
 
 ## 0.1.4
 

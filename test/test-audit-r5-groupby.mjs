@@ -99,6 +99,15 @@ for (const [opts, source] of [[{}, 'table'], [{ threads: 1 }, 'table'], [{}, 'da
     same([[d.groupBy('g').agg({ s: 'sum(k)' }).toRows()[0].s]], [[NaN]], 'dataset groupBy sum with a NaN chunk');
   }
   same(rowsOf(sql("SELECT CAST('inf' AS DOUBLE) AS a, CAST('-inf' AS DOUBLE) AS b, CAST('Infinity' AS DOUBLE) AS c", { one: e.table({ x: [1] }) }).toRows()), [[Infinity, -Infinity, Infinity]], "CAST('inf' AS DOUBLE)");
+  // G3: FILTER (WHERE ...) on aggregates; an unknown aggregate says so
+  const f = e.table({ g: ['a', 'a', 'b', 'b'], v: [1, 2, 3, 4] });
+  same(rowsOf(sql('SELECT g, COUNT(*) FILTER (WHERE v > 1) AS c, SUM(v) FILTER (WHERE v < 4) AS s, MEDIAN(v) FILTER (WHERE v > 1) AS m FROM f GROUP BY g ORDER BY g', { f }).toRows()), [['a', 1, 3, 2], ['b', 2, 3, 3.5]], 'aggregates with FILTER (WHERE ...)');
+  same(rowsOf(sql('SELECT COUNT(*) FILTER (WHERE v > 9) AS c FROM f', { f }).toRows()), [[0]], 'COUNT(*) FILTER that keeps nothing is 0');
+  let msg = ''; try { sql('SELECT g, STDDEV(v) AS s FROM f GROUP BY g', { f }).toRows(); } catch (err) { msg = err.message; }
+  same([[/unknown function STDDEV\(\)/.test(msg)]], [[true]], 'an unknown aggregate in a GROUP BY query says it is unknown');
+  // S2: NULL in a text IN list
+  same(rowsOf(sql("SELECT g FROM f WHERE g IN ('a', NULL)", { f }).toRows()), [['a'], ['a']], "text IN ('a', NULL)");
+  same(rowsOf(sql("SELECT g FROM f WHERE g NOT IN ('a', NULL)", { f }).toRows()), [], "text NOT IN ('a', NULL) keeps nothing");
   await e.close();
 }
 rmSync(dir, { recursive: true, force: true });
