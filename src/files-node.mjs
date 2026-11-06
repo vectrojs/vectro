@@ -1,7 +1,7 @@
 // Node files for datasets (see dataset.mjs): reading, writing and temporary
 // folders. dataset.mjs itself uses no Node APIs, so datasets also open in
 // browsers (from a File or a URL; see blobFile and urlFile there).
-import { openSync, readSync, read, writeSync, closeSync, fstatSync, ftruncateSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { openSync, readSync, read, writeSync, closeSync, fstatSync, ftruncateSync, existsSync, mkdtempSync, rmSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -52,15 +52,33 @@ function reader(fd, path) {
 export const nodeFiles = {
   openRead: (path) => reader(openSync(path, 'r'), path),
   // A writable file; with append, an existing file is opened as it is
-  // (existed: true, and readable, for its footer).
-  openWrite(path, { append = false } = {}) {
+  // (existed: true, and readable, for its footer). With atomic, a new file is
+  // written beside the path and put in its place by commit() (discard() or
+  // abort() delete it instead): a dataset still open on the old file keeps
+  // reading the old file, where writing over it in place mixed old and new bytes.
+  openWrite(path, { append = false, atomic = false } = {}) {
     const existed = append && existsSync(path);
-    const fd = openSync(path, existed ? 'r+' : 'w');
-    return Object.assign(reader(fd, path), { // (the same object: a copy would let the reader be collected, closing the descriptor)
+    const tmp = atomic && !existed ? `${path}.${process.pid}-${Math.random().toString(36).slice(2, 10)}.tmp` : null;
+    const fd = openSync(tmp ?? path, existed ? 'r+' : 'w');
+    const file = Object.assign(reader(fd, path), { // (the same object: a copy would let the reader be collected, closing the descriptor)
       existed,
       write(u8, pos) { for (let done = 0; done < u8.length; ) done += writeSync(fd, u8, done, u8.length - done, pos + done); },
       truncate: (size) => ftruncateSync(fd, size),
     });
+    if (tmp) {
+      Object.assign(file, {
+        commit() {
+          try { renameSync(tmp, path); } catch (err) {
+            rmSync(tmp, { force: true });
+            if (['EPERM', 'EBUSY', 'EACCES'].includes(err.code)) throw new Error(`vectro: can't replace ${path} while it is open (close the datasets that use it): ${err.code}`);
+            throw err;
+          }
+        },
+        discard: () => rmSync(tmp, { force: true }),
+        abort() { file.close(); file.discard(); },
+      });
+    }
+    return file;
   },
   tempDir: (prefix) => mkdtempSync(join(tmpdir(), prefix)),
   join,

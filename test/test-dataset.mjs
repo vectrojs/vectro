@@ -2,7 +2,7 @@
 // memory, read chunk by chunk (small chunks here, so there are many), on
 // every engine; chunks the filters rule out are skipped; writers append,
 // buffer and convert CSV of any size; errors are clear.
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Engine, sql, Dataset } from '../src/node.mjs';
@@ -420,7 +420,14 @@ for (const [label, make] of engines) {
   check(msg(() => w.append({ a: [1] })).includes('differ'), 'columns differ');
   check(msg(() => w.append({ a: [1], b: [2] })).includes('category'), 'kinds differ');
   w.abort();
-  check(msg(() => e.openDataset(file('schema.vectro'))).includes("wasn't closed"), 'aborted file');
+  check(!existsSync(file('schema.vectro')) && !readdirSync(dir).some((f) => f.endsWith('.tmp')), 'an aborted writer leaves no file');
+  e.writeDataset(file('kept.vectro'), e.table({ a: [1, 2, 3] }));
+  const w2 = e.createDataset(file('kept.vectro'));
+  w2.append({ a: [9] });
+  w2.abort();
+  const kept = e.openDataset(file('kept.vectro'));
+  check(kept.count() === 3, 'an aborted writer leaves the file it would have replaced');
+  kept.close();
   const d = e.writeDataset(file('ok.vectro'), e.table({ a: [1, 2] })) && e.openDataset(file('ok.vectro'));
   check(msg(() => d.filter('nope > 1').count()).includes('nope'), 'unknown column');
   await d.close();

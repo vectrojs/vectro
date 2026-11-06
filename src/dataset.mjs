@@ -104,7 +104,7 @@ export class DatasetWriter {
     this.pendingRows = 0; // (copying the waiting rows on every append made many small appends quadratic)
     this.meta = null;
     this.labels = new Map(); // category column -> { dict, codes }: one dictionary for the dataset
-    this.file = typeof path === 'string' ? need('writing a dataset').openWrite(path, { append }) : path;
+    this.file = typeof path === 'string' ? need('writing a dataset').openWrite(path, { append, atomic: true }) : path;
     if (this.file.existed) {
       if (!footer) try { footer = readFooter(this.file); } catch (err) { this.file.close(); throw err; }
       const { meta, footerStart } = footer;
@@ -157,6 +157,7 @@ export class DatasetWriter {
   close() {
     if (this.summary) return this.summary;
     if (this.aborted) throw new Error('vectro: this dataset writer was aborted');
+    let closed = false;
     try {
       if (!this.meta) throw new Error('vectro: append at least one table to a dataset (it can have no rows)');
       if (this.parts.length && (this.pendingRows || !this.meta.chunks.length)) {
@@ -173,16 +174,19 @@ export class DatasetWriter {
       this.file.write(tail, this.pos);
       this.pos += TAIL;
       this.file.truncate(this.pos);
+      this.file.close();
+      closed = true;
+      this.file.commit?.(); // (a new file in Node: written beside the path, now put in its place)
       this.summary = { path: this.path, rows: this.meta.rows, chunks: this.meta.chunks.length, bytes: this.pos };
       return this.summary;
     } finally {
       this.#dropParts();
-      this.file.close();
+      if (!closed) { this.file.close(); this.file.discard?.(); }
     }
   }
 
-  // Stop without a footer (the file is left unreadable as a dataset; a
-  // browser file is discarded).
+  // Stop without a footer: a new file is discarded (in Node and browsers), an
+  // existing one appended to is left unreadable as a dataset.
   abort() {
     if (this.summary || this.aborted) return;
     this.aborted = true;
@@ -1770,7 +1774,7 @@ export function writeDataset(engine, path, source, opts) {
 // A writer for a path (Node) or a writable file object (browsers), reading
 // the footer first when appending to a file that has one.
 export async function createDatasetAsync(engine, target, opts = {}) {
-  const file = typeof target === 'string' ? need('writing a dataset').openWrite(target, { append: opts.append }) : target;
+  const file = typeof target === 'string' ? need('writing a dataset').openWrite(target, { append: opts.append, atomic: true }) : target;
   let footer = null;
   if (file.existed) try { footer = file.readSync ? readFooter(file) : await readFooterAsync(file); } catch (err) { file.close(); throw err; }
   return new DatasetWriter(engine, file, { ...opts, footer });

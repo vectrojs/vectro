@@ -26,6 +26,13 @@ Fixes from audit round 5 (the six worst bugs first).
   `close()` stopped the whole process at garbage collection ("A FileHandle
   object was closed during garbage collection"). A dataset dropped without
   `close()` now has its file closed when it is collected.
+- Writing a dataset over an existing file no longer changes it under a dataset
+  that has it open. `writeDataset`, `csvToDataset` and `createDataset` write a
+  new file beside the path and move it into place when it is complete, so an
+  open dataset keeps reading the old file. Before, it read the new bytes with
+  the old layout: rows mixed old and new values. A writer that fails or is
+  aborted leaves no file behind, and leaves the file it would have replaced
+  as it was.
 
 ## 0.1.4
 
