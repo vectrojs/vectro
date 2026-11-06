@@ -42,6 +42,7 @@ const KEYWORDS = new Set(['SELECT', 'DISTINCT', 'FROM', 'AS', 'JOIN', 'INNER', '
 
 class SqlError extends SyntaxError {}
 const fail = (msg) => { throw new SqlError(`vectro SQL: ${msg}`); };
+const ONE_ROW = 'vectro SQL: a subquery used as a value returned more than one row (add LIMIT 1, or use IN or a JOIN)'; // (checked by the join, when the rows are known)
 
 // ---- tokens ---------------------------------------------------------------------------
 // fold: unquoted names in lower case, as PostgreSQL reads them
@@ -911,7 +912,7 @@ function compileSelect(ast, env, outer, tail) {
   // rel's columns get fresh names; returns them
   // a subquery's columns looked up on the outer rows by key; in a grouped SELECT (ctx.step deferred),
   // done after grouping, so the columns are there for the grouped rows
-  function attach(rel, outerKeys, relKeys, cols, ctx) {
+  function attach(rel, outerKeys, relKeys, cols, ctx, single = false) { // (single: a value, so more than one row per key is an error)
     const tag = n.hidden++;
     const fresh = (c) => `__s${tag}_${c}`;
     const run = () => {
@@ -922,7 +923,7 @@ function compileSelect(ast, env, outer, tail) {
       let lefts = outerKeys.map((t) => hide(t));
       let rights = relKeys.map(fresh);
       if (!lefts.length) { const k = `__x${n.hidden++}`; q = q.derive(k, '0'); rq = rq.derive(k, '0'); lefts = [k]; rights = [k]; }
-      q = q.join(rq, { on: { left: lefts, right: rights }, how: 'left', view: true }); // (its keys are unique: right columns looked up, left rows not copied)
+      q = q.join(rq, { on: { left: lefts, right: rights }, how: 'left', view: true, ...(single ? { single: ONE_ROW } : {}) }); // (its keys are unique: right columns looked up, left rows not copied)
     };
     if (ctx?.step) ctx.step({ name: fresh(cols[0]), inputs: [], run }); else run();
     return cols.map(fresh);
@@ -981,14 +982,14 @@ function compileSelect(ast, env, outer, tail) {
     if (!pairs.length) {
       const rel = compileQuery(inner, env, outerHere);
       if (rel.names.length !== 1) fail('a subquery used as a value needs exactly one column');
-      const [c] = attach(rel, [], [], [rel.names[0]], ctx);
+      const [c] = attach(rel, [], [], [rel.names[0]], ctx, true);
       return v(c);
     }
     if (!(body.items.length === 1 && hasAgg(body.items[0].e)) || body.groupBy?.length) fail('a correlated subquery used as a value must compute one aggregate, e.g. (SELECT MAX(x) FROM t WHERE t.k = o.k)');
     const keyItems = pairs.map((pr, i) => ({ e: pr.inner, alias: `__k${i}` }));
     const sel = { ...body, items: [...keyItems, { e: body.items[0].e, alias: '__v' }], groupBy: keyItems.map((it) => it.e) };
     const rel = compileQuery({ ...inner, body: sel, orderBy: [], limit: null, offset: 0 }, env, outerHere);
-    const [c] = attach(rel, pairs.map((pr) => translate(pr.outer, ctx)), keyItems.map((it) => it.alias), ['__v'], ctx);
+    const [c] = attach(rel, pairs.map((pr) => translate(pr.outer, ctx)), keyItems.map((it) => it.alias), ['__v'], ctx, true);
     const it = body.items[0].e;
     return it.k === 'call' && it.fn === 'COUNT' ? call('coalesce', v(c), num(0)) : v(c); // (no rows: COUNT is 0)
   }

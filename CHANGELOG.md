@@ -11,6 +11,10 @@ Fixes from audit round 5 (the six worst bugs first).
   table; it gave milliseconds. Each chunk now records whether a date column
   holds whole days; files written before are read from their encoding. The
   PostgreSQL, Flight and OData servers report those columns as `date` too.
+- SQL: a subquery used as a value that returns more than one row (`WHERE
+  price < (SELECT v FROM u)`) is an error, as in DuckDB and PostgreSQL. It
+  silently joined every row to every value, so a SUM came out several times
+  too big.
 
 ## 0.1.4
 
