@@ -281,6 +281,27 @@ export class Table {
 
   #hasPacked() { for (const c of this.cols.values()) if (c.enc) return true; return false; }
 
+  // This table with its packed columns decoded, in plain JavaScript (callable inside a running query);
+  // the columns it owned move to the new table, the packed arrays stay with this one (freed by its dispose).
+  _plain() {
+    if (!this.#hasPacked()) return this;
+    const { engine } = this, f32 = this.type === Float32Array;
+    const cols = new Map(), decoded = [];
+    for (const [name, c] of this.cols) {
+      if (!c.enc) { cols.set(name, c); continue; }
+      const out = engine.alloc(c.plainType, this.n), codes = engine.live(c.data), o = engine.live(out);
+      for (let i = 0; i < this.n; i++) o[i] = decodeOne(c.enc, codes[i], f32);
+      const { enc, plainType, rows, ...rest } = c;
+      cols.set(name, { ...rest, data: out });
+      decoded.push(name);
+    }
+    for (const c of cols.values()) c.data = engine.live(c.data);
+    const owned = [...decoded, ...this.owned.filter((n) => !decoded.includes(n))], ownedBuffers = this.ownedBuffers;
+    this.owned = this.owned.filter((n) => decoded.includes(n));
+    this.ownedBuffers = [];
+    return new Table(engine, cols, this.n, { pred: this.pred, params: this.params, owned, ownedBuffers, zones: this.zones });
+  }
+
   // The same rows with packed columns decoded (new arrays, owned): all of
   // them, or those in `names` (the others stay packed).
   *#decodedG(names = null) {

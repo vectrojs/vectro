@@ -1512,7 +1512,8 @@ function groupAccumulator(kind, B, engine, ds, derived) {
   }
 
   // Merged partial groups G -> the result: keys, then each aggregation.
-  function finalize(G, counts) {
+  function finalize(G0, counts) {
+      const G = G0._plain(); // (packed partial columns: their values, not their codes)
       try {
         const cols = new Map(), owned = [];
         const take = (t, name) => { t.owned = t.owned.filter((n) => n !== name); return t.cols.get(name); };
@@ -1544,6 +1545,7 @@ function groupAccumulator(kind, B, engine, ds, derived) {
         return new Table(engine, cols, G.n, { owned });
       } finally {
         G.dispose();
+        if (G0 !== G) G0.dispose();
         for (const C of counts) C.dispose?.();
       }
   }
