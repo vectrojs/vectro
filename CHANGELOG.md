@@ -86,6 +86,10 @@ Fixes from audit round 5.
   `meanAsync`, `minAsync`, `maxAsync`, `explainAsync`, and
   `groupBy(...).aggAsync` (also on lazy queries). They were missing
   (TypeError). `count` / `countAsync` take params.
+- Streams: `keepMs` drops every row older than the newest time minus
+  `keepMs`, also rows that arrived late with an old time. Only the rows at the
+  front were dropped, so a late row from long ago stayed in "the last second"
+  and went into its totals.
 
 ## 0.1.4
 

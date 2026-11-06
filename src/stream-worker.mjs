@@ -172,7 +172,28 @@ export function createStreams(getEngine) {
     if (s.keepMs != null) {
       const ts = getEngine().live(s.cols.get(s.timeColumn).data), oldest = Math.max(s.maxTime, s.newest) - s.keepMs;
       while (s.start < s.n && ts[s.start] < oldest) s.start++;
+      dropLate(s, oldest);
     }
+  }
+  // Rows that arrived late with an old time sit behind newer ones, where the
+  // trim above doesn't reach. A block whose smallest time is older than the
+  // cutoff holds one: the rows after it are moved up over such rows, in order.
+  function dropLate(s, oldest) {
+    const engine = getEngine(), z = s.zones.get(s.timeColumn), ts = engine.live(s.cols.get(s.timeColumn).data);
+    let first = -1;
+    for (let b = Math.floor(s.start / ZONE_ROWS); b * ZONE_ROWS < s.n && first < 0; b++) {
+      if (!(z.mins[b] < oldest)) continue;
+      for (let i = Math.max(s.start, b * ZONE_ROWS), e = Math.min(s.n, (b + 1) * ZONE_ROWS); i < e; i++) if (ts[i] < oldest) { first = i; break; }
+    }
+    if (first < 0) return;
+    const keep = [];
+    for (let i = first; i < s.n; i++) if (!(ts[i] < oldest)) keep.push(i); // (missing times are kept, as before)
+    for (const c of s.cols.values()) { const d = engine.live(c.data); keep.forEach((r, j) => { d[first + j] = d[r]; }); }
+    keep.forEach((r, j) => { s.pos[first + j] = s.pos[r]; });
+    s.n = first + keep.length;
+    const b0 = Math.floor(first / ZONE_ROWS); // (zone maps from that block on: rebuilt)
+    for (const zz of s.zones.values()) { zz.mins.length = b0; zz.maxs.length = b0; }
+    updateZones(s, b0 * ZONE_ROWS, s.n - b0 * ZONE_ROWS);
   }
 
   // Parse up to `limit` bytes of queued lines (everything by default).
