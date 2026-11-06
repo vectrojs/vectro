@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Fixes from audit round 5 (the six worst bugs first).
+Fixes from audit round 5.
 
 - LIKE and ILIKE (in SQL and in `like()` / `ilike()`) match in linear time.
   They were a backtracking regular expression: `LIKE '%a%e%o%zzz'` on 4 KB of
@@ -33,6 +33,9 @@ Fixes from audit round 5 (the six worst bugs first).
   the old layout: rows mixed old and new values. A writer that fails or is
   aborted leaves no file behind, and leaves the file it would have replaced
   as it was.
+- SQL: a missing date compared with a date written as text (`d <> '2024-02-29'`,
+  `NOT (d = '…')`, `d NOT IN ('…')`) is unknown, so the row is left out, as with
+  `DATE '…'`. Those rows were kept.
 
 ## 0.1.4
 

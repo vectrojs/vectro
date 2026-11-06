@@ -1275,8 +1275,10 @@ function compileSelect(ast, env, outer, tail) {
             return bin('&&', bin(op, T(e.l), T(e.r)), bin('&&', present(e.l, ctx), present(e.r, ctx)));
           const lk = kindOf(e.l, ctx), rk = kindOf(e.r, ctx);
           if (lk === 'text' || rk === 'text') {
-            if ((lk === 'date' && e.r.k === 'str') || (rk === 'date' && e.l.k === 'str')) // a date written as text
-              return bin(op, e.l.k === 'str' ? T({ k: 'date', v: e.l.v }) : T(e.l), e.r.k === 'str' ? T({ k: 'date', v: e.r.v }) : T(e.r));
+            if ((lk === 'date' && e.r.k === 'str') || (rk === 'date' && e.l.k === 'str')) { // a date written as text
+              const c = bin(op, e.l.k === 'str' ? T({ k: 'date', v: e.l.v }) : T(e.l), e.r.k === 'str' ? T({ k: 'date', v: e.r.v }) : T(e.r));
+              return op === '!=' ? bin('&&', c, present(e.l.k === 'str' ? e.r : e.l, ctx)) : c; // (a missing date: unknown, so not kept)
+            }
             const lit = e.l.k === 'str' ? e.r : e.r.k === 'str' ? e.l : null;
             if ((op === '==' || op === '!=') && lit && lit.k !== 'str' && kindOf(lit, ctx) === 'text') { // (a column and a label: by code)
               const c = bin(op, T(e.l), T(e.r));
