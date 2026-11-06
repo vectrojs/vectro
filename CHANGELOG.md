@@ -187,6 +187,13 @@ Fixes from audit round 5.
 - `tableFromRows`: the columns are every key of any row (missing where a row
   lacks one); keys first seen after the first row were dropped. A number in a
   text column is its text (`'5'`); it stayed a number.
+- JSON lines files (servers, MCP): every key is a column, as the docs say. A
+  key whose value is nested in some rows keeps its plain values (the whole key
+  was dropped, and with a list of numbers in one row the file was taken for
+  vectors), and a nested value in a text column is its JSON text
+  (`'{"nested":true}'`); a key with only nested values is such a column (it
+  was dropped). A vector field is one that holds a list of numbers of one
+  length in every row. Streams still leave nested values missing.
 
 ## 0.1.4
 

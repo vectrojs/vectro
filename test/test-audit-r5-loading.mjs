@@ -84,7 +84,7 @@ if (MODE === 'node') {
   same(await jsonl(['{"x":1}', '{"x":"1e3"}', '{"x":" 7 "}']), [{ x: 1 }, { x: 1000 }, { x: 7 }], 'JSON lines: numeric strings with an exponent or spaces');
   same(await jsonl(['﻿{"x":1}', '{"x":2}']), [{ x: 1 }, { x: 2 }], 'JSON lines: a BOM before the first record');
   same(await jsonl(['{"x":1}', '{"x":1e400}', '{"x":-1e400}']), [{ x: 1 }, { x: 'Infinity' }, { x: '-Infinity' }], 'JSON lines: 1e400 is Infinity (as in CSV)');
-  same(await jsonl(['{"a":[1,2],"z":1}', '{"a":"txt","z":2}', '{"a":null,"z":3}']), [{ a: null, z: 1 }, { a: 'txt', z: 2 }, { a: null, z: 3 }], 'JSON lines: a key nested in some rows keeps its plain values');
+  same(await jsonl(['{"a":[1,2],"z":1}', '{"a":"txt","z":2}', '{"a":null,"z":3}']), [{ a: '[1,2]', z: 1 }, { a: 'txt', z: 2 }, { a: null, z: 3 }], 'JSON lines: a key nested in some rows keeps its plain values, nested ones as JSON text');
   same(await jsonl(['{"user":"a","ms":12}', 'not json', '{"user":"b","ms":null}']), [{ user: 'a', ms: 12 }, { user: 'b', ms: null }], 'JSON lines: a line that is not an object is skipped');
   same(await jsonl(['{"x":"1"}', '{"x":""}', '{"x":"\\u0030"}']), [{ x: 1 }, { x: null }, { x: 0 }], 'JSON lines: blank text is missing, an escaped "0" is 0');
   same(await jsonl([...Array.from({ length: 1200 }, (_, i) => `{"x":${i}}`), '{"x":1,"y":"7"}']).then((r) => r.at(-1)), { x: 1, y: 7 }, 'JSON lines: a key first seen after the first lines, with a numeric string, is a number');

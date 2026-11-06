@@ -87,7 +87,7 @@ async function loadWithEmbeddings(engine, bytes, field, dim, kinds, types) {
     if (late) continue;
     names.forEach((n, k) => {
       const x = o[n];
-      const value = kinds.get(n) === 'number' ? (typeof x === 'number' ? x : typeof x === 'boolean' ? +x : typeof x === 'string' && x.trim() ? Number(x) : NaN) : x == null || typeof x === 'object' ? '' : String(x);
+      const value = kinds.get(n) === 'number' ? (typeof x === 'number' ? x : typeof x === 'boolean' ? +x : typeof x === 'string' && x.trim() ? Number(x) : NaN) : x == null ? '' : typeof x === 'object' ? JSON.stringify(x) : String(x); // (nested: its JSON text)
       cols[clean[k]].push(value);
       if (hasVector) withVector[clean[k]].push(value);
     });
@@ -100,27 +100,33 @@ async function loadWithEmbeddings(engine, bytes, field, dim, kinds, types) {
 
 function loadJSONLines(engine, bytes, types) {
   // column names and kinds from the first 1,000 lines
-  const kinds = new Map(), arrays = new Map();
+  const kinds = new Map(), arrays = new Map(), notVector = new Set();
   const text = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 1 << 20)));
   for (const line of text.split('\n').slice(0, 1000)) {
     let o;
     try { o = JSON.parse(line.replace(/^\uFEFF/, '')); } catch { continue; }
     if (!o || typeof o !== 'object' || Array.isArray(o)) continue;
     for (const [k, v] of Object.entries(o)) {
-      if (Array.isArray(v) && v.length && v.every((x) => typeof x === 'number')) { if (!arrays.has(k)) arrays.set(k, v.length); }
+      // (a vector field: a list of numbers of one length in every sampled row that has the key; a key
+      // also holding other values is a plain column, nested values in it missing)
+      if (v !== null) {
+        const vec = Array.isArray(v) && v.length && v.every((x) => typeof x === 'number');
+        if (vec && !notVector.has(k) && (!arrays.has(k) || arrays.get(k) === v.length)) arrays.set(k, v.length);
+        else { notVector.add(k); arrays.delete(k); }
+      }
       if (v === null || typeof v === 'object') { if (!kinds.has(k)) kinds.set(k, null); continue; }
       const kind = typeof v === 'string' ? textKind(v) : 'number'; // (numeric strings stay numbers; blank text changes nothing)
       if (kind === 'blank') { if (!kinds.get(k)) kinds.set(k, 'blank'); }
       else if (kinds.get(k) !== 'category') kinds.set(k, kind);
     }
   }
-  for (const [k, v] of kinds) if (v === 'blank') kinds.set(k, 'category');
+  for (const [k, v] of kinds) if (v === 'blank' || (v === null && !arrays.has(k))) kinds.set(k, 'category'); // (only nested or null values: a text column, nested values as their JSON text; every key is a column)
   for (const [k, v] of Object.entries(types ?? {})) kinds.set(k, v === 'number' ? 'number' : 'category');
   if (arrays.size) { const [field, dim] = arrays.entries().next().value; return loadWithEmbeddings(engine, bytes, field, dim, kinds, types); }
   let names = [...kinds].filter(([, v]) => v).map(([k]) => k);
   if (!names.length) throw new LoadError('no JSON objects with plain values found in the first lines');
   const seen = {};
-  let r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)), seen);
+  let r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)), seen, { nestedText: true });
   // after the first lines: text in a number column (loaded as text, as CSV does) and new keys
   const given = (n) => types && n in types;
   const late = names.filter((n, k) => seen.text[k] && !given(n));
@@ -128,7 +134,7 @@ function loadJSONLines(engine, bytes, types) {
   for (const [n, kind] of seen.extra) if (!kinds.get(n)) { late.push(n); kinds.set(n, kind === 'blank' ? 'category' : kind); }
   if (late.length) {
     names = [...kinds].filter(([, v]) => v).map(([k]) => k);
-    r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)));
+    r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)), null, { nestedText: true });
   }
   const clean = cleanNames(names); // ("@timestamp", "user-agent": names that work in expressions, as CSV headers get)
   const cols = Object.fromEntries(names.map((n, k) => [clean[k], r.dicts[k] ? Array.from(r.cols[k], (code) => r.dicts[k][code]) : r.cols[k]]));

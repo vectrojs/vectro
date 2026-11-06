@@ -24,7 +24,8 @@ const RANK = { blank: 0, number: 1, category: 2 };
 // report (optional, an object): filled with text (a Uint8Array, 1 for a number column that got
 // text that isn't a number) and extra (a Map: each other key with plain values -> 'number',
 // 'category' or 'blank' (only blank text), as its values look), so a caller can load the lines again with those kinds.
-export function parseNDJSON(bytes, start, end, names, kinds, report = null) {
+// nestedText: a nested value in a text column is its JSON text (loading a file; streams leave it missing).
+export function parseNDJSON(bytes, start, end, names, kinds, report = null, { nestedText = false } = {}) {
   const k = names.length;
   const keyBytes = names.map((n) => encode(n));
   let cap = 1;
@@ -110,9 +111,12 @@ export function parseNDJSON(bytes, start, end, names, kinds, report = null) {
           seen[c] = 1;
         } else if (extra) noteExtra(extraName(ks, kEnd, kEsc), textKind(esc ? unescapeJSON(decodeLatin(bytes, vs, p)) : decodeLatin(bytes, vs, p)));
         p++;
-      } else if (b === LBRACE || b === LBRACKET) { // nested: skip it
+      } else if (b === LBRACE || b === LBRACKET) { // nested: missing (nestedText: its JSON text in a text column)
+        const vs = p;
         p = skipNested(bytes, p, eol);
         if (p < 0) { ok = false; break; }
+        if (c >= 0 && dicts[c] && nestedText) { cols[c][row] = dicts[c].code(vs, p, false); seen[c] = 1; }
+        else if (c < 0 && extra) noteExtra(extraName(ks, kEnd, kEsc), 'category'); // (a key first seen so, after the first lines)
       } else {
         const vs = p;
         while (p < eol && bytes[p] !== COMMA && bytes[p] !== RBRACE && !isSpace(bytes[p])) p++;
