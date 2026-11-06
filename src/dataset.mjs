@@ -922,7 +922,7 @@ function* runChunksG(plan, path, sink) {
   ds.lastRun.skipped = ds.chunkCount - pieces.length;
   const list = pieces.length ? pieces : [{ i: -1, lo: 0, hi: 0 }]; // (no rows, but the plan still runs once for the result's shape)
   // columns made below B (names made above it, such as a result's renames, are not: B sees the dataset's)
-  const derived = new Set(below.filter((n) => n.op === 'derive' || n.op === 'textmap' || n.op === 'join').flatMap((n) => (n.op === 'join' ? namesOf(n.right) : [n.name])));
+  const derived = new Set(below.filter((n) => n.op === 'derive' || n.op === 'textmap' || n.op === 'join').flatMap((n) => (n.op === 'join' ? [...namesOf(n.right), ...joinNames(n).fromRight.keys()] : [n.name]))); // (a join's right columns under their output names too: s_right)
   // derived columns that are arithmetic on number columns of the dataset (a top-k cutoff can compare them)
   derived.numeric = new Set(below.filter((n) => n.op === 'derive' && arithmetic(n.ast, ds)).map((n) => n.name));
   // the columns of each chunk's rows the steps from B up use: a chunk's plan is cut to them, so a column it

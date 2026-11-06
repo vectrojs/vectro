@@ -108,7 +108,11 @@ export class Query {
   // only after that join ran (an earlier input of the same union).
   static unmatched(state, names) { return new Query({ op: 'unmatched', state, names }); }
   groupBy(keys) {
-    const agg = (spec, params = {}) => new Query({ op: 'aggregate', input: this.node, keys: keyList(keys), spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) });
+    const agg = (spec, params = {}) => {
+      for (const k of Object.keys(spec)) if (keyList(keys).includes(k)) throw new Error(`vectro: aggregation "${k}" has the same name as a key`); // (as a table says; a dataset put the sums in the key)
+      return aggQuery(spec, params);
+    };
+    const aggQuery = (spec, params = {}) => new Query({ op: 'aggregate', input: this.node, keys: keyList(keys), spec: Object.fromEntries(Object.entries(spec).map(([k, v]) => [k, bindParams(parse(v), params)])) });
     return { agg, aggAsync: (spec, params) => agg(spec, params).collectAsync() }; // (aggAsync: the groups, in a table)
   }
 
@@ -424,7 +428,9 @@ function* materializeG(s, names, temps, exprs = [], keepVisibleOrder = false) {
   for (const n of derivedNames) for (const v of vars(s.derived.get(n).ast)) base.add(v);
   for (const e of exprs) for (const v of vars(inline(e, s.derived))) if (s.table.cols.has(v)) base.add(v);
   for (const n of base) if (!s.table.cols.has(n)) throw new Error(`vectro: no column "${n}"`);
-  let t = base.size ? s.table.select(...base) : s.table;
+  // (keepVisibleOrder: the columns in the order the query shows them, so a join keeps the left table's order)
+  const order = keepVisibleOrder ? [...s.visible.filter((n) => base.has(n)), ...[...base].filter((n) => !s.visible.includes(n))] : [...base];
+  let t = base.size ? s.table.select(...order) : s.table;
   if (!derivedNames.length) return t;
   if (t.pred) t = yield { table: t, method: 'collect', args: [] };
   return yield* deriveAllG(t, derivedNames, s.derived);

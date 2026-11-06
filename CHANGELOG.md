@@ -175,6 +175,12 @@ Fixes from audit round 5.
   number key names the columns as written (`"b.s" and "c.s"`), not a hidden
   `__k0`, and `FULL JOIN ... USING (s)` with an empty table's column keeps the
   other side's text (it gave numbers).
+- Lazy queries and datasets: a join keeps the left table's column order, as
+  an eager join does (the key came first). On a dataset,
+  `join(...).top(k, 's_right')` (a renamed text column of the right table)
+  works; it failed with "s_right is a text column". `groupBy('s').agg({ s:
+  ... })` (an aggregation named like a key) is refused, as on a table; on a
+  dataset it put the sums where the keys should be.
 
 ## 0.1.4
 
