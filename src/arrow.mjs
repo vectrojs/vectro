@@ -697,6 +697,7 @@ export class ArrowEncoder {
       const map = this.labels[k], fresh = [];
       let codes;
       const code = (label) => {
+        label ??= ''; // (null / undefined: missing, as '' is; it was written as the text "null")
         let c = map.get(label);
         if (c === undefined) { c = map.size; map.set(label, c); fresh.push(String(label)); }
         return c;
@@ -739,12 +740,13 @@ const isCoded = (v) => v != null && !ArrayBuffer.isView(v) && !Array.isArray(v) 
 
 // Write columns as Arrow IPC: the stream format, or with file: true the file
 // format (.arrow / .feather, what pandas.read_feather and pyarrow open).
-// columns: { name: Float64Array | Float32Array | number[] | string[] | { codes, labels } }.
+// columns: { name: Float64Array | Float32Array | number[] | string[] | { codes, labels } };
+// text by its first value that isn't null, and null / undefined text is missing.
 // dates: names of columns holding dates (ms), written as Timestamp(ms, UTC).
 export function writeArrow(columns, { file = false, dates = [] } = {}) {
   const kinds = {};
   for (const [name, v] of Object.entries(columns)) {
-    kinds[name] = dates.includes(name) ? 'date' : isCoded(v) || (Array.isArray(v) && typeof v[0] === 'string') ? 'category' : v instanceof Float32Array ? 'float32' : 'number';
+    kinds[name] = dates.includes(name) ? 'date' : isCoded(v) || (Array.isArray(v) && typeof v.find((x) => x != null) === 'string') ? 'category' : v instanceof Float32Array ? 'float32' : 'number';
   }
   const e = new ArrowEncoder(kinds);
   const schema = e.schema(), parts = e.messages(columns);

@@ -104,6 +104,9 @@ Fixes from audit round 5.
 - A UTF-8 BOM before the first JSON lines record no longer loses that record,
   and a BOM before the first row pushed or sent to a CSV or JSON lines stream
   is dropped (it went into the first value, or lost the first row).
+- `writeArrow`: a text column whose first value is null is written as text
+  (it was taken for numbers, and every value was lost), and null text is
+  missing (it was written as the text "null").
 
 ## 0.1.4
 
