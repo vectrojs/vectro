@@ -97,6 +97,13 @@ Fixes from audit round 5.
   of memory. `dispose()` still frees at once and is still the way to free
   memory soon. `column()` now returns a new array view each call (over the
   same memory).
+- JSON lines: a numeric string (`{"x":"2"}`, `" 1e3 "`) goes into a number
+  column, as the docs say; one such value made the whole column text. Blank
+  text doesn't change a column's kind (it is missing in a number column), and
+  an escaped `"\u0030"` is 0 (it was missing).
+- A UTF-8 BOM before the first JSON lines record no longer loses that record,
+  and a BOM before the first row pushed or sent to a CSV or JSON lines stream
+  is dropped (it went into the first value, or lost the first row).
 
 ## 0.1.4
 

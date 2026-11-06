@@ -86,6 +86,17 @@ if (MODE === 'node') {
   same(await jsonl(['{"x":1}', '{"x":1e400}', '{"x":-1e400}']), [{ x: 1 }, { x: 'Infinity' }, { x: '-Infinity' }], 'JSON lines: 1e400 is Infinity (as in CSV)');
   same(await jsonl(['{"a":[1,2],"z":1}', '{"a":"txt","z":2}', '{"a":null,"z":3}']), [{ a: null, z: 1 }, { a: 'txt', z: 2 }, { a: null, z: 3 }], 'JSON lines: a key nested in some rows keeps its plain values');
   same(await jsonl(['{"user":"a","ms":12}', 'not json', '{"user":"b","ms":null}']), [{ user: 'a', ms: 12 }, { user: 'b', ms: null }], 'JSON lines: a line that is not an object is skipped');
+  same(await jsonl(['{"x":"1"}', '{"x":""}', '{"x":"\\u0030"}']), [{ x: 1 }, { x: null }, { x: 0 }], 'JSON lines: blank text is missing, an escaped "0" is 0');
+  same(await jsonl([...Array.from({ length: 1200 }, (_, i) => `{"x":${i}}`), '{"x":1,"y":"7"}']).then((r) => r.at(-1)), { x: 1, y: 7 }, 'JSON lines: a key first seen after the first lines, with a numeric string, is a number');
+  // streams: a BOM before the first pushed row
+  const { SplitEngine } = await import('../src/node.mjs');
+  const se = new SplitEngine({ workers: 2 });
+  for (const [format, text] of [['csv', '\uFEFF1,x\n2,y\n'], ['ndjson', '\uFEFF{"a":1,"b":"x"}\n{"a":2,"b":"y"}\n']]) {
+    const st = await se.streamAsync({ format, columns: { a: 'number', b: 'category' } });
+    await st.push(text);
+    same(await (await st.snapshotAsync()).toRowsAsync(), [{ a: 1, b: 'x' }, { a: 2, b: 'y' }], `${format} stream: a BOM before the first row`);
+  }
+  await se.close();
   rmSync(dir, { recursive: true, force: true });
 }
 

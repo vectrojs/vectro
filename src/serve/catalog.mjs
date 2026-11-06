@@ -6,7 +6,7 @@ import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { resolve, sep, extname, basename, join } from 'node:path';
 import { VectorIndex } from '../vectors.mjs';
 import { Engine } from '../node.mjs';
-import { parseNDJSON } from '../ndjson.mjs';
+import { parseNDJSON, textKind } from '../ndjson.mjs';
 import { cleanNames } from '../csv.mjs';
 
 export const MAX_FILE_BYTES = 2 ** 31;
@@ -75,14 +75,14 @@ async function loadWithEmbeddings(engine, bytes, field, dim, kinds, types) {
   for (const line of new TextDecoder().decode(bytes).split('\n')) {
     if (!line.trim()) continue;
     let o;
-    try { o = JSON.parse(line); } catch { skipped++; continue; }
+    try { o = JSON.parse(line.replace(/^\uFEFF/, '')); } catch { skipped++; continue; }
     if (!o || typeof o !== 'object' || Array.isArray(o)) { skipped++; continue; }
     const v = o[field], hasVector = Array.isArray(v) && v.length === dim && v.every((x) => typeof x === 'number');
     if (hasVector) vectors.push(v);
     for (const [n, x] of Object.entries(o)) { // after the first lines: text in a number column, new keys (loaded again with them)
       if (n === field || (types && n in types) || x === null || typeof x === 'object') continue;
-      const kind = typeof x === 'number' || typeof x === 'boolean' ? 'number' : 'category';
-      if (!kinds.get(n) || (kinds.get(n) === 'number' && kind === 'category' && x.trim() && Number.isNaN(Number(x)))) { kinds.set(n, kinds.get(n) ? 'category' : kind); late = true; }
+      const kind = typeof x === 'string' ? textKind(x) : 'number';
+      if (!kinds.get(n) || (kinds.get(n) === 'number' && kind === 'category')) { kinds.set(n, kinds.get(n) || kind === 'blank' ? 'category' : kind); late = true; }
     }
     if (late) continue;
     names.forEach((n, k) => {
@@ -104,15 +104,17 @@ function loadJSONLines(engine, bytes, types) {
   const text = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 1 << 20)));
   for (const line of text.split('\n').slice(0, 1000)) {
     let o;
-    try { o = JSON.parse(line); } catch { continue; }
+    try { o = JSON.parse(line.replace(/^\uFEFF/, '')); } catch { continue; }
     if (!o || typeof o !== 'object' || Array.isArray(o)) continue;
     for (const [k, v] of Object.entries(o)) {
       if (Array.isArray(v) && v.length && v.every((x) => typeof x === 'number')) { if (!arrays.has(k)) arrays.set(k, v.length); }
       if (v === null || typeof v === 'object') { if (!kinds.has(k)) kinds.set(k, null); continue; }
-      const kind = typeof v === 'number' || typeof v === 'boolean' ? 'number' : 'category';
-      if (kinds.get(k) !== 'category') kinds.set(k, kind);
+      const kind = typeof v === 'string' ? textKind(v) : 'number'; // (numeric strings stay numbers; blank text changes nothing)
+      if (kind === 'blank') { if (!kinds.get(k)) kinds.set(k, 'blank'); }
+      else if (kinds.get(k) !== 'category') kinds.set(k, kind);
     }
   }
+  for (const [k, v] of kinds) if (v === 'blank') kinds.set(k, 'category');
   for (const [k, v] of Object.entries(types ?? {})) kinds.set(k, v === 'number' ? 'number' : 'category');
   if (arrays.size) { const [field, dim] = arrays.entries().next().value; return loadWithEmbeddings(engine, bytes, field, dim, kinds, types); }
   let names = [...kinds].filter(([, v]) => v).map(([k]) => k);
@@ -123,7 +125,7 @@ function loadJSONLines(engine, bytes, types) {
   const given = (n) => types && n in types;
   const late = names.filter((n, k) => seen.text[k] && !given(n));
   for (const n of late) kinds.set(n, 'category');
-  for (const [n, kind] of seen.extra) if (!kinds.get(n)) { late.push(n); kinds.set(n, kind); }
+  for (const [n, kind] of seen.extra) if (!kinds.get(n)) { late.push(n); kinds.set(n, kind === 'blank' ? 'category' : kind); }
   if (late.length) {
     names = [...kinds].filter(([, v]) => v).map(([k]) => k);
     r = parseNDJSON(bytes, 0, bytes.length, names, names.map((n) => kinds.get(n)));
