@@ -1448,7 +1448,9 @@ export class Table {
       return out;
     };
     const b = bounds(n, partition.map(values), order.map((o) => values(o.name)), readsPeers(items));
-    const orderKey = order.length === 1 ? values(order[0].name) : null;
+    // (the one order key a RANGE distance measures; a NULLS FIRST flag before it (missing ones first) doesn't count)
+    const keyOrder = order.length === 1 ? order[0] : order.length === 2 && order[0].nullsFlag ? order[1] : null;
+    const orderKey = keyOrder ? values(keyOrder.name) : null;
     const cols = new Map(t.cols), owned = t === this ? [] : [...t.owned];
     if (t !== this) t.owned = [];
     const KEEPS_KIND = new Set(['lag', 'lead', 'first_value', 'last_value', 'nth_value', 'min', 'max', 'percentile_disc']);
@@ -1462,12 +1464,16 @@ export class Table {
         rank.forEach((r, code) => { if (r === r) codeOf[r] = code; });
         arg = arg.map((code) => (code === code ? rank[code] : NaN));
       }
-      let vals = windowValues(n, b, { ...it, arg }, order.length > 0, orderKey, order[0]?.desc);
+      const textDef = typeof it.def === 'string'; // (LAG(s, 1, 'none'): filled in below, as a label)
+      if (textDef && !src?.dict) throw new Error(`vectro: ${it.fn}(): a text default needs a text column, not "${it.arg}"`);
+      if (!textDef && it.def !== undefined && src?.dict) throw new Error(`vectro: ${it.fn}(): the default of the text column "${it.arg}" must be text`);
+      let vals = windowValues(n, b, { ...it, arg, def: textDef ? undefined : it.def }, order.length > 0, orderKey, keyOrder?.desc);
       if (codeOf) vals = vals.map((r) => (r === r ? codeOf[r] : NaN));
       let dict = src?.dict ?? null, codes = src?.codes ?? null;
-      if (dict && vals.includes(NaN)) { // no row (LAG past the start, an empty frame): missing text, ''
-        let e = codes.get('');
-        if (e === undefined) { dict = [...dict, '']; codes = new Map(codes).set('', dict.length - 1); e = dict.length - 1; }
+      if (dict && vals.includes(NaN)) { // no row (LAG past the start, an empty frame): the default, or missing text ''
+        const fill = textDef ? it.def : '';
+        let e = codes.get(fill);
+        if (e === undefined) { dict = [...dict, fill]; codes = new Map(codes).set(fill, dict.length - 1); e = dict.length - 1; }
         for (let i = 0; i < n; i++) if (vals[i] !== vals[i]) vals[i] = e;
       }
       const data = engine.alloc(t.type, n);

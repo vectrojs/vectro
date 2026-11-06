@@ -1615,7 +1615,15 @@ function compileSelect(ast, env, outer, tail) {
       if (!specs.has(sk)) specs.set(sk, { partition, order, items: [] });
       const constArg = (i, what) => { const x = c.args[i]; if (!x) return undefined; const k = constNum(tr(x)); if (k === null) fail(`${c.fn}(): the ${what} must be a number`); return k; };
       const item = { node: w, fn, name: `__w${n.hidden++}` };
-      if (['lag', 'lead'].includes(fn)) { item.arg = tr(c.args[0] ?? fail(`${c.fn}() needs a value`)); item.offset = constArg(1, 'offset') ?? 1; item.def = constArg(2, 'default'); }
+      if (['lag', 'lead'].includes(fn)) {
+        item.arg = tr(c.args[0] ?? fail(`${c.fn}() needs a value`)); item.offset = constArg(1, 'offset') ?? 1;
+        const text = kindCtx(c.args[0]) === 'text', d = c.args[2];
+        if (text && d) { // (a text value: a text default, LAG(s, 1, 'none'))
+          const num0 = d.k === 'str' || d.k === 'null' ? null : sqlConst(d);
+          if (d.k !== 'str' && d.k !== 'null' && num0 === null) fail(`${c.fn}(): the default of a text value must be a constant`);
+          item.def = d.k === 'str' ? d.v : d.k === 'null' ? undefined : toText(num0, 'number'); // (a number default as text, as DuckDB casts it)
+        } else item.def = d?.k === 'null' ? undefined : constArg(2, 'default');
+      }
       else if (fn === 'ntile') { item.k = constArg(0, 'number of tiles'); if (!(item.k >= 1)) fail('NTILE(n) needs n >= 1'); }
       else if (fn === 'nth_value') { item.arg = tr(c.args[0]); item.k = constArg(1, 'position'); }
       else if (['first_value', 'last_value', 'sum', 'avg', 'min', 'max'].includes(fn)) {
@@ -1644,14 +1652,10 @@ function compileSelect(ast, env, outer, tail) {
       const order = [];
       const byValue = spec.order.length === 1 && spec.items.some((it) => it.frame?.unit === 'range' && (it.frame.start.n !== undefined || it.frame.end.n !== undefined));
       for (const o of spec.order) {
-        if (o.nullsFirst && byValue) { // (RANGE with a distance takes one key: missing keys as the end the sort puts first)
-          const name = hide(o.ast, '__wo'), h = `__nf${n.hidden++}`;
-          q = q.derive(h, `${name} == ${name} ? ${name} : ${o.desc ? 'Infinity' : '(-Infinity)'}`);
-          order.push({ name: h, desc: o.desc });
-          continue;
-        }
+        // (NULLS FIRST: a 0 / 1 flag sorts the missing keys first; with a RANGE distance the window measures the
+        // key after it: missing keys were -Infinity there, so real infinite keys shared their frames)
         const name = hide(o.ast, '__wo');
-        if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, o.text ? `${name} == '' ? 0 : 1` : `${name} == ${name} ? 1 : 0`); order.push({ name: h }); }
+        if (o.nullsFirst) { const h = `__nf${n.hidden++}`; q = q.derive(h, o.text ? `${name} == '' ? 0 : 1` : `${name} == ${name} ? 1 : 0`); order.push({ name: h, ...(byValue ? { nullsFlag: true } : {}) }); }
         order.push({ name, desc: o.desc });
       }
       const its = spec.items.map((it) => ({ name: it.name, fn: it.fn, arg: it.arg ? hide(it.arg, '__wa') : null, frame: it.frame, offset: it.offset, def: it.def, k: it.k }));

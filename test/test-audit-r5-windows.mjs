@@ -110,6 +110,10 @@ rmSync(dir, { recursive: true, force: true });
   let rows;
   try { rows = sql('SELECT q, o, COUNT(*) AS n FROM g GROUP BY q, o, q ORDER BY q, o', { g }).toRows().map((r) => r.n); } catch (err) { rows = [err.message]; }
   same(rows, [1, 1, 1], 'GROUP BY the same key twice');
+  // W3: LAG / LEAD of text with a text default (a number default is written as text, as DuckDB casts it)
+  const w = e.table({ g: ['a', 'a', 'b', 'b'], i: [1, 2, 3, 4], s: ['x', 'y', 'z', ''] });
+  const lag = sql("SELECT LAG(s, 1, 'none') OVER (PARTITION BY g ORDER BY i) AS p, LEAD(s, 1, 'end') OVER (ORDER BY i) AS q, LAG(s, 2, 7) OVER (ORDER BY i) AS r FROM w ORDER BY i", { w }).toRows();
+  same(lag.flatMap((r) => [r.p, r.q, r.r]), ['none', 'y', '7', 'x', 'z', '7', 'none', '', 'x', 'z', 'end', 'y'], 'LAG / LEAD of text with a text default');
   await e.close();
 }
 

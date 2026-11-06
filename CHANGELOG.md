@@ -159,6 +159,11 @@ Fixes from audit round 5.
 - SQL: a query nested more than 400 levels deep (brackets or function calls)
   fails with that number in the message. Before, about 860 brackets ran out
   of stack, and the message said "thousands of levels".
+- SQL windows: a RANGE frame with a distance (`RANGE BETWEEN 1 PRECEDING AND
+  CURRENT ROW`) with `NULLS FIRST` keeps missing order keys out of the frames
+  of ±Infinity keys (they were counted together). `LAG` / `LEAD` of text take a
+  text default (`LAG(s, 1, 'none')`); it was refused ("must be a number"), and
+  a number default on text gave a wrong label.
 
 ## 0.1.4
 

@@ -74,7 +74,9 @@ function frames(n, b, frame, hasOrder, orderKey, desc) {
     const sign = desc ? -1 : 1, off = (e) => (e.kind === 'preceding' ? -e.n : e.kind === 'following' ? e.n : 0);
     for (let s = 0; s < n; s = pe[s]) {
       const end = pe[s];
-      let a = s, z = s;
+      let a = s;
+      while (a < end && orderKey[a] !== orderKey[a]) a++; // (NULLS FIRST: missing keys first, never in a present key's frame)
+      let z = a;
       for (let i = s; i < end; i++) {
         const v = sign * orderKey[i];
         if (v !== v) { if (f.start.n !== undefined) lo[i] = qs[i]; if (f.end.n !== undefined) hi[i] = qe[i]; continue; } // (missing keys: their ties, on the sides with a distance)
