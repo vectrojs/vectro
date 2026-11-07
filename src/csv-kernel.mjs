@@ -312,3 +312,34 @@ function slowNumber(b, s, e) {
   const v = Number(str);
   return str.trim() === '' ? NaN : v;
 }
+
+// A CSV stream's next bytes from one sender (st: that sender's state, kept across calls): a stream whose
+// lines end in CR alone has them read as LF (decided on the first line end seen, as file loaders decide
+// it), and with st.skipHeader its first line is left out (streamAsync({ header: true })).
+export function csvStreamBytes(st, bytes) {
+  if (st.crOnly === undefined && (bytes.includes(10) || bytes.includes(13))) st.crOnly = !bytes.includes(10);
+  if (st.crOnly) { bytes = Uint8Array.prototype.slice.call(bytes); for (let i = bytes.indexOf(13); i !== -1; i = bytes.indexOf(13, i + 1)) bytes[i] = 10; }
+  if (st.skipHeader) {
+    const nl = bytes.indexOf(10);
+    if (nl === -1) return bytes.subarray(bytes.length); // (still in the header line)
+    st.skipHeader = false;
+    bytes = bytes.subarray(nl + 1);
+  }
+  return bytes;
+}
+
+// A lone CR (not before an LF) outside quotes, in a file that has LFs too, is a line end: it was read
+// as part of a value (two rows merged), and whole-file and piece-by-piece loaders split such files
+// differently. In place; a CR at the end of b is left unless atEnd (an LF may follow in the next piece).
+export function loneCRToLF(b, delim = 44, atEnd = true) {
+  let lone = false;
+  for (let i = b.indexOf(13); i !== -1; i = b.indexOf(13, i + 1)) if (b[i + 1] !== 10 && (i + 1 < b.length || atEnd)) { lone = true; break; }
+  if (!lone) return false;
+  let st = 0;
+  for (let j = 0; j < b.length; j++) {
+    const c = b[j];
+    if (c === 13 && st !== 2 && b[j + 1] !== 10 && (j + 1 < b.length || atEnd)) { b[j] = 10; st = 0; continue; }
+    st = c === NL && ROW_END[st] ? 0 : csvStep(st, c, delim);
+  }
+  return true;
+}

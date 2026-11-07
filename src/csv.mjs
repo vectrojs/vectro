@@ -11,7 +11,7 @@
 
 import { Table } from './table.mjs';
 import { OP, MAX_ARGS } from './kernels.mjs';
-import { parseNumber, STR_SHIFT, STR_ESCAPED, STR_MAX_LEN, CSV_FIELD_START } from './csv-kernel.mjs';
+import { parseNumber, STR_SHIFT, STR_ESCAPED, STR_MAX_LEN, CSV_FIELD_START, loneCRToLF } from './csv-kernel.mjs';
 import { parseDateBytes, looksLikeDate, f32Dates } from './dates.mjs';
 import { decode, encode, indexOfByte } from './bytes.mjs';
 
@@ -78,7 +78,7 @@ export function checkCSVOptions({ types, columns, type, sampleRows } = {}) {
 
 function* loadBytesG(engine, bytes, opts = {}) {
   checkCSVOptions(opts);
-  crOnlyToLF(engine.live(bytes));
+  loneCRToLF(engine.live(bytes), String(opts.delimiter ?? ',').charCodeAt(0) || 44, opts.trimEnd !== false); // (CR-only and mixed line ends: a CR not before an LF ends a line, outside quotes)
   const { delimiter = ',', header = true, types = {}, columns: only = null, type = Float64Array, sampleRows = 1000, chunkBytes = CHUNK_BYTES, pieces = null, onPieceRows = null, checkTypes = null, badType = 'retype', trimEnd = true } = opts;
   const temp = [bytes];
   try {
@@ -138,6 +138,9 @@ function* loadBytesG(engine, bytes, opts = {}) {
         if (k > 0) cut[k] = scan[k * 8 + 2 * state + 1];
         state = scan[k * 8 + 2 * state];
       }
+      // (still inside a quoted field at the end: a quote was opened and never closed, and the rest of the
+      // file went into one value without a word, R6-3.12)
+      if (state === 2 && trimEnd) throw new Error('vectro: the CSV ends inside a quoted field: a quote (") was opened and never closed, so the rest of the file would be one value');
       for (let k = chunks - 1; k >= 1; k--) bounds[k] = cut[k] >= 0 ? cut[k] : k + 1 < chunks ? bounds[k + 1] : end; // (no row end in a chunk: it joins the next)
       for (let k = 1; k < chunks; k++) bounds[k] = Math.max(bounds[k - 1], Math.min(end, bounds[k]));
     } else {
@@ -328,6 +331,7 @@ export function cleanNames(raw) {
     let nm = r.trim().replace(/[^\p{L}\p{M}\p{N}_]/gu, '_') || `col${i}`;
     if (/^\d/.test(nm)) nm = `_${nm}`;
     if (RESERVED.has(nm)) nm = `${nm}_`;
+    if (nm === '__proto__') nm = '_proto_'; // (it can't be a key of a plain object: the column was dropped, R6-3.13)
     return nm;
   });
   // a name that is already fine keeps it (a-b, a_b -> a_b_2, a_b); a repeated name gets _2, _3...

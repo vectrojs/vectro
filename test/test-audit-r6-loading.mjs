@@ -2,7 +2,7 @@
 // Object.prototype properties (constructor, toString, valueOf, ...) made
 // every CSV loader refuse the file, because the `types` lookup found the
 // inherited function (vectro-qa-2026-11-07/run3).
-import { Engine } from './test-mode.mjs';
+import { Engine, MODE } from './test-mode.mjs';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -207,6 +207,29 @@ if (node) {
 }
 
 rmSync(dir, { recursive: true, force: true });
+// R6-3.9 / 3.12 / 3.13: mixed line ends, an unterminated quote, a column named __proto__; R6-3.10 / 3.11: CSV streams
+{
+  const rows = (text) => engine.parseCSV(text).toRows();
+  same(rows('a,b\r\n1,x\n2,y\r3,z\r\n'), [{ a: 1, b: 'x' }, { a: 2, b: 'y' }, { a: 3, b: 'z' }], 'mixed line ends: a lone CR ends a row');
+  same(rows('a,b\r1,x\r\n2,y\n'), [{ a: 1, b: 'x' }, { a: 2, b: 'y' }], 'first line ends in CR, then CRLF and LF');
+  same(rows('a,b\n1,"x\ry"\n'), [{ a: 1, b: 'x\ry' }], 'a CR inside quotes stays in the value');
+  let msg = ''; try { rows('a,b\n1,"open\n2,x\n'); } catch (err) { msg = err.message; }
+  same(/ends inside a quoted field/.test(msg), true, 'an unterminated quote is an error, not one swallowed value');
+  same(Object.keys(rows('__proto__,b\n1,2\n')[0]), ['_proto_', 'b'], 'a CSV column named __proto__ is _proto_');
+  if (MODE === 'node') {
+    const { SplitEngine } = await import('../src/node.mjs');
+    const se = new SplitEngine({ workers: 2 });
+    const h = await se.streamAsync({ columns: { region: 'category', n: 'number' }, header: true });
+    await h.push('region,n\nEU,1\nUS,'); await h.push('2\n');
+    same(await (await h.snapshotAsync()).toRowsAsync(), [{ region: 'EU', n: 1 }, { region: 'US', n: 2 }], 'stream header: true leaves out the first line');
+    const c = await se.streamAsync({ columns: { x: 'number' } });
+    await c.push('1\r2\r'); await c.push('3\r');
+    same(await (await c.snapshotAsync()).toRowsAsync(), [{ x: 1 }, { x: 2 }, { x: 3 }], 'a CSV stream with CR-only line ends');
+    let m2 = ''; try { await se.streamAsync({ columns: { x: 'number' }, hedaer: true }); } catch (err) { m2 = err.message; }
+    same(/doesn't take "hedaer"/.test(m2), true, 'streamAsync refuses an unknown option');
+    await se.close();
+  }
+}
 await engine.close();
 console.log(`audit r6 loading: ${checks - failures}/${checks} checks passed`);
 if (failures) process.exit(1);

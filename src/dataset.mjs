@@ -36,9 +36,9 @@ import { Query, execute, findDataset, optimize, vars, namesOf, joinNames, joinCo
 import { parse, toSource, isMask } from './fuse.mjs';
 import { KINDS, decodeOne } from './pack.mjs';
 import { conditions, mayMatch, computeZones } from './zones.mjs';
-import { STR_SHIFT, STR_ESCAPED, csvRowEnds } from './csv-kernel.mjs';
+import { STR_SHIFT, STR_ESCAPED, csvRowEnds, loneCRToLF } from './csv-kernel.mjs';
 import { trackAsyncMethods } from './engine.mjs';
-import { inspectCSV, loadBytes, loadBytesAsync, crOnlyToLF, checkCSVOptions } from './csv.mjs';
+import { inspectCSV, loadBytes, loadBytesAsync, checkCSVOptions } from './csv.mjs';
 import { freeBuild } from './join.mjs';
 import { copyRows, plainInto, remapCodes, textLength } from './rows.mjs';
 export { copyRows };
@@ -1827,20 +1827,16 @@ function* csvPiecesG(engine, size, writer, opts = {}) {
     checkCSVOptions(opts);
     if (!(pieceBytes >= 1)) throw new Error('vectro: pieceBytes must be 1 or more'); // (0 read nothing, forever)
     pieceBytes = Math.floor(pieceBytes);
-    let pos = 0, carry = new Uint8Array(0), head = new Uint8Array(0), kinds = null, crOnly = null;
+    let pos = 0, carry = new Uint8Array(0), head = new Uint8Array(0), kinds = null;
     const last0 = (at) => at >= size;
     while (true) {
       const want = Math.min(pieceBytes, size - pos);
       const buf = new Uint8Array(carry.length + want);
       buf.set(carry, 0);
       yield { read: buf.subarray(carry.length), pos };
-      // (CR-only line ends, decided on the first piece: every piece's CRs become LFs, see crOnlyToLF)
-      const fresh = buf.subarray(carry.length);
-      if (crOnly === null) { // (on the first piece with an LF, or a CR that isn't its last byte: an LF may follow it)
-        const cr = fresh.indexOf(13);
-        if (fresh.includes(10) || (cr !== -1 && cr < fresh.length - 1) || last0(pos + want)) crOnly = crOnlyToLF(buf); // (the carry too: nothing was parsed yet)
-      }
-      else if (crOnly) for (let i = fresh.indexOf(13); i !== -1; i = fresh.indexOf(13, i + 1)) fresh[i] = 10;
+      // (a CR not before an LF, outside quotes, is a line end: CR-only files and mixed ones, as loadBytes reads
+      // them; before the header and types are read. A CR at the end of a piece waits: an LF may follow.)
+      loneCRToLF(buf, delimiter.charCodeAt(0) || 44, last0(pos + want));
       pos += want;
       const last = pos >= size;
       let start = 0;

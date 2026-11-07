@@ -16,9 +16,9 @@
 // filtered table that collect() makes is still spread over every worker.
 // The page remembers rows per block ("segments") to put rows back in order.
 import { Engine as LocalEngine, trackAsyncMethods } from './engine.mjs';
-import { inspectCSV, crOnlyToLF, checkCSVOptions } from './csv.mjs';
+import { inspectCSV, checkCSVOptions } from './csv.mjs';
 import { encode, countByte } from './bytes.mjs';
-import { csvRowEnds, csvTail, CSV_FIELD_START } from './csv-kernel.mjs';
+import { csvRowEnds, csvTail, CSV_FIELD_START, csvStreamBytes, loneCRToLF } from './csv-kernel.mjs';
 import { parse, toSource } from './fuse.mjs';
 import { mergeHits } from './vectors.mjs';
 import { isCoded } from './table.mjs';
@@ -223,8 +223,9 @@ export class SplitEngine {
     checkCSVOptions(opts);
     await this.ready;
     let bytes = typeof text === 'string' ? encode(text) : text;
-    if (bytes.indexOf(10) === -1 && bytes.indexOf(13) !== -1) { bytes = Uint8Array.prototype.slice.call(bytes); crOnlyToLF(bytes); } // (CR-only line ends: on a copy, the bytes are the caller's)
+    if (bytes.indexOf(13) !== -1) { bytes = Uint8Array.prototype.slice.call(bytes); loneCRToLF(bytes, String(opts.delimiter ?? ',').charCodeAt(0) || 44); } // (CR-only or mixed line ends: on a copy, the bytes are the caller's)
     const info = inspectCSV(bytes, opts);
+    if (bytes.indexOf(34, info.start) !== -1 && csvTail(bytes, info.start, info.end, info.delim, CSV_FIELD_START).state === 2) throw new Error('vectro: the CSV ends inside a quoted field: a quote (") was opened and never closed, so the rest of the file would be one value');
     const f32 = opts.type === Float32Array; // (a guessed free-text column: a category there, as readCSV loads it)
     const types = Object.fromEntries(info.names.map((nm, f) => [nm, f32 && info.kinds[f] === 'string' ? 'category' : info.kinds[f]]));
     const head = bytes.subarray(info.headerStart, info.start);
@@ -261,15 +262,19 @@ export class SplitEngine {
   // TCP stream (Node), so the data never passes through this thread. Rows from
   // connections have no order across workers: there each worker keeps its
   // share of keepRows (keepRows / workers).
-  async streamAsync({ columns, format = 'csv', keepRows = Infinity, keepMs = null, timeColumn = null } = {}) {
+  async streamAsync({ columns, format = 'csv', keepRows = Infinity, keepMs = null, timeColumn = null, header = false, ...other } = {}) {
+    const unknown = Object.keys(other);
+    if (unknown.length) throw new Error(`vectro: streamAsync doesn't take ${unknown.map((k) => `"${k}"`).join(', ')} (options: columns, format, keepRows, keepMs, timeColumn, header)`);
+    if (header && format !== 'csv') throw new Error("vectro: streamAsync header: true is for format 'csv' (a first line of column names, left out)");
     await this.ready;
     if (this.closed) throw closedError();
     if (!columns || !Object.keys(columns).length) throw new Error('vectro: streamAsync needs columns, e.g. { ts: "number", region: "category" }');
     const id = ++this.nextTable;
     const share = Number.isFinite(keepRows) ? Math.ceil(keepRows / this.size) : Infinity;
-    await Promise.all(this.workers.map((_, w) => this._call(w, 'streamOpen', { id, columns, format, share, keepMs, timeColumn })));
+    await Promise.all(this.workers.map((_, w) => this._call(w, 'streamOpen', { id, columns, format, share, keepMs, timeColumn, header: !!header })));
     const t = new StreamTable(this, id, Object.keys(columns), [], {}, true, Object.keys(columns).filter((n) => columns[n] === 'date'));
     t.format = format;
+    t.skipHeader = !!header; // (pushed bytes: the first line is the header, see csvStreamBytes)
     t.keepRows = keepRows;
     t.keepMs = keepMs;
     if (Number.isFinite(keepRows) || keepMs != null) this.keepers.set(id, t);
@@ -680,6 +685,7 @@ export class StreamTable extends SplitTable {
       this.begun = true;
       if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) bytes = bytes.subarray(3);
     }
+    if (this.format === 'csv') bytes = csvStreamBytes(this, bytes); // (CR-only line ends, a header line)
     let last, rows = 0; // last: the last row's newline
     if (this.format === 'csv') {
       const r = csvTail(bytes, 0, bytes.length, COMMA, this.quote);

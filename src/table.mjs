@@ -2124,6 +2124,7 @@ function hiddenView(c) {
 
 const RESERVED = new Set(['Infinity', 'NaN']); // (function names are fine: sum(...) is a call, sum a column)
 function checkName(name) {
+  if (name === '__proto__') throw new Error('vectro: "__proto__" can\'t be a column name (a JavaScript object can\'t hold it as a key); rename it, e.g. _proto_');
   if (!IDENT.test(name) || RESERVED.has(name)) throw new Error(`vectro: "${name}" can't be a column name (use letters, digits and _, starting with a letter or _)`);
 }
 

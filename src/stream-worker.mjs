@@ -12,7 +12,7 @@ import { FrameReader } from './frames.mjs';
 import { ArrowReader } from './arrow.mjs';
 import { parse, isMask } from './fuse.mjs';
 import { SKETCH_SIZE, sketchAdd, sketchMerge, hashNumber, hashText } from './sketch.mjs';
-import { csvTail, csvRowEnds, CSV_FIELD_START } from './csv-kernel.mjs';
+import { csvTail, csvRowEnds, CSV_FIELD_START, csvStreamBytes } from './csv-kernel.mjs';
 
 const BATCH_BYTES = 256 * 1024; // parse once this much has arrived...
 const FLUSH_MS = 20;         // ...or this long after the first unparsed line
@@ -33,7 +33,7 @@ export function createStreams(getEngine) {
 
   // share: this worker's share of keepRows, for rows from connections (pushed
   // rows are kept by their place in push order over the whole stream, see trim).
-  function open({ id, columns, format = 'csv', share = Infinity, keepMs = null, timeColumn = null }) {
+  function open({ id, columns, format = 'csv', share = Infinity, keepMs = null, timeColumn = null, header = false }) {
     if (!['csv', 'ndjson', 'vectro', 'arrow'].includes(format)) throw new Error(`vectro: stream format must be 'csv', 'ndjson', 'vectro' or 'arrow', got "${format}"`);
     const engine = getEngine();
     const names = Object.keys(columns);
@@ -48,7 +48,7 @@ export function createStreams(getEngine) {
       date: columns[name] === 'date',
     }]));
     streams.set(id, {
-      id, names, format, badLines: 0, windows: new Map(),
+      id, names, format, badLines: 0, windows: new Map(), skipHeader: header, // (each connection's first line, see csvStreamBytes)
       types: columns, header: new TextEncoder().encode(`${names.join(',')}\n`),
       zones: new Map(names.map((name) => [name, { mins: [], maxs: [] }])), // per block of ZONE_ROWS buffer rows
       cols, cap: 1 << 16, n: 0, start: 0, share, keepMs, timeColumn, maxTime: -Infinity,
@@ -507,8 +507,9 @@ export function createStreams(getEngine) {
       return new Promise((resolve, reject) => {
         const socket = net.connect({ host, port }, () => resolve(true));
         if (s.format === 'vectro' || s.format === 'arrow') { const reader = frameReceiver(s); socket.on('data', (chunk) => receiveFrames(s, reader, chunk)); } else
-        { let head = new Uint8Array(0); socket.on('data', (chunk) => { // (the first 3 bytes, for a BOM, even when they come in pieces)
+        { let head = new Uint8Array(0); const sender = { skipHeader: s.skipHeader }; socket.on('data', (chunk) => { // (the first 3 bytes, for a BOM, even when they come in pieces)
           if (head) { chunk = concat([head, chunk]); if (chunk.length < 3 && [0xef, 0xbb].slice(0, chunk.length).every((x, i) => chunk[i] === x)) { head = chunk; return; } head = null; chunk = noBOM(chunk); }
+          if (s.format === 'csv') chunk = csvStreamBytes(sender, chunk); // (this connection's CR-only line ends and header line)
           receive(s, chunk);
         }); }
         socket.on('end', () => { if (s.partial) { queue(s, concat([s.partial, Uint8Array.of(NL)])); s.partial = null; s.quote = CSV_FIELD_START; } flush(s); });
@@ -599,10 +600,11 @@ export function createStreams(getEngine) {
       ws.binaryType = 'arraybuffer';
       let opened = false;
       ws.onopen = () => { opened = true; resolve(true); };
-      const reader = s.format === 'vectro' || s.format === 'arrow' ? frameReceiver(s) : null;
+      const reader = s.format === 'vectro' || s.format === 'arrow' ? frameReceiver(s) : null, sender = { skipHeader: s.skipHeader };
       ws.onmessage = (ev) => {
         if (reader) { if (typeof ev.data !== 'string') receiveFrames(s, reader, new Uint8Array(ev.data)); return; }
-        const bytes = noBOM(typeof ev.data === 'string' ? textEncoder.encode(ev.data) : new Uint8Array(ev.data));
+        let bytes = noBOM(typeof ev.data === 'string' ? textEncoder.encode(ev.data) : new Uint8Array(ev.data));
+        if (s.format === 'csv') bytes = csvStreamBytes(sender, bytes); // (CR-only line ends, the header line)
         if (!bytes.length) return;
         queue(s, bytes[bytes.length - 1] === NL ? bytes : concat([bytes, Uint8Array.of(NL)]));
       };
