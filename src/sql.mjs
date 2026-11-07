@@ -1814,7 +1814,8 @@ function compileSelect(ast, env, outer, tail) {
         spec[`${name}_n`] = `count(${x})`;
         spec[`${name}_d`] = `count(${d})`; // (fewer than n: an infinite value made a difference NaN)
         const cnt = v(`${name}_n`), e1 = v(`${name}_e`);
-        const m2 = bin('-', v(name), bin('/', bin('*', e1, e1), cnt));
+        // (squares that overflow: S2 is Infinity and so can e1² be, Infinity - Infinity is NaN; the variance is Infinity)
+        const m2 = cond(bin('<', v(name), num(Number.MAX_VALUE)), bin('-', v(name), bin('/', bin('*', e1, e1), cnt)), v(name));
         const val = call('max', bin('/', m2, pop ? cnt : bin('-', cnt, num(1))), num(0)); // (never below 0 by rounding)
         // NULL for too few values; NaN where a value is infinite (overflowing squares give Infinity)
         return cond(bin('>', cnt, num(pop ? 0 : 1)), cond(bin('==', v(`${name}_d`), cnt), sd ? call('sqrt', val) : val, num(NaN)), num(NaN));
