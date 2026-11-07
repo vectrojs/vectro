@@ -142,6 +142,14 @@ function loadJSONLines(engine, bytes, types) {
   return { table: engine.table(cols), skipped: r.bad };
 }
 
+// the data folder's real path, or a plain error (raw ENOENT / ENOTDIR before)
+function folderOf(path) {
+  let st;
+  try { st = statSync(path); } catch { throw new LoadError(`no folder ${path}: --root / root must be a folder of data files`); }
+  if (!st.isDirectory()) throw new LoadError(`${path} is a file, not a folder: give the folder that holds it as --root / root`);
+  return realpathSync(path);
+}
+
 // The tables a server serves: given in code, or the files in a data folder
 // (reload() reads it again). Shared by the HTTP and PostgreSQL servers.
 //   { engine, entries: Map name -> { table, source, owned }, named(), reload(), hold(), whenFree(fn), version, close() }
@@ -154,7 +162,7 @@ export async function openTables({ tables = {}, root = null, engine = null, log 
   engine ??= Object.values(tables).find((t) => t?.engine)?.engine ?? new Engine();
   const entries = new Map();
   for (const [name, table] of Object.entries(tables)) entries.set(name, { table, source: 'given', owned: false });
-  const rootPath = root ? realpathSync(resolve(String(root).replace(/^~(?=\/|$)/, process.env.HOME ?? '~'))) : null;
+  const rootPath = root ? folderOf(resolve(String(root).replace(/^~(?=\/|$)/, process.env.HOME ?? '~'))) : null;
   // holds since the last reload; old: the tables a reload replaced, freed when its holds end
   let gen = { holds: 0, old: [], after: [] }, reloading = Promise.resolve();
   const waiting = new Set(); // earlier ones with holds still running

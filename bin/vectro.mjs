@@ -39,6 +39,19 @@ function option(name, fallback) {
   return v;
 }
 
+if (command === '--version' || command === '-v' || command === 'version') {
+  const { readFileSync } = await import('node:fs');
+  console.log(JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
+  process.exit(0);
+}
+// a port option as a number (0 to 65535), or the usage and exit 2
+function port(name, fallback) {
+  const v = option(name, fallback);
+  if (v === null) return null;
+  const n = Number(v);
+  if (String(v).trim() === '' || !Number.isInteger(n) || n < 0 || n > 65535) { console.error(`vectro: --${name} needs a port number from 0 to 65535, got "${v}"\n\n${HELP}`); process.exit(2); }
+  return n;
+}
 if (command !== 'serve') {
   console.log(HELP);
   process.exit(command === undefined || command === 'help' || command === '--help' ? 0 : 2);
@@ -50,25 +63,25 @@ try {
   const catalog = await openTables({ root: option('root', process.cwd()), log });
   const running = [];
   if (!rest.includes('--no-http')) {
-    const s = await serve({ catalog, port: Number(option('port', process.env.PORT ?? 8787)), host, token: option('token', process.env.VECTRO_TOKEN ?? null), cors: rest.includes('--cors'), log });
+    const s = await serve({ catalog, port: port('port', process.env.PORT ?? 8787), host, token: option('token', process.env.VECTRO_TOKEN ?? null), cors: rest.includes('--cors'), log });
     running.push(s);
     log(`HTTP at ${s.url}: try ${s.url}/sql?q=${encodeURIComponent(`SELECT * FROM ${[...catalog.entries.keys()][0] ?? 'mytable'} LIMIT 5`)}`);
   }
-  const pgPort = option('pg', null);
+  const pgPort = port('pg', null);
   if (pgPort !== null) {
     const certFile = option('tls-cert', null), keyFile = option('tls-key', null);
     const p = await servePg({
-      catalog, port: Number(pgPort), host, user: option('user', null), password: option('password', process.env.VECTRO_PG_PASSWORD ?? null),
+      catalog, port: pgPort, host, user: option('user', null), password: option('password', process.env.VECTRO_PG_PASSWORD ?? null),
       auth: option('auth', 'scram'), tls: certFile && keyFile ? { certFile, keyFile } : null, database: option('database', 'vectro'),
       log, logQueries: rest.includes('--log-queries'),
     });
     running.push(p);
     log(`PostgreSQL at ${p.host}:${p.port} (database ${option('database', 'vectro')}${certFile ? ', TLS' : ''}): psql -h ${p.host} -p ${p.port} -U ${option('user', 'vectro')} ${option('database', 'vectro')}`);
   }
-  const flightPort = option('flight', null);
+  const flightPort = port('flight', null);
   if (flightPort !== null) {
     const certFile = option('tls-cert', null), keyFile = option('tls-key', null);
-    const f = await serveFlight({ catalog, port: Number(flightPort), host, user: option('user', null), password: option('password', process.env.VECTRO_PG_PASSWORD ?? null), tls: certFile && keyFile ? { certFile, keyFile } : null, database: option('database', 'vectro'), log, logQueries: rest.includes('--log-queries') });
+    const f = await serveFlight({ catalog, port: flightPort, host, user: option('user', null), password: option('password', process.env.VECTRO_PG_PASSWORD ?? null), tls: certFile && keyFile ? { certFile, keyFile } : null, database: option('database', 'vectro'), log, logQueries: rest.includes('--log-queries') });
     running.push(f);
     log(`Flight SQL at ${f.url}`);
   }

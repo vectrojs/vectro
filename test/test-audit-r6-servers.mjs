@@ -5,7 +5,9 @@
 // (dup.csv and dup.jsonl): the later one replaced the first without a word,
 // and the first table was never freed. Parameters from the pg driver (text with
 // no type) failed in id IN ($1, $2), BETWEEN $1 AND $2 and LIMIT $1.
-// The MCP tools gave missing text as "" (null over the other protocols)
+// The MCP tools gave missing text as "" (null over the other protocols). The
+// vectro command had no --version and showed raw Node errors for a wrong
+// --root or port
 // (vectro-qa-2026-11-07/run4).
 import { serve } from '../src/serve/index.mjs';
 import { paramLiteral, bindParams } from '../src/serve/pgtypes.mjs';
@@ -110,6 +112,25 @@ eq((await call('query', { table: 'o', filter: 'id == 2' })).rows.map((r) => r.re
 mcp.stdin.end();
 await new Promise((r) => mcp.on('exit', r));
 rmSync(dir3, { recursive: true, force: true });
+
+// the vectro command: --version, and plain messages for a wrong --root or port (raw ENOENT / ENOTDIR / RangeError before)
+const { spawnSync } = await import('node:child_process');
+const cli = (...args) => { const r = spawnSync(process.execPath, [fileURLToPath(new URL('../bin/vectro.mjs', import.meta.url)), ...args], { encoding: 'utf8', timeout: 20_000 }); return { code: r.status, out: r.stdout.trim(), err: r.stderr.trim() }; };
+const version = JSON.parse((await import('node:fs')).readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+for (const flag of ['--version', '-v', 'version']) { const r = cli(flag); ok(r.code === 0 && r.out === version, `vectro ${flag}: ${JSON.stringify(r)}`); }
+const dir4 = mkdtempSync(join(tmpdir(), 'vectro-r6-servers-'));
+writeFileSync(join(dir4, 'a.csv'), 'x\n1\n');
+let r4 = cli('serve', '--root', join(dir4, 'nope'), '--port', '0', '--quiet');
+ok(r4.code === 1 && /no folder .*nope/.test(r4.err) && !/ENOENT|lstat/.test(r4.err), `missing --root: ${r4.err}`);
+r4 = cli('serve', '--root', join(dir4, 'a.csv'), '--port', '0', '--quiet');
+ok(r4.code === 1 && /is a file, not a folder/.test(r4.err) && !/ENOTDIR|scandir/.test(r4.err), `--root a file: ${r4.err}`);
+for (const port of ['abc', '99999', '-1', '1.5']) {
+  r4 = cli('serve', '--root', dir4, '--port', port, '--quiet');
+  ok(r4.code === 2 && /--port needs a port number/.test(r4.err) && !/options\.port|RangeError/.test(r4.err), `--port ${port}: ${r4.err}`);
+}
+r4 = cli('serve', '--root', dir4, '--no-http', '--pg', 'x', '--quiet');
+ok(r4.code === 2 && /--pg needs a port number/.test(r4.err), `--pg x: ${r4.err}`);
+rmSync(dir4, { recursive: true, force: true });
 
 console.log(`${checks - failures} / ${checks} checks pass (audit r6 servers)`);
 if (failures) process.exit(1);
