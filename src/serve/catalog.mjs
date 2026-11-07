@@ -57,7 +57,7 @@ export async function loadFile(engine, real, { types } = {}) {
 // Every loadable file directly in root: [{ name, path }].
 export function filesIn(root) {
   return readdirSync(root, { withFileTypes: true })
-    .filter((d) => d.isFile() && LOADABLE.has(extname(d.name).toLowerCase()))
+    .filter((d) => d.isFile() && !d.name.startsWith('.') && LOADABLE.has(extname(d.name).toLowerCase())) // (not hidden files: macOS puts ._name.csv copies on shared and USB disks)
     .map((d) => d.name).sort()
     .map((f) => ({ name: tableName(f), path: join(root, f) }));
 }
