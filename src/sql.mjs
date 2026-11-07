@@ -977,7 +977,8 @@ function compileSelect(ast, env, outer, tail) {
       const q0 = q;
       scope.push(rs);
       try { where = joinWhere.map((c) => `(${src(truth(c, plain))})`).join(' && '); } finally { scope.pop(); }
-      if (q !== q0) fail(`${j.how.toUpperCase()} JOIN ... ON: a condition with text functions or subqueries can't be checked in the join; compute it in a subquery first`);
+      // (text compared with <, text functions or subqueries: worked out by extra steps, which the join can't run on its pairs)
+      if (q !== q0) fail(`${j.how.toUpperCase()} JOIN ... ON: this condition needs a step the join can't run on its pairs (text compared with < or >, a text function or a subquery); compute it in a subquery first, or put it in WHERE`);
     }
     const anyJoin = joinRange || joinCross || where;
     if (anyJoin && (j.how === 'right' || j.how === 'full') && (findDataset(q.node) || findDataset(rq.node))) fail(`${j.how.toUpperCase()} JOIN with conditions other than equalities works on tables in memory, not datasets`);
@@ -1427,6 +1428,10 @@ function compileSelect(ast, env, outer, tail) {
             if ((lk === 'date' && e.r.k === 'str') || (rk === 'date' && e.l.k === 'str')) { // a date written as text
               const c = bin(op, e.l.k === 'str' ? T({ k: 'date', v: e.l.v }) : T(e.l), e.r.k === 'str' ? T({ k: 'date', v: e.r.v }) : T(e.r));
               return op === '!=' ? bin('&&', c, present(e.l.k === 'str' ? e.r : e.l, ctx)) : c; // (a missing date: unknown, so not kept)
+            }
+            if ((op === '==' || op === '!=') && lk === 'text' && rk === 'text') { // (two text columns: by label in the kernel, no extra step, so an outer join's ON can hold it)
+              const l = T(e.l), r = T(e.r);
+              if (l.t === 'var' && r.t === 'var') return bin('&&', bin(op, l, r), bin('&&', present(e.l, ctx), present(e.r, ctx)));
             }
             const lit = e.l.k === 'str' ? e.r : e.r.k === 'str' ? e.l : null;
             if ((op === '==' || op === '!=') && lit && lit.k !== 'str' && kindOf(lit, ctx) === 'text') { // (a column and a label: by code)

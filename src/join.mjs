@@ -41,7 +41,8 @@ export function* joinTablesG(L, R, opts = {}, makeTable) {
   if (how !== 'inner' && how !== 'left') throw new Error(`vectro: join how must be 'inner', 'left', 'right' or 'full', got "${how}"`);
   if (L.type !== R.type) throw new Error('vectro: join needs two tables of the same number type (both float64 or both float32)');
   const [lk, rk] = parseOn(on);
-  if (!lk.length || lk.length !== rk.length) throw new Error('vectro: join needs as many left keys as right keys');
+  if (!lk.length) throw new Error("vectro: join needs keys in on ('key', ['k1', 'k2'] or { left, right }); for a join without keys pass range or cross");
+  if (lk.length !== rk.length) throw new Error(`vectro: join needs as many left keys as right keys (${lk.length} and ${rk.length})`);
   const t = L.type === Float32Array ? 'f32' : 'f64';
   const nk = lk.length, nL = L.n, nR = R.n;
   const made = []; // engine arrays to free at the end
@@ -588,6 +589,7 @@ export function* anyJoinG(L, R, opts, makeTable, keepG) {
   // 2. the other conditions, on a table of the columns they read
   if (where) {
     const used = new Set(whereNames(where)), read = cols.filter((c) => used.has(c.out));
+    for (const n of used) if (!cols.some((c) => c.out === n)) throw new Error(`vectro: join where: no column "${n}" (the joined columns: ${cols.map((c) => c.out).join(', ')})`);
     if (!read.length) read.push(cols[0]); // (ON TRUE, ON 1 = 0: a constant reads no column, but a table needs one)
     const C = gatherPairs(engine, L, R, li, ri, n, read, makeTable);
     let keep;

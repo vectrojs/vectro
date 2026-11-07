@@ -265,7 +265,9 @@ What changed: [CHANGELOG.md](CHANGELOG.md). Problems and ideas:
   22 ms; sort then first 10 177 → 12 ms.
 - **Joins:** `orders.join(customers, { on: 'customer_id' })`, several keys
   (`on: ['region', 'day']`), different names (`on: { left: 'cust', right: 'id' }`),
-  `how: 'inner'` (default) or `'left'`. Put the smaller table on the right: its
+  `how: 'inner'` (default), `'left'`, `'right'` or `'full'`; besides keys, `range: { left, right, op }`
+  (a.t < b.t: a range join), `where: 'expr'` (checked on each pair) and `cross: true` join on any
+  condition (right / full with those: tables in memory, not datasets). Put the smaller table on the right: its
   keys go into one hash table built on every thread, then every left row looks
   its key up on every thread, and the joined columns are gathered on every
   thread. Text keys match by label; a missing (NaN) key never matches; a left
