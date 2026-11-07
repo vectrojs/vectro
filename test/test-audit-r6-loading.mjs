@@ -3,7 +3,7 @@
 // every CSV loader refuse the file, because the `types` lookup found the
 // inherited function (vectro-qa-2026-11-07/run3).
 import { Engine } from './test-mode.mjs';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -111,6 +111,32 @@ if (node) {
   same(attempt(() => engine.fromArrow(whole).toRows().length), 3, 'a whole Arrow file reads');
   same(attempt(() => engine.fromArrow(stream).toRows().length), 3, 'an Arrow stream reads');
   same(/footer/.test(attempt(() => engine.fromArrow(whole.subarray(0, whole.length - 1)))), true, 'a cut Arrow file names the missing footer');
+}
+
+// Damaged files: errors that say so (raw "Offset is outside the bounds of the DataView", "position
+// NaN", JSON syntax errors before). Bytes changed inside the data itself can't be seen: there are no
+// checksums (written up in vectro-qa-2026-11-07/AREA-3.md).
+{
+  const t = engine.table({ id: Array.from({ length: 50 }, (_, i) => i), g: Array.from({ length: 50 }, (_, i) => 'g' + (i % 3)), ts: Array.from({ length: 50 }, (_, i) => new Date(i * 1000)) });
+  for (const file of [false, true]) {
+    const b = t.toArrow({ file });
+    const raw = new Set();
+    for (let i = 0; i < b.length; i++) for (const x of [0xff, 0x80, 0x01]) {
+      const c = b.slice(); c[i] ^= x;
+      try { engine.fromArrow(c).toRows(); } catch (e) { if (!/^vectro/.test(e.message) && !/^Invalid (array|typed array) length/.test(e.message)) raw.add(e.message.replace(/\d+/g, 'N')); }
+    }
+    same([...raw], [], `damaged Arrow ${file ? 'file' : 'stream'}: every error is Vectro's`);
+  }
+  if (node) {
+    const p = join(dir, 'damaged.vectro');
+    engine.writeDataset(p, t, { rowsPerChunk: 20 });
+    const good = readFileSync(p);
+    const raw = new Set();
+    const at = (i) => { const c = Buffer.from(good); c[i] ^= 0xff; writeFileSync(p, c); try { const ds = engine.openDataset(p); try { ds.toRows(); } finally { ds.close(); } } catch (e) { if (!/^vectro/.test(e.message)) raw.add(e.message.replace(/\d+/g, 'N').slice(0, 80)); } };
+    const footer = good.length - 24 - Number(new DataView(good.buffer, good.byteOffset).getFloat64(good.length - 16, true));
+    for (let i = footer; i < good.length; i++) at(i); // (the footer and the tail after it)
+    same([...raw], [], 'damaged dataset footer: every error is Vectro\'s');
+  }
 }
 
 rmSync(dir, { recursive: true, force: true });

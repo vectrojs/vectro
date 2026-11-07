@@ -378,9 +378,23 @@ function* footerG(file) {
   if (version < 1 || version > VERSION) throw new Error(`vectro: ${name} is dataset version ${version}; this Vectro reads versions 1 to ${VERSION}`);
   const dv = new DataView(tail.buffer);
   const footerStart = dv.getFloat64(0, true), len = dv.getFloat64(8, true);
+  const damaged = () => new Error(`vectro: ${name} is damaged: its footer (the schema and where each chunk is) can't be read`);
+  if (!Number.isInteger(footerStart) || !Number.isInteger(len) || footerStart < HEADER || footerStart + len + TAIL !== size) throw damaged(); // (a raw "position NaN" or JSON error before)
   const json = new Uint8Array(len);
   yield { read: json, pos: footerStart };
-  return { meta: JSON.parse(new TextDecoder().decode(json)), footerStart, size };
+  let meta;
+  try { meta = JSON.parse(new TextDecoder().decode(json)); } catch { throw damaged(); }
+  if (!Array.isArray(meta?.columns) || !Array.isArray(meta.chunks)) throw damaged();
+  const place = (v) => v === undefined || (Number.isInteger(v) && v >= 0 && v <= size);
+  for (const c of meta.columns) if (typeof c?.name !== 'string' || !['number', 'date', 'category', 'text'].includes(c.kind) || (c.kind === 'category' && !Array.isArray(c.dict))) throw damaged();
+  for (const ch of meta.chunks) {
+    if (!Number.isInteger(ch?.rows) || ch.rows < 0 || !ch.cols || typeof ch.cols !== 'object') throw damaged();
+    for (const c of meta.columns) {
+      const m = ch.cols[c.name];
+      if (!m || typeof m !== 'object' || m.off === undefined || m.len === undefined || !place(m.off) || !place(m.len) || (m.off + m.len > size) || !place(m.soff) || !place(m.slen) || (m.enc && !KINDS[m.enc.kind])) throw damaged();
+    }
+  }
+  return { meta, footerStart, size };
 }
 
 function readFooter(file) {
