@@ -450,8 +450,11 @@ function parseStatement(src, fold = false) {
     const rowCount = (what) => {
       const t = peek();
       if (t?.t === 'str' && /^\s*\+?\d+\s*$/.test(t.v)) { p++; return Number(t.v); } // (LIMIT '10', as PostgreSQL takes it: drivers send LIMIT $1 as text)
-      if (!t || !(t.t === 'num' || isOp('(') || isOp('-') || isOp('+'))) fail(`${what} needs a number`);
-      const v = sqlConst(add());
+      if (isKw('NULL')) { p++; return what === 'OFFSET' ? 0 : null; } // (LIMIT NULL: no limit, as DuckDB and PostgreSQL)
+      if (!t || !(t.t === 'num' || isOp('(') || isOp('-') || isOp('+') || isKw('CAST'))) fail(`${what} needs a number`);
+      const x = add();
+      if (x.k === 'subq') return { subq: x.q, what }; // (LIMIT (SELECT ...): run when the query is compiled, see rowsOf)
+      const v = sqlConst(x);
       if (v === null || !(v >= 0)) fail(`${what} needs a number of rows (0 or more)`);
       return v === Infinity ? v : Math.round(v);
     };
@@ -517,6 +520,10 @@ export const displayName = (name) => (name.startsWith('__q_') ? name.slice(4).re
 const sqlConst = (e) => {
   if (e.k === 'num' && !e.bool) return e.v;
   if (e.k === 'neg') { const x = sqlConst(e.x); return x === null ? null : -x; }
+  if (e.k === 'cast' && (INT_TYPES.has(e.type) || FLOAT_TYPES.has(e.type))) { // (CAST of a constant, LIMIT CAST('10' AS INT))
+    const x = e.x.k === 'str' ? textToNumber(e.x.v) : sqlConst(e.x);
+    return x === null ? null : INT_TYPES.has(e.type) ? Math.sign(x) * Math.round(Math.abs(x)) : x;
+  }
   if (e.k === 'bin' && ['+', '-', '*', '/'].includes(e.op)) {
     const l = sqlConst(e.l), r = sqlConst(e.r);
     return l === null || r === null ? null : e.op === '+' ? l + r : e.op === '-' ? l - r : e.op === '*' ? l * r : l / r;
@@ -695,7 +702,8 @@ function compileQuery(q, env, outer) {
     }
     out = out.sort(by);
   }
-  if (q.limit !== null || q.offset) out = out.limit(q.limit ?? Infinity, q.offset); // (OFFSET alone: every row after it)
+  const qLimit = rowsOf(q.limit, env), qOffset = rowsOf(q.offset, env) ?? 0;
+  if (qLimit !== null || qOffset) out = out.limit(qLimit ?? Infinity, qOffset); // (OFFSET alone: every row after it)
   return { ...rel, query: out.select(...rel.names) };
 }
 
@@ -745,6 +753,19 @@ function compileSet(body, env, outer) {
 }
 
 // FROM item -> relation
+// LIMIT / OFFSET: a number, null, or { subq } (LIMIT (SELECT ...)): that subquery run now, one value
+function rowsOf(x, env) {
+  if (x === null || x === undefined || typeof x === 'number') return x ?? null;
+  const rel = compileQuery(x.subq, env, null);
+  if (rel.names.length !== 1) fail(`${x.what} (SELECT ...) needs one column`);
+  const rows = rel.query.collect().toRows(2);
+  if (rows.length > 1) fail(ONE_ROW.replace('vectro SQL: ', ''));
+  const v = rows.length ? Object.values(rows[0])[0] : null;
+  if (v === null || v === '' || Number.isNaN(v)) return x.what === 'OFFSET' ? 0 : null;
+  if (typeof v !== 'number' || !(v >= 0)) fail(`${x.what} needs a number of rows (0 or more)`);
+  return v === Infinity ? v : Math.round(v);
+}
+
 function relationOf(item, env, outer) {
   if (item.q) return compileQuery(item.q, env, outer);
   const cte = item.schema ? null : env.ctes.get(item.name.toLowerCase());
@@ -1929,7 +1950,8 @@ function compileSelect(ast, env, outer, tail) {
   function finish(outs, kindFn, ctx) {
     let out = q;
     if (sortKeys.length) out = out.sort(sortKeys);
-    if ((tail.limit !== null && tail.limit !== undefined) || tail.offset) out = out.limit(tail.limit ?? Infinity, tail.offset); // (OFFSET alone: every row after it)
+    const tLimit = rowsOf(tail.limit ?? null, env), tOffset = rowsOf(tail.offset, env) ?? 0;
+    if (tLimit !== null || tOffset) out = out.limit(tLimit ?? Infinity, tOffset); // (OFFSET alone: every row after it)
     const names = outs.map((o) => o.name);
     const outKinds = new Map(outs.map((o) => [o.name, o.e.k === 'null' ? 'null' : kindFn(o) ?? 'number'])); // (a NULL column matches any kind in a UNION)
     if (outs.some((o) => o.col !== o.name)) { // (through fresh names: an output may be named like another's column)

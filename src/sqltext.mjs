@@ -20,7 +20,8 @@ export function toText(v, kind) {
 export const isNull = (v, kind) => (kind === 'text' ? v === '' : v !== v);
 // (also 'inf', '-inf', 'infinity' and 'nan' in any case, as DuckDB reads them)
 const SPECIAL = { inf: Infinity, '+inf': Infinity, '-inf': -Infinity, infinity: Infinity, '+infinity': Infinity, '-infinity': -Infinity, nan: NaN, '+nan': NaN, '-nan': NaN };
-export const textToNumber = (s) => { const t = s.trim(); return t === '' ? NaN : SPECIAL[t.toLowerCase()] ?? Number(t); };
+// (not 0x10, 0b11 or 0o7: JavaScript's Number() reads them, DuckDB and PostgreSQL don't)
+export const textToNumber = (s) => { const t = s.trim(); return t === '' || /^[+-]?0[xXbBoO]/.test(t) ? NaN : SPECIAL[t.toLowerCase()] ?? Number(t); };
 export const textToDate = (s) => (s.trim() === '' ? NaN : parseDateText(s.trim()));
 
 const chars = (s) => Array.from(s);
