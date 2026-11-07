@@ -81,6 +81,9 @@ export class Engine {
     if (!wasmModule && !compile) {
       throw new Error("vectro: this runtime cannot compile WebAssembly; pass the precompiled module: new Engine({ wasmModule }) with dist/vectro.wasm");
     }
+    if (wasmModule && !(wasmModule instanceof WebAssembly.Module)) { // (the file's bytes, a path, ...)
+      throw new TypeError("vectro: wasmModule must be a WebAssembly.Module: on Workers `import wasmModule from 'vectrojs/dist/vectro.wasm'`, elsewhere new WebAssembly.Module(bytes)");
+    }
     if (wasmModule && this.isShared) throw new Error('vectro: a precompiled wasmModule is single-threaded; use threads: 1');
 
     // One WebAssembly memory; arrays are allocated in it. Shared between

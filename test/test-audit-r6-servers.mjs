@@ -11,7 +11,8 @@
 // "sql() got not a Vectro Table" (found on the prototype). Hidden files (a
 // binary macOS ._x.csv) became tables; HEAD requests were 404. The browser
 // Engine lacked the Node names writeDatasetAsync / openDatasetAsync. MCP: a
-// missing argument said "undefined"; a missing --root gave a raw stack
+// missing argument said "undefined"; a missing --root gave a raw stack.
+// wasmModule given as bytes: a raw WebAssembly error
 // (vectro-qa-2026-11-07/run4).
 import { serve } from '../src/serve/index.mjs';
 import { paramLiteral, bindParams } from '../src/serve/pgtypes.mjs';
@@ -158,6 +159,16 @@ rmSync(dir5, { recursive: true, force: true });
   ok(['csvToDatasetAsync', 'createDatasetAsync'].every((m) => typeof be[m] === 'function'), 'browser Engine: csvToDatasetAsync / createDatasetAsync');
   await scores.close();
   await be.close();
+}
+
+// wasmModule given as the file's bytes (or anything not a WebAssembly.Module): say what to pass
+{
+  const { Engine: PortableEngine } = await import('../src/portable.mjs');
+  for (const wasmModule of [new Uint8Array([0, 97, 115, 109]), {}, 'dist/vectro.wasm']) {
+    let msg = '';
+    try { new PortableEngine({ wasmModule, threads: 1 }); } catch (e) { msg = e.message; }
+    ok(/wasmModule must be a WebAssembly\.Module/.test(msg), `wasmModule ${typeof wasmModule}: ${msg}`);
+  }
 }
 
 // the vectro command: --version, and plain messages for a wrong --root or port (raw ENOENT / ENOTDIR / RangeError before)
