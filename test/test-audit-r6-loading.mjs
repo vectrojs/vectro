@@ -230,6 +230,23 @@ rmSync(dir, { recursive: true, force: true });
     await se.close();
   }
 }
+// R6-3.6: checksums (version 3): a changed byte gives an error or the right answer, never a wrong one
+if (MODE === 'node') {
+  const dir = mkdtempSync(join(tmpdir(), 'r6-sums-')), p = join(dir, 'x.vectro'), q = join(dir, 'y.vectro'), N = 3000;
+  engine.writeDataset(p, engine.table({ id: Float64Array.from({ length: N }, (_, i) => i), v: Float64Array.from({ length: N }, (_, i) => (i * 7) % 101), g: Array.from({ length: N }, (_, i) => ['EU', 'US', 'APAC'][i % 3]) }), { rowsPerChunk: 500 });
+  const orig = readFileSync(p);
+  const ask = (path) => { const ds = engine.openDataset(path); try { return JSON.stringify([ds.agg({ s: 'sum(v)', n: 'count()', m: 'max(id)' }), ds.groupBy('g').agg({ t: 'sum(v)' }).toRows()]); } finally { ds.close(); } };
+  const want = ask(p);
+  let wrong = 0;
+  for (let k = 0; k < 400; k++) {
+    const b = Buffer.from(orig); b[Math.floor((k / 400) * orig.length)] ^= 1 << (k % 8);
+    writeFileSync(q, b);
+    let got = want; try { got = ask(q); } catch { /* an error is a fine answer */ }
+    if (got !== want) wrong++;
+  }
+  same(wrong, 0, 'one changed byte in a dataset: never a wrong answer (400 places)');
+  rmSync(dir, { recursive: true, force: true });
+}
 await engine.close();
 console.log(`audit r6 loading: ${checks - failures}/${checks} checks passed`);
 if (failures) process.exit(1);

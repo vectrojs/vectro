@@ -77,7 +77,42 @@ function* closeWriter(w) { w.close(); yield { call: () => w.file.done?.() }; }
 const removeTemp = (path) => { try { const r = tempStorage ? tempStorage.remove(path) : files?.remove(path); r?.catch?.(() => {}); } catch { /* (best effort) */ } };
 
 const MAGIC = new TextEncoder().encode('VECTRODS');
-const VERSION = 2; // (2: bit-packed columns; version 1 files read too)
+const VERSION = 3; // (3: checksums; 2: bit-packed columns; versions 1 and 2 read too, without checks)
+
+// Checksums (version 3): one per SUM_BLOCK bytes of each column's bytes in a chunk (every read starts
+// at such a block: a row range starts at a multiple of 65,536 rows), and one of the footer, in the
+// header's last 4 bytes. One changed byte gave a wrong answer with no error before (R6-3.6).
+const SUM_BLOCK = 8192;
+// Fletcher-style sums of 32-bit words (a changed byte changes it), mixed into one 32-bit value
+function sum32(u8, a, b) {
+  let s1 = 1, s2 = 0, i = a;
+  if ((u8.byteOffset + a) % 4 === 0) {
+    const w = new Int32Array(u8.buffer, u8.byteOffset + a, (b - a) >> 2);
+    for (let k = 0; k < w.length; k++) { s1 = (s1 + w[k]) | 0; s2 = (s2 + s1) | 0; }
+    i = a + w.length * 4;
+  }
+  for (; i < b; i++) { s1 = (s1 + u8[i] + 0x100) | 0; s2 = (s2 + s1) | 0; }
+  // (each sum through Murmur3's finalizer, a bijection, before they're combined: a change to s1 alone always
+  // shows, and the two can't cancel out, as a plain mix let one changed high bit do)
+  return (fmix(s1) ^ fmix((s2 + Math.imul(b - a, 0x9e3779b1)) | 0)) >>> 0;
+}
+function fmix(h) {
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35);
+  return h ^ (h >>> 16);
+}
+const sumsOf = (u8) => { // one per block, as base64 (a footer of 1 GB of columns: about 700 KB of them)
+  const out = new Uint32Array(Math.ceil(u8.length / SUM_BLOCK));
+  for (let k = 0; k < out.length; k++) out[k] = sum32(u8, k * SUM_BLOCK, Math.min(u8.length, (k + 1) * SUM_BLOCK));
+  const b = new Uint8Array(out.buffer);
+  let str = '';
+  for (let i = 0; i < b.length; i += 0x8000) str += String.fromCharCode(...b.subarray(i, i + 0x8000));
+  return btoa(str);
+};
+const readSums = (m, key) => { // (decoded once per column piece)
+  const cache = (m.__sums ??= {});
+  if (!cache[key]) { const bin = atob(m[key]), b = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i); cache[key] = new Uint32Array(b.buffer); }
+  return cache[key];
+};
 const HEADER = 16, TAIL = 24, ALIGN = 64;
 const SLACK = 16;
 const READ_PIECE = 1 << 20; // reads are cut into pieces this big, read by several threads at once // bytes after packed codes (SIMD loads read a little past the end)
@@ -167,8 +202,11 @@ export class DatasetWriter {
         try { this.#writeChunk(all, 0, all.n); } finally { if (all !== this.parts[0]) all.dispose(); }
       }
       for (const c of this.meta.columns) if (c.kind === 'category') c.dict = this.labels.get(c.name).dict;
-      const json = new TextEncoder().encode(JSON.stringify(this.meta));
+      const json = new TextEncoder().encode(JSON.stringify(this.meta, (k, v) => (k === '__sums' ? undefined : v)));
       const { off } = this.#write(json);
+      const fsum = new Uint8Array(4);
+      new DataView(fsum.buffer).setUint32(0, sum32(json, 0, json.length), true);
+      this.file.write(fsum, 12); // (the footer's checksum, in the header)
       const tail = new Uint8Array(TAIL), dv = new DataView(tail.buffer);
       dv.setFloat64(0, off, true);
       dv.setFloat64(8, json.length, true);
@@ -291,11 +329,11 @@ export class DatasetWriter {
         if (seq) { Object.assign(chunk.cols[name], { off: 0, len: 0, enc: c.enc, seq }); continue; } // (nothing to store: rebuilt on read)
         const plan = c.enc && this.bitPack ? bitPlan(d, n, KINDS[c.enc.kind].nan, KINDS[c.enc.kind].bytes * 8) : null;
         if (plan) { // each code in only the bits it needs
-          Object.assign(chunk.cols[name], this.#write(packBits(d, n, plan)), { enc: c.enc, bits: plan.bits, bbase: plan.base }, plan.missing !== null ? { bmissing: plan.missing } : {});
+          Object.assign(chunk.cols[name], this.#write(packBits(d, n, plan), true), { enc: c.enc, bits: plan.bits, bbase: plan.base }, plan.missing !== null ? { bmissing: plan.missing } : {});
           continue;
         }
         const bytes = c.enc ? KINDS[c.enc.kind].bytes * n : d.BYTES_PER_ELEMENT * n;
-        Object.assign(chunk.cols[name], this.#write(new Uint8Array(d.buffer, d.byteOffset, bytes)), c.enc ? { enc: c.enc } : {});
+        Object.assign(chunk.cols[name], this.#write(new Uint8Array(d.buffer, d.byteOffset, bytes), true), c.enc ? { enc: c.enc } : {});
       }
     } finally {
       ct.dispose();
@@ -320,17 +358,17 @@ export class DatasetWriter {
       outPtr[i - lo] = at * STR_SHIFT + field;
       at += len;
     }
-    const p = this.#write(new Uint8Array(outPtr.buffer)), s = this.#write(outBytes);
-    return { off: p.off, len: p.len, soff: s.off, slen: s.len };
+    const p = this.#write(new Uint8Array(outPtr.buffer), true), s = this.#write(outBytes, true);
+    return { off: p.off, len: p.len, sums: p.sums, soff: s.off, slen: s.len, ssums: s.sums };
   }
 
-  #write(u8) {
+  #write(u8, sums = false) {
     const pad = (ALIGN - (this.pos % ALIGN)) % ALIGN;
     if (pad) { this.file.write(new Uint8Array(pad), this.pos); this.pos += pad; }
     const off = this.pos;
     this.file.write(u8, off);
     this.pos += u8.length;
-    return { off, len: u8.length };
+    return sums ? { off, len: u8.length, sums: sumsOf(u8) } : { off, len: u8.length };
   }
 }
 
@@ -382,6 +420,7 @@ function* footerG(file) {
   if (!Number.isInteger(footerStart) || !Number.isInteger(len) || footerStart < HEADER || footerStart + len + TAIL !== size) throw damaged(); // (a raw "position NaN" or JSON error before)
   const json = new Uint8Array(len);
   yield { read: json, pos: footerStart };
+  if (version >= 3 && new DataView(head.buffer).getUint32(12, true) !== sum32(json, 0, json.length)) throw damaged(); // (its checksum)
   let meta;
   try { meta = JSON.parse(new TextDecoder().decode(json)); } catch { throw damaged(); }
   if (!Array.isArray(meta?.columns) || !Array.isArray(meta.chunks)) throw damaged();
@@ -544,13 +583,14 @@ export class Dataset {
     const ch = i < 0 ? { rows: 0, cols: {} } : this.meta.chunks[i];
     const n = hi - lo;
     const cols = new Map(), owned = [], ownedBuffers = [], reads = [], seqs = [], unpacks = [], temps = [];
+    const checks = []; // [array, its place in the column's bytes, length, column meta, sums key, name] (version 3)
     for (const name of names) {
       const m = ch.cols[name], base = this.cols.get(name);
       if (base.strings) {
         const data = engine.alloc(Float64Array, n), strings = engine.alloc(Uint8Array, m?.slen ?? 0);
         cols.set(name, { data, dict: null, codes: null, strings });
         ownedBuffers.push(strings);
-        if (m) reads.push([data, m.off + lo * 8, n * 8], [strings, m.soff, m.slen]);
+        if (m) { reads.push([data, m.off + lo * 8, n * 8], [strings, m.soff, m.slen]); checks.push([data, lo * 8, n * 8, m, 'sums', name], [strings, 0, m.slen, m, 'ssums', name]); }
       } else if (m?.enc) {
         const k = KINDS[m.enc.kind];
         const data = engine.alloc(k.Type, n + SLACK / k.bytes);
@@ -561,19 +601,42 @@ export class Dataset {
           const words = engine.alloc(Uint8Array, (w1 - w0) * 4 + 8);
           temps.push(words);
           reads.push([words, m.off + w0 * 4, (w1 - w0) * 4]);
+          checks.push([words, w0 * 4, (w1 - w0) * 4, m, 'sums', name]);
           unpacks.push([words, data, n, { bits: m.bits, base: m.bbase, missing: m.bmissing ?? null }, k.bytes]);
-        } else reads.push([data, m.off + lo * k.bytes, n * k.bytes]);
+        } else { reads.push([data, m.off + lo * k.bytes, n * k.bytes]); checks.push([data, lo * k.bytes, n * k.bytes, m, 'sums', name]); }
       } else {
         const w = this.type.BYTES_PER_ELEMENT, data = engine.alloc(this.type, n);
         cols.set(name, { data, dict: base.dict, codes: base.codes, date: base.date });
-        if (m) reads.push([data, m.off + lo * w, n * w]);
+        if (m) { reads.push([data, m.off + lo * w, n * w]); checks.push([data, lo * w, n * w, m, 'sums', name]); }
       }
       owned.push(name);
     }
     for (const c of cols.values()) { c.data = engine.live(c.data); if (c.strings) c.strings = engine.live(c.strings); }
     for (const [name, { first, step }] of seqs) unpacks.push(['seq', cols.get(name).data, n, { first: first + lo * step, step }, KINDS[cols.get(name).enc.kind].bytes]);
     const table = new Table(engine, cols, n, { owned, ownedBuffers, zones: false });
-    return { table, reads, unpacks, temps, bytes: reads.reduce((a, r) => a + r[2], 0) };
+    return { table, reads, unpacks, temps, checks, chunk: i, bytes: reads.reduce((a, r) => a + r[2], 0) };
+  }
+
+  // After the reads: every whole checksum block they cover against the footer's sums (version 3 files)
+  // (each block once per open dataset: the file can't change under this handle, a new write goes beside it)
+  #verified = new Map(); // column meta -> { sums key: a bit per block checked }
+  #verify(checks, chunk) {
+    for (const [arr, rel, len, m, key, name] of checks) {
+      if (!m?.[key] || !len || rel % SUM_BLOCK) continue;
+      const sums = readSums(m, key), blob = key === 'ssums' ? m.slen : m.len;
+      let seen = this.#verified.get(m);
+      if (!seen) this.#verified.set(m, (seen = {}));
+      const done = (seen[key] ??= new Uint8Array(sums.length));
+      let u8 = null;
+      for (let at = 0; at < len; at += SUM_BLOCK) {
+        const k = (rel + at) / SUM_BLOCK, size = Math.min(SUM_BLOCK, blob - (rel + at));
+        if (at + size > len) break; // (a block the read only starts)
+        if (done[k]) continue;
+        u8 ??= bytesOf(this.engine.live(arr), len);
+        if (sum32(u8, at, at + size) !== sums[k]) throw new Error(`vectro: ${this.file?.name ?? 'this dataset'} is damaged: chunk ${chunk}, column "${name}" doesn't match its checksum (the file changed after it was written)`);
+        done[k] = 1;
+      }
+    }
   }
 
   // Bit-packed columns back to their codes, on every thread (a generator).
@@ -608,7 +671,7 @@ export class Dataset {
   _readSync(piece, names) {
     const { file } = this;
     if (!file?.readSync) throw new Error(file ? 'vectro: this dataset is read asynchronously (a File, Blob or URL): use toRowsAsync(), aggAsync(), collectAsync()...' : 'vectro: this dataset is closed');
-    const { table, reads, unpacks, temps, bytes } = this.#allocChunk(piece, names);
+    const { table, reads, unpacks, temps, checks, chunk, bytes } = this.#allocChunk(piece, names);
     const { engine } = this;
     try {
       const pieces = this.#pieces(reads);
@@ -622,6 +685,7 @@ export class Dataset {
           })());
         } finally { engine.free(jobs); }
       } else for (const [arr, off, len] of reads) file.readSync(bytesOf(engine.live(arr), len), off);
+      this.#verify(checks, chunk);
       this.engine._drive(this.#unpackG(unpacks));
     } catch (err) { table.dispose(); throw err; } finally { for (const t of temps) this.engine.free(t); }
     if (this.lastRun) this.lastRun.bytesRead += bytes;
@@ -631,7 +695,7 @@ export class Dataset {
   async _readAsync(piece, names) {
     const { file } = this;
     if (!file) throw new Error('vectro: this dataset is closed');
-    const { table, reads, unpacks, temps, bytes } = this.#allocChunk(piece, names);
+    const { table, reads, unpacks, temps, checks, chunk, bytes } = this.#allocChunk(piece, names);
     try {
       const view = (arr, at, len) => new Uint8Array(this.engine.live(arr).buffer, this.engine.live(arr).byteOffset + at, len);
       if (file.coalesce) { // (a URL: neighbouring reads as one request each)
@@ -653,6 +717,7 @@ export class Dataset {
           view(arr, at, len).set(buf);
         }));
       }
+      this.#verify(checks, chunk);
       await this.engine._driveAsync(this.#unpackG(unpacks));
     } catch (err) { table.dispose(); throw err; } finally { for (const t of temps) this.engine.free(t); }
     if (this.lastRun) this.lastRun.bytesRead += bytes;
