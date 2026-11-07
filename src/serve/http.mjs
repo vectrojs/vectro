@@ -27,6 +27,17 @@ const MAX_BODY = 1 << 20;
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 
+// res.write, waiting for 'drain' when the buffer is full; false once the client has gone
+// (a hung-up client never drains: waiting only for 'drain' kept the request, its answer
+// and the tables it holds for ever)
+async function send(res, chunk) {
+  if (res.destroyed) return false;
+  if (res.write(chunk)) return true;
+  const ac = new AbortController();
+  try { await Promise.race([once(res, 'drain', { signal: ac.signal }), once(res, 'close', { signal: ac.signal })]); } catch {} finally { ac.abort(); }
+  return !res.destroyed;
+}
+
 // catalog: tables opened with openTables (catalog.mjs), to share them with
 // the PostgreSQL server; else tables / root / engine open them here.
 export async function serve({ tables = {}, root = null, engine = null, catalog = null, port = 8787, host = '127.0.0.1', token = null, cors = false, odataPage = 50_000, log = () => {} } = {}) {
@@ -89,7 +100,7 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
       const columns = columnsOf(t), data = await t.toColumnsAsync(), n = t.length;
       res.writeHead(200, { 'content-type': FORMATS[format], ...(format === 'csv' ? { 'content-disposition': `inline; filename="${filename}.csv"` } : {}) });
       for (const chunk of encode(format, columns, data, n, { ...extra, row_count: n, ms: Math.round((performance.now() - t0) * 100) / 100 })) {
-        if (!res.write(chunk)) await once(res, 'drain');
+        if (!(await send(res, chunk))) return;
       }
       res.end();
     } finally { if (t !== query) t.dispose(); }
@@ -118,7 +129,7 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
       }
       log(`odata ${decodeURIComponent(url.pathname + url.search).slice(0, 200)}`);
       res.writeHead(r.status, r.headers);
-      for (const chunk of r.body) if (!res.write(chunk)) await once(res, 'drain');
+      for (const chunk of r.body) if (!(await send(res, chunk))) return;
       return res.end();
     }
     const parts = path.split('/').filter(Boolean).map((p) => { try { return decodeURIComponent(p); } catch { throw new HttpError(400, `the path has a malformed %-escape: ${p}`); } });
