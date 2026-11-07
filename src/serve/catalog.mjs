@@ -58,7 +58,8 @@ export async function loadFile(engine, real, { types } = {}) {
 export function filesIn(root) {
   return readdirSync(root, { withFileTypes: true })
     .filter((d) => d.isFile() && LOADABLE.has(extname(d.name).toLowerCase()))
-    .map((d) => ({ name: tableName(d.name), path: join(root, d.name) }));
+    .map((d) => d.name).sort()
+    .map((f) => ({ name: tableName(f), path: join(root, f) }));
 }
 
 // A table's memory back (datasets closed).
@@ -198,6 +199,11 @@ export async function openTables({ tables = {}, root = null, engine = null, log 
     const fresh = new Map(), loaded = [], failed = [];
     for (const { name, path } of filesIn(rootPath)) {
       if (entries.has(name) && !entries.get(name).owned) continue; // (tables given in code win)
+      if (fresh.has(name)) { // (dup.csv and dup.jsonl, "a b.csv" and "a_b.csv": the first file in name order wins)
+        const error = `same table name "${name}" as ${basename(fresh.get(name).source)}: rename one of the files`;
+        failed.push({ file: path, error }); log(`skipped ${path}: ${error}`);
+        continue;
+      }
       try {
         const { table } = await loadFile(engine, path);
         fresh.set(name, { table, source: path, owned: true });
