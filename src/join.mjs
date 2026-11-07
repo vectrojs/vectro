@@ -583,8 +583,9 @@ export function* anyJoinG(L, R, opts, makeTable, keepG) {
   const cols = outputColumns(L, R, lk, rk, suffix);
   // 2. the other conditions, on a table of the columns they read
   if (where) {
-    const used = new Set(whereNames(where));
-    const C = gatherPairs(engine, L, R, li, ri, n, cols.filter((c) => used.has(c.out)), makeTable);
+    const used = new Set(whereNames(where)), read = cols.filter((c) => used.has(c.out));
+    if (!read.length) read.push(cols[0]); // (ON TRUE, ON 1 = 0: a constant reads no column, but a table needs one)
+    const C = gatherPairs(engine, L, R, li, ri, n, read, makeTable);
     let keep;
     try { keep = yield* keepG(C, where); } finally { C.dispose(); }
     let m = 0;
