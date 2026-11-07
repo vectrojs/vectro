@@ -4,7 +4,8 @@
 // tables a reload replaced stayed in memory. Two files with one table name
 // (dup.csv and dup.jsonl): the later one replaced the first without a word,
 // and the first table was never freed. Parameters from the pg driver (text with
-// no type) failed in id IN ($1, $2), BETWEEN $1 AND $2 and LIMIT $1
+// no type) failed in id IN ($1, $2), BETWEEN $1 AND $2 and LIMIT $1.
+// The MCP tools gave missing text as "" (null over the other protocols)
 // (vectro-qa-2026-11-07/run4).
 import { serve } from '../src/serve/index.mjs';
 import { paramLiteral, bindParams } from '../src/serve/pgtypes.mjs';
@@ -13,6 +14,8 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 let failures = 0, checks = 0;
 const ok = (cond, msg) => { checks++; if (!cond) { failures++; console.log(`FAIL ${msg}`); } };
@@ -88,6 +91,25 @@ eq(ids('SELECT id FROM t LIMIT $1', 2), [1, 2], 'LIMIT $1');
 eq(ids('SELECT id FROM t LIMIT $1 OFFSET $2', 2, 1), [2, 4], 'LIMIT $1 OFFSET $2');
 ok(/LIMIT needs a number/.test(ids('SELECT id FROM t LIMIT $1', 'x')), 'LIMIT with text that is not a number is refused');
 await engine.close();
+
+// MCP: missing text came back as "" (an LLM reads it as a label ""), where HTTP, PostgreSQL and OData say null
+const dir3 = mkdtempSync(join(tmpdir(), 'vectro-r6-servers-'));
+writeFileSync(join(dir3, 'o.csv'), 'id,region\n1,EU\n2,\n3,US\n');
+const mcp = spawn(process.execPath, [fileURLToPath(new URL('../mcp/server.mjs', import.meta.url)), '--root', dir3], { stdio: ['pipe', 'pipe', 'ignore'] });
+let mbuf = '', mid = 0;
+const waiting = new Map();
+mcp.stdout.on('data', (d) => { mbuf += d; let i; while ((i = mbuf.indexOf('\n')) >= 0) { const o = JSON.parse(mbuf.slice(0, i)); mbuf = mbuf.slice(i + 1); waiting.get(o.id)?.(o); } });
+const rpc = (method, params) => new Promise((r) => { const id = ++mid; waiting.set(id, r); mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); });
+const call = async (name, args) => JSON.parse((await rpc('tools/call', { name, arguments: args })).result.content[0].text);
+await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
+const loaded = await call('load_file', { path: 'o.csv' });
+eq(loaded.sample.map((r) => r.region), ['EU', null, 'US'], 'MCP load_file sample: missing text is null');
+eq((await call('sql', { query: 'SELECT region, COUNT(*) n FROM o GROUP BY 1 ORDER BY 1 NULLS LAST' })).rows.map((r) => r.region), ['EU', 'US', null], 'MCP sql: missing text is null');
+eq((await call('query', { table: 'o', group_by: 'region', aggregates: { n: 'count()' }, sort: 'region' })).rows.length, 3, 'MCP query groups');
+eq((await call('query', { table: 'o', filter: 'id == 2' })).rows.map((r) => r.region), [null], 'MCP query rows: missing text is null');
+mcp.stdin.end();
+await new Promise((r) => mcp.on('exit', r));
+rmSync(dir3, { recursive: true, force: true });
 
 console.log(`${checks - failures} / ${checks} checks pass (audit r6 servers)`);
 if (failures) process.exit(1);
