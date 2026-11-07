@@ -8,7 +8,7 @@
 //
 // Safety: the assistant only reads files under --root, and its expressions
 // are Vectro's small math language (no code runs, no eval).
-import { realpathSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import { resolve, extname, basename } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Engine, sql } from '../src/node.mjs';
@@ -20,7 +20,11 @@ const MAX_ROWS = 500, DEFAULT_ROWS = 50;
 
 const args = process.argv.slice(2);
 const rootArg = args.includes('--root') ? args[args.indexOf('--root') + 1] : process.cwd();
-const ROOT = realpathSync(resolve(rootArg));
+const ROOT = (() => {
+  try { if (statSync(resolve(rootArg)).isDirectory()) return realpathSync(resolve(rootArg)); } catch {}
+  process.stderr.write(`[vectro-mcp] no folder ${resolve(rootArg)}: --root must be the folder of data files\n`);
+  process.exit(1);
+})();
 const engine = new Engine();
 const tables = new Map(); // name -> { table, source, chain: tables to free when dropped (add_column builds on the previous one) }
 const log = (...a) => process.stderr.write(`[vectro-mcp] ${a.join(' ')}\n`);
@@ -81,7 +85,7 @@ const TOOLS = [
       'Run one SQL SELECT over the loaded tables (by their names).',
       'SELECT [DISTINCT] ... FROM t [[LEFT | RIGHT | FULL] JOIN u ON t.x = u.y | USING (x)] WHERE ... GROUP BY ... HAVING ... ORDER BY ... [ASC|DESC] LIMIT n [OFFSET m]; WITH (CTEs), subqueries (IN, EXISTS, correlated), UNION / INTERSECT / EXCEPT, window functions (ROW_NUMBER, RANK, SUM(...) OVER (...)), MEDIAN and PERCENTILE_CONT.',
       'Aggregates: COUNT(*), COUNT(x), COUNT(DISTINCT x), SUM, AVG, MIN, MAX, APPROX_COUNT_DISTINCT. Also BETWEEN, IN, LIKE, IS NULL, CASE WHEN, COALESCE, ROUND, LEAST, GREATEST, CAST, DATE \'2024-01-01\', INTERVAL \'7 days\', EXTRACT(YEAR FROM ts), DATE_TRUNC(\'month\', ts), YEAR(ts), MONTH(ts).',
-      'Text: compare, LIKE / ILIKE, IN, ||, UPPER, LOWER, TRIM, SUBSTRING, REPLACE, LENGTH, SPLIT_PART, STRFTIME and more. Missing values are NULL (missing text is \'\').',
+      'Text: compare, LIKE / ILIKE, IN, ||, UPPER, LOWER, TRIM, SUBSTRING, REPLACE, LENGTH, SPLIT_PART, STRFTIME and more. Missing values are NULL, and come back as null (\'\' is missing text too).',
       'At most 500 rows come back (add LIMIT); the answer says how many rows the query has.',
     ].join(' '),
     inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
@@ -270,6 +274,10 @@ async function handle(msg) {
       const fn = handlers[params?.name];
       if (!fn) return error(-32602, `unknown tool: ${params?.name}`);
       try {
+        // (a required argument missing, or sent under another name: say which, not "undefined" from deeper down)
+        const given = params.arguments ?? {}, spec = TOOLS.find((t) => t.name === params.name).inputSchema;
+        const lacking = (spec.required ?? []).filter((k) => given[k] === undefined || given[k] === null);
+        if (lacking.length) throw new ToolError(`"${params.name}" needs ${lacking.map((k) => `"${k}"`).join(' and ')}; got ${Object.keys(given).length ? Object.keys(given).map((k) => `"${k}"`).join(', ') : 'no arguments'} (arguments: ${Object.keys(spec.properties).join(', ')})`);
         const t0 = performance.now();
         const result = await fn(params.arguments ?? {});
         const ms = Math.round((performance.now() - t0) * 100) / 100;

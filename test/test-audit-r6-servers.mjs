@@ -10,7 +10,8 @@
 // --root or port. FROM constructor (toString, __proto__) with no such table said
 // "sql() got not a Vectro Table" (found on the prototype). Hidden files (a
 // binary macOS ._x.csv) became tables; HEAD requests were 404. The browser
-// Engine lacked the Node names writeDatasetAsync / openDatasetAsync
+// Engine lacked the Node names writeDatasetAsync / openDatasetAsync. MCP: a
+// missing argument said "undefined"; a missing --root gave a raw stack
 // (vectro-qa-2026-11-07/run4).
 import { serve } from '../src/serve/index.mjs';
 import { paramLiteral, bindParams } from '../src/serve/pgtypes.mjs';
@@ -118,8 +119,20 @@ eq(loaded.sample.map((r) => r.region), ['EU', null, 'US'], 'MCP load_file sample
 eq((await call('sql', { query: 'SELECT region, COUNT(*) n FROM o GROUP BY 1 ORDER BY 1 NULLS LAST' })).rows.map((r) => r.region), ['EU', 'US', null], 'MCP sql: missing text is null');
 eq((await call('query', { table: 'o', group_by: 'region', aggregates: { n: 'count()' }, sort: 'region' })).rows.length, 3, 'MCP query groups');
 eq((await call('query', { table: 'o', filter: 'id == 2' })).rows.map((r) => r.region), [null], 'MCP query rows: missing text is null');
+// a required argument missing or under another name: say which (it was 'near "undefined"' / "got undefined")
+const callErr = async (name, args) => (await rpc('tools/call', { name, arguments: args })).result;
+let bad = await callErr('sql', { sql: 'SELECT 1' });
+ok(bad.isError && /"sql" needs "query"/.test(bad.content[0].text) && !/undefined/.test(bad.content[0].text), `MCP sql with "sql": ${bad.content[0].text}`);
+bad = await callErr('add_column', { table: 'o', name: 'x', expr: 'id * 2' });
+ok(bad.isError && /"add_column" needs "expression"/.test(bad.content[0].text), `MCP add_column with "expr": ${bad.content[0].text}`);
+bad = await callErr('query', {});
+ok(bad.isError && /"query" needs "table"/.test(bad.content[0].text), `MCP query with no table: ${bad.content[0].text}`);
 mcp.stdin.end();
 await new Promise((r) => mcp.on('exit', r));
+// --root that isn't a folder: a plain message and exit 1 (a raw ENOENT stack before)
+const { spawnSync: spawnS } = await import('node:child_process');
+const noRoot = spawnS(process.execPath, [fileURLToPath(new URL('../mcp/server.mjs', import.meta.url)), '--root', join(dir3, 'nope')], { encoding: 'utf8', input: '', timeout: 20_000 });
+ok(noRoot.status === 1 && /no folder .*nope/.test(noRoot.stderr) && !/ENOENT|at /.test(noRoot.stderr), `vectro-mcp with a missing --root: ${noRoot.status} ${noRoot.stderr.slice(0, 200)}`);
 rmSync(dir3, { recursive: true, force: true });
 
 // hidden files (.x.csv, macOS ._x.csv copies) are not tables; HEAD answers as GET does (uptime checks)
