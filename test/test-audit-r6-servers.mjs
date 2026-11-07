@@ -3,8 +3,12 @@
 // table was never freed (about 7 MB per aborted 300K-row download) and the
 // tables a reload replaced stayed in memory. Two files with one table name
 // (dup.csv and dup.jsonl): the later one replaced the first without a word,
-// and the first table was never freed (vectro-qa-2026-11-07/run4).
+// and the first table was never freed. Parameters from the pg driver (text with
+// no type) failed in id IN ($1, $2), BETWEEN $1 AND $2 and LIMIT $1
+// (vectro-qa-2026-11-07/run4).
 import { serve } from '../src/serve/index.mjs';
+import { paramLiteral, bindParams } from '../src/serve/pgtypes.mjs';
+import { Engine, sql } from '../src/node.mjs';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -61,5 +65,29 @@ ok(JSON.stringify(t2.tables.map((t) => t.file).sort()) === JSON.stringify(['dup.
 await s2.close();
 ok(seen.length === 2, `every table freed on reload (${seen.length} of 2)`);
 rmSync(dir2, { recursive: true, force: true });
+
+// PostgreSQL drivers (the pg package) send parameters as text with no type: id IN ($1, $2),
+// id BETWEEN $1 AND $2 and LIMIT $1 failed ("can only be compared with a text column"),
+// though id = $1 worked. As the PostgreSQL server binds them: quoted text.
+const engine = new Engine();
+const t = engine.table({ id: [1, 2, 4, NaN], ts: [Date.UTC(2024, 0, 1), Date.UTC(2024, 1, 1), Date.UTC(2024, 2, 1), NaN] }, { dates: ['ts'] });
+const bound = (text, ...values) => bindParams(text, values.map((v) => paramLiteral(v === null ? null : Buffer.from(String(v)), 0, 0)));
+const ids = (text, ...values) => { try { return sql(bound(text, ...values), { t }).toRows().map((r) => r.id); } catch (e) { return e.message; } };
+const eq = (a, b, msg) => ok(JSON.stringify(a) === JSON.stringify(b), `${msg}: ${JSON.stringify(a)}`);
+eq(ids('SELECT id FROM t WHERE id = $1', 1), [1], 'id = $1');
+eq(ids('SELECT id FROM t WHERE id IN ($1, $2)', 1, 4), [1, 4], 'id IN ($1, $2)');
+eq(ids('SELECT id FROM t WHERE id IN ($1)', 2), [2], 'id IN ($1)');
+eq(ids('SELECT id FROM t WHERE id IN ($1, $2)', 1, null), [1], 'id IN ($1, NULL)');
+eq(ids('SELECT id FROM t WHERE id NOT IN ($1, $2)', 1, 2), [4], 'id NOT IN ($1, $2)');
+eq(ids('SELECT id FROM t WHERE id IN (1, $1)', 4), [1, 4], 'id IN (1, $1)');
+eq(ids('SELECT id FROM t WHERE id BETWEEN $1 AND $2', 1, 2), [1, 2], 'id BETWEEN $1 AND $2');
+eq(ids('SELECT id FROM t WHERE id NOT BETWEEN $1 AND $2', 1, 2), [4], 'id NOT BETWEEN $1 AND $2');
+eq(ids('SELECT id FROM t WHERE ts IN ($1)', '2024-02-01'), [2], 'date IN ($1)');
+eq(ids('SELECT id FROM t WHERE ts BETWEEN $1 AND $2', '2024-01-15', '2024-03-01'), [2, 4], 'date BETWEEN $1 AND $2');
+eq(ids('SELECT id FROM t LIMIT $1', 2), [1, 2], 'LIMIT $1');
+eq(ids('SELECT id FROM t LIMIT $1 OFFSET $2', 2, 1), [2, 4], 'LIMIT $1 OFFSET $2');
+ok(/LIMIT needs a number/.test(ids('SELECT id FROM t LIMIT $1', 'x')), 'LIMIT with text that is not a number is refused');
+await engine.close();
+
 console.log(`${checks - failures} / ${checks} checks pass (audit r6 servers)`);
 if (failures) process.exit(1);

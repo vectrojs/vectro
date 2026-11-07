@@ -449,6 +449,7 @@ function parseStatement(src, fold = false) {
     // a count of rows: a constant (2 + 3), rounded as DuckDB does (LIMIT 2.5 is 3)
     const rowCount = (what) => {
       const t = peek();
+      if (t?.t === 'str' && /^\s*\+?\d+\s*$/.test(t.v)) { p++; return Number(t.v); } // (LIMIT '10', as PostgreSQL takes it: drivers send LIMIT $1 as text)
       if (!t || !(t.t === 'num' || isOp('(') || isOp('-') || isOp('+'))) fail(`${what} needs a number`);
       const v = sqlConst(add());
       if (v === null || !(v >= 0)) fail(`${what} needs a number of rows (0 or more)`);
@@ -1440,7 +1441,9 @@ function compileSelect(ast, env, outer, tail) {
         return bin(op, V(e.l), V(e.r));
       }
       case 'between': {
-        if (kindOf(e.x, ctx) === 'text') return T({ k: 'bin', op: 'AND', l: { k: 'bin', op: '>=', l: e.x, r: e.lo }, r: { k: 'bin', op: '<=', l: e.x, r: e.hi } });
+        // (text, or a number between text: as two comparisons, which read '10' as 10 as x = '10' does;
+        // PostgreSQL drivers send parameters as text: id BETWEEN $1 AND $2)
+        if (kindOf(e.x, ctx) === 'text' || kindOf(e.lo, ctx) === 'text' || kindOf(e.hi, ctx) === 'text') return T({ k: 'bin', op: 'AND', l: { k: 'bin', op: '>=', l: e.x, r: e.lo }, r: { k: 'bin', op: '<=', l: e.x, r: e.hi } });
         const x = valueOf(e.x, ctx); // (a condition: 1, 0 or NULL, so an unknown one stays unknown)
         return bin('&&', bin('>=', x, valueOf(e.lo, ctx)), bin('<=', x, valueOf(e.hi, ctx)));
       }
@@ -1451,6 +1454,8 @@ function compileSelect(ast, env, outer, tail) {
           const items = e.list.filter((i) => i.k === 'str'); // (a NULL in the list never matches: s IN ('a', NULL) is s = 'a', or unknown)
           return items.length ? call('in', x, ...items.map((i) => ({ t: 'str', v: i.v }))) : num(0);
         }
+        if (e.list.some((i) => i.k !== 'null' && kindOf(i, ctx) === 'text')) // (a number in a list with text: id IN ('1', '4'), as id = '1' OR id = '4')
+          return T(e.list.map((i) => ({ k: 'bin', op: '=', l: e.x, r: i })).reduce((a, b) => ({ k: 'bin', op: 'OR', l: a, r: b })));
         return e.list.map((i) => bin('==', x, valueOf(i, ctx))).reduce((a, b) => bin('||', a, b));
       }
       case 'like': {
