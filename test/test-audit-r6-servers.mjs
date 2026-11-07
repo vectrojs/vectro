@@ -7,7 +7,8 @@
 // no type) failed in id IN ($1, $2), BETWEEN $1 AND $2 and LIMIT $1.
 // The MCP tools gave missing text as "" (null over the other protocols). The
 // vectro command had no --version and showed raw Node errors for a wrong
-// --root or port
+// --root or port. FROM constructor (toString, __proto__) with no such table said
+// "sql() got not a Vectro Table" (found on the prototype)
 // (vectro-qa-2026-11-07/run4).
 import { serve } from '../src/serve/index.mjs';
 import { paramLiteral, bindParams } from '../src/serve/pgtypes.mjs';
@@ -92,6 +93,12 @@ eq(ids('SELECT id FROM t WHERE ts BETWEEN $1 AND $2', '2024-01-15', '2024-03-01'
 eq(ids('SELECT id FROM t LIMIT $1', 2), [1, 2], 'LIMIT $1');
 eq(ids('SELECT id FROM t LIMIT $1 OFFSET $2', 2, 1), [2, 4], 'LIMIT $1 OFFSET $2');
 ok(/LIMIT needs a number/.test(ids('SELECT id FROM t LIMIT $1', 'x')), 'LIMIT with text that is not a number is refused');
+// a table name that is also on every object's prototype (constructor, toString, __proto__): "no table", not
+// "sql() got not a Vectro Table or Dataset"; a table really named so still works
+for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty', 'valueOf']) {
+  ok(/no table/.test(ids(`SELECT * FROM ${name === '__proto__' ? name : `"${name}"`}`)), `FROM ${name} with no such table: ${ids(`SELECT * FROM "${name}"`)}`);
+}
+ok(sql('SELECT COUNT(*) n FROM "constructor"', { constructor: t }).toRows()[0].n === 4, 'a table named constructor');
 await engine.close();
 
 // MCP: missing text came back as "" (an LLM reads it as a label ""), where HTTP, PostgreSQL and OData say null

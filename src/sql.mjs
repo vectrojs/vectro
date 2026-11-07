@@ -600,7 +600,8 @@ function compileSQL(text, tables, opts) {
 // A table by its (maybe schema-qualified) name, case aside; null if none.
 function lookupTable(env, { name, schema }) {
   const { tables } = env, keys = Object.keys(tables);
-  const get = (k) => tables[k] ?? tables[keys.find((x) => x.toLowerCase() === k.toLowerCase())];
+  const own = (k) => (k !== undefined && Object.hasOwn(tables, k) ? tables[k] : undefined); // (not constructor, toString, ... from the prototype)
+  const get = (k) => own(k) ?? own(keys.find((x) => x.toLowerCase() === k.toLowerCase()));
   const sc = schema?.toLowerCase();
   if (sc && sc !== 'public' && sc !== env.database?.toLowerCase()) return get(`${schema}.${name}`) ?? null;
   return get(name) ?? (sc ? null : get(`pg_catalog.${name}`)) ?? null;
