@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.2.1
+
+Fixes from audit round 6 (the published 0.2.0 checked again against DuckDB
+and plain JavaScript). Every fix has a test in `npm test`
+(`test/test-audit-r6-*.mjs`).
+
+**Wrong answers fixed**
+- SQL joins with a dataset on the left and a text key made by an expression
+  (`ON UPPER(a.s) = UPPER(b.s)`, `IS NOT DISTINCT FROM` on text, COALESCE
+  keys) lost matches after the first chunk.
+- `table.join(b, { on: 'k', how: 'right' | 'full' })` on a text key named the
+  same on both sides showed the wrong label in right-only rows.
+- `table.join` with a dataset on the left and `how: 'right'` / `'full'` gave
+  wrong rows; it is now refused (use `collect()` first, or SQL RIGHT / FULL
+  JOIN, which is right on datasets).
+- `range: { op }` is checked: `'=='` / `'<>'` were silently taken as `'>='`.
+- STDDEV / VARIANCE of values whose squares overflow is Infinity, not NaN.
+- An Arrow file cut short right after a message loaded fewer rows with no
+  error; a file without its footer is now refused.
+- Two dataset writers on one path in one process lost rows; the second
+  writer is now refused.
+- A UTF-8 BOM cut over stream pushes or TCP reads stayed in the first value.
+
+**Errors fixed**
+- Band joins (`ON b.t BETWEEN a.t - 5 AND a.t + 5`,
+  `ON a.v < b.v AND b.v < a.v + 2`) failed with "no column __jl0".
+- Outer joins `ON TRUE` / `ON 1 = 0` / `... AND FALSE` failed inside the engine.
+- A CSV column named `constructor`, `toString`, `valueOf` or
+  `hasOwnProperty` made every loader refuse the file.
+- The dataset writer refused batches that lose nothing (no rows, a column
+  of only nulls, text into a free-text column).
+- Wrong CSV options are refused clearly (`pieceBytes: 0` never ended,
+  `type: Int32Array` stored dates wrong, `columns: []`, `types: null`,
+  `sampleRows: 0`).
+- PostgreSQL driver parameters (sent as text) work in `IN ($1, $2)`,
+  `BETWEEN $1 AND $2` and `LIMIT $1`.
+- Damaged Arrow bytes and dataset footers give a clear Vectro error.
+- `SELECT * FROM constructor` (no such table) says "no table".
+- Clear messages for a `wasmModule` given as bytes, a missing MCP tool
+  argument, `vectro-mcp` without `--root`, a bad `--root` or port.
+
+**Servers**
+- HTTP: a client that hangs up mid-answer no longer keeps the answer and
+  the replaced tables in memory; `HEAD` is answered.
+- Data folder: two files with one table name are reported and the first is
+  kept; hidden files (`.x.csv`, macOS `._x.csv`) are not served.
+- MCP: missing text is `null` in tool answers, as over HTTP / PostgreSQL / OData.
+- `vectro --version`.
+
+**Faster**
+- `ON a.t BETWEEN b.lo AND b.hi` checks the second bound while making pairs
+  (it made every pair of the first bound first, so big inputs used GBs of
+  memory).
+
+**Browser**
+- The browser Engine has `openDatasetAsync`, `writeDatasetAsync`,
+  `csvToDatasetAsync`, `createDatasetAsync`, as in Node.
+
+**Also fixed (the open ones from round 6)**
+- Datasets have checksums (file version 3): one per 8 KB of each column and
+  one of the footer, checked the first time an open dataset reads each block.
+  A changed byte gives a clear "damaged" error instead of a wrong answer
+  (6,000 single-byte changes: 0 wrong answers; before, 464 of 1,200 were
+  wrong). Version 1 and 2 files still read; appending makes a file version 3;
+  0.2.0 can't read version 3 files.
+- Joins with keys and a range (`a.g = b.g AND a.t BETWEEN b.lo AND b.hi`) make
+  only the pairs they keep: 200K x 1K rows went from 981 MB and 580 ms to
+  123 MB and 68 ms.
+- CSV: a lone CR in a file with LF line ends ends a row, the same in every
+  loader (rows merged, and loaders disagreed); an unterminated quote is an
+  error (the rest of the file became one value); a column named `__proto__`
+  is `_proto_` (it was dropped).
+- CSV streams: CR-only line ends work; `header: true` leaves out the first
+  line; unknown `streamAsync` options are refused (they were ignored).
+- PostgreSQL: `COPY (query) TO STDOUT` and `COPY table TO STDOUT`, text or CSV
+  (psql's `\copy`).
+- SQL: `LIMIT NULL`, `LIMIT CAST(...)`, `LIMIT / OFFSET (SELECT ...)`;
+  `CAST('0x10' AS DOUBLE)` is missing, as DuckDB refuses it (`CAST('0x1F' AS INTEGER)` is 31, as in DuckDB); text = text
+  between columns works in an outer join's ON (`OR a.s = b.s`).
+- Clearer messages: `on: []` without `range` / `cross`, an unknown column in a
+  join's `where`, outer-join conditions the join can't check.
+
 ## 0.2.0
 
 Fixes from audit round 5: 59 bugs found by checking SQL, the dataframe API,

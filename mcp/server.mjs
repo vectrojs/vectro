@@ -14,7 +14,7 @@ import { createInterface } from 'node:readline';
 import { Engine, sql } from '../src/node.mjs';
 import { LoadError, safePath as safePathIn, loadFile, columnsOf, kindOf } from '../src/serve/catalog.mjs';
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const MAX_ROWS = 500, DEFAULT_ROWS = 50;
 
