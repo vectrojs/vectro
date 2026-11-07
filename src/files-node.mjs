@@ -3,7 +3,7 @@
 // browsers (from a File or a URL; see blobFile and urlFile there).
 import { openSync, readSync, read, writeSync, closeSync, fstatSync, ftruncateSync, existsSync, mkdtempSync, rmSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 function readFully(fd, u8, pos) {
   for (let done = 0; done < u8.length; ) {
@@ -19,10 +19,10 @@ function readFully(fd, u8, pos) {
 // 25 stop the process at garbage collection. A file dropped without close() has
 // its descriptor closed when it is collected.
 const readAt = (fd, u8, off, len, pos) => new Promise((resolve, reject) => read(fd, u8, off, len, pos, (err, n) => (err ? reject(err) : resolve(n))));
-const shut = (s) => { if (s.closed) return; s.closed = true; closeSync(s.fd); };
+const shut = (s) => { s.release?.(); if (s.closed) return; s.closed = true; closeSync(s.fd); };
 const dropped = new FinalizationRegistry((s) => { if (s.busy) s.closing = true; else shut(s); });
-function reader(fd, path) {
-  const s = { fd, busy: 0, closing: false, closed: false }; // (no reference back to the file: it can be collected)
+function reader(fd, path, release = null) {
+  const s = { fd, busy: 0, closing: false, closed: false, release }; // (no reference back to the file: it can be collected)
   const file = {
     fd,
     name: path,
@@ -42,12 +42,15 @@ function reader(fd, path) {
     },
     close() {
       dropped.unregister(file);
+      s.release?.();
       if (s.busy) s.closing = true; else shut(s);
     },
   };
   dropped.register(file, s, file);
   return file;
 }
+
+const writing = new Set(); // (resolved paths with a writer open)
 
 export const nodeFiles = {
   openRead: (path) => reader(openSync(path, 'r'), path),
@@ -56,11 +59,16 @@ export const nodeFiles = {
   // written beside the path and put in its place by commit() (discard() or
   // abort() delete it instead): a dataset still open on the old file keeps
   // reading the old file, where writing over it in place mixed old and new bytes.
+  // One writer per path at a time in this process (closed, aborted or collected frees it): a second
+  // one lost its rows without a word (two appends at once, or a new file put in place under an append).
   openWrite(path, { append = false, atomic = false } = {}) {
+    const key = resolve(path);
+    if (writing.has(key)) throw new Error(`vectro: ${path} is already being written by another dataset writer; close() or abort() that one first (a dataset has one writer at a time)`);
     const existed = append && existsSync(path);
     const tmp = atomic && !existed ? `${path}.${process.pid}-${Math.random().toString(36).slice(2, 10)}.tmp` : null;
     const fd = openSync(tmp ?? path, existed ? 'r+' : 'w');
-    const file = Object.assign(reader(fd, path), { // (the same object: a copy would let the reader be collected, closing the descriptor)
+    writing.add(key);
+    const file = Object.assign(reader(fd, path, () => writing.delete(key)), { // (the same object: a copy would let the reader be collected, closing the descriptor)
       existed,
       write(u8, pos) { for (let done = 0; done < u8.length; ) done += writeSync(fd, u8, done, u8.length - done, pos + done); },
       truncate: (size) => ftruncateSync(fd, size),

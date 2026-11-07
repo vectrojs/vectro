@@ -36,6 +36,31 @@ for (const h of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__defi
 fails(() => engine.parseCSV('a\n1\n', { types: { a: 'int' } }), /type for "a" must be/, 'types: int');
 same(engine.parseCSV('constructor\n01\n', { types: { constructor: 'category' } }).toRows(), [{ constructor: '01' }], 'types: { constructor: category }');
 
+// Two writers on one dataset path in this process: the second one's rows were lost without a word
+// (two writeDatasetAsync appends at once kept only one of them). Now the second writer is refused.
+if (node) {
+  const p = join(dir, 'two.vectro');
+  engine.writeDataset(p, { v: [1, 2] });
+  const w = engine.createDataset(p, { append: true });
+  w.append({ v: [3] });
+  fails(() => engine.createDataset(p, { append: true }), /already being written/, 'a second writer while one is open');
+  fails(() => engine.writeDataset(p, { v: [9] }), /already being written/, 'writeDataset while a writer is open');
+  w.close();
+  engine.writeDataset(p, { v: [4] }, { append: true }); // (free again after close)
+  const got = await Promise.allSettled([engine.writeDatasetAsync(p, { v: [10] }, { append: true }), engine.writeDatasetAsync(p, { v: [20] }, { append: true })]);
+  const ok = got.filter((g) => g.status === 'fulfilled').length;
+  const ds = engine.openDataset(p);
+  same(ds.length, 4 + ok, 'concurrent async appends: every append that succeeded is in the file');
+  same(got.filter((g) => g.status === 'rejected').every((g) => /already being written/.test(g.reason.message)), true, 'concurrent async appends: the other one is refused');
+  ds.close();
+  const a = engine.createDataset(p);
+  a.abort();
+  same(attempt(() => engine.writeDataset(p, { v: [5] }).rows), 1, 'free again after abort');
+  const failed = attempt(() => engine.writeDataset(p, { v: [1], s: ['x'] }, { append: true }));
+  same(/differ/.test(failed), true, 'a failed append is refused');
+  same(attempt(() => engine.writeDataset(p, { v: [6] }, { append: true }).rows), 2, 'free again after a failed append');
+}
+
 rmSync(dir, { recursive: true, force: true });
 await engine.close();
 console.log(`audit r6 loading: ${checks - failures}/${checks} checks passed`);
