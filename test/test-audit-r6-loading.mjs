@@ -139,6 +139,38 @@ if (node) {
   }
 }
 
+// A stream's UTF-8 BOM cut over pushes (or TCP reads): [EF] then [BB BF] stayed in the first value
+// (a CSV stream's first date was missing). A BOM in one piece was already dropped.
+if (node) {
+  const { SplitEngine } = await import('../src/node.mjs');
+  const net = await import('node:net');
+  const split = new SplitEngine({ workers: 1 });
+  const row = Buffer.from('\uFEFF2024-01-01T00:00:00Z,EU,1\n2024-01-02T00:00:00Z,US,2\n');
+  const want = [{ ts: new Date('2024-01-01T00:00:00Z'), region: 'EU', price: 1 }, { ts: new Date('2024-01-02T00:00:00Z'), region: 'US', price: 2 }];
+  for (const cuts of [[1], [2], [1, 2], [3], [1, 1, 1, 1]]) {
+    const s = await split.streamAsync({ format: 'csv', columns: { ts: 'date', region: 'category', price: 'number' } });
+    let at = 0;
+    for (const c of cuts) { await s.push(row.subarray(at, at + c)); at += c; }
+    await s.push(row.subarray(at));
+    await s.flushAsync();
+    same(await s.toRowsAsync(), want, `CSV stream, a BOM pushed in pieces of ${cuts}`);
+  }
+  for (const cuts of [[1], [2], [1, 1]]) {
+    const srv = net.createServer(async (sock) => {
+      let at = 0;
+      for (const c of cuts) { sock.write(row.subarray(at, at + c)); at += c; await new Promise((r) => setTimeout(r, 30)); }
+      sock.end(row.subarray(at));
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const s = await split.streamAsync({ format: 'csv', columns: { ts: 'date', region: 'category', price: 'number' } });
+    await s.connect(0, { host: '127.0.0.1', port: srv.address().port });
+    for (let k = 0; k < 100 && (await s.flushAsync()).rows < 2; k++) await new Promise((r) => setTimeout(r, 20));
+    same(await s.toRowsAsync(), want, `CSV stream over TCP, a BOM in pieces of ${cuts}`);
+    srv.close();
+  }
+  await split.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 await engine.close();
 console.log(`audit r6 loading: ${checks - failures}/${checks} checks passed`);

@@ -674,6 +674,8 @@ export class StreamTable extends SplitTable {
     if (this.format === 'vectro' || this.format === 'arrow') return Promise.reject(new Error("vectro: binary streams take frames over connections: connect each worker to the sender (push() is for 'csv' and 'ndjson')"));
     let bytes = typeof chunk === 'string' ? encode(chunk) : chunk;
     if (!this.begun && bytes.length) { // (a UTF-8 BOM before the first row: dropped, it would go into the first value)
+      if (this.head) { bytes = join(this.head, bytes); this.head = null; }
+      if (bytes.length < 3 && BOM.subarray(0, bytes.length).every((x, i) => bytes[i] === x)) { this.head = Uint8Array.prototype.slice.call(bytes); return Promise.resolve(); } // (a BOM cut over pushes: wait for the rest)
       this.begun = true;
       if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) bytes = bytes.subarray(3);
     }
@@ -842,6 +844,8 @@ class LiveWindow {
     await Promise.all(this.stream.counts.map((_, w) => this.stream.engine._call(w, 'streamWindowClose', { id: this.stream.id, wid: this.wid })));
   }
 }
+
+const BOM = Uint8Array.of(0xef, 0xbb, 0xbf);
 
 function join(a, b) {
   const out = new Uint8Array(a.length + b.length);

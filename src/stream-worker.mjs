@@ -507,7 +507,10 @@ export function createStreams(getEngine) {
       return new Promise((resolve, reject) => {
         const socket = net.connect({ host, port }, () => resolve(true));
         if (s.format === 'vectro' || s.format === 'arrow') { const reader = frameReceiver(s); socket.on('data', (chunk) => receiveFrames(s, reader, chunk)); } else
-        { let first = true; socket.on('data', (chunk) => { if (first && chunk.length) { first = false; chunk = noBOM(chunk); } receive(s, chunk); }); }
+        { let head = new Uint8Array(0); socket.on('data', (chunk) => { // (the first 3 bytes, for a BOM, even when they come in pieces)
+          if (head) { chunk = concat([head, chunk]); if (chunk.length < 3 && [0xef, 0xbb].slice(0, chunk.length).every((x, i) => chunk[i] === x)) { head = chunk; return; } head = null; chunk = noBOM(chunk); }
+          receive(s, chunk);
+        }); }
         socket.on('end', () => { if (s.partial) { queue(s, concat([s.partial, Uint8Array.of(NL)])); s.partial = null; s.quote = CSV_FIELD_START; } flush(s); });
         socket.on('error', (err) => { s.error ??= err.message; reject(err); });
         s.sockets.push(socket);
