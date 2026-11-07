@@ -56,6 +56,8 @@ const COND = [
   ['l.v - 1 < r.v AND l.v + 1 > r.v AND l.id < 3', (l, i, r, j) => l.v[i] - 1 < r.v[j] && l.v[i] + 1 > r.v[j] && l.id[i] < 3],
   ['l.v BETWEEN r.v - 1 AND r.v + 1', (l, i, r, j) => l.v[i] >= r.v[j] - 1 && l.v[i] <= r.v[j] + 1],
   ['l.v + 0 BETWEEN r.v - 1 AND r.v', (l, i, r, j) => l.v[i] >= r.v[j] - 1 && l.v[i] <= r.v[j]],
+  ['r.v BETWEEN l.v - 1 AND l.v + 1', (l, i, r, j) => r.v[j] >= l.v[i] - 1 && r.v[j] <= l.v[i] + 1], // (a band join, as users write it)
+  ['l.v - 1 <= r.v AND r.v <= l.v + 1', (l, i, r, j) => l.v[i] - 1 <= r.v[j] && r.v[j] <= l.v[i] + 1],
 ];
 for (const how of ['JOIN', 'LEFT', 'RIGHT', 'FULL']) {
   for (const [on, f] of COND) {
