@@ -686,8 +686,17 @@ function gatherPairs(engine, L, R, li, ri, n, cols, makeTable) {
       none = codes.get('');
       if (none === undefined) { dict = [...dict, '']; codes = new Map(codes).set('', dict.length - 1); none = dict.length - 1; }
     }
+    let recode = null; // (a text key: the right table's codes are in its own dictionary, so they become this column's)
+    if (dict && alt?.dict) {
+      recode = new Float64Array(alt.dict.length);
+      alt.dict.forEach((label, j) => {
+        let k = codes.get(label);
+        if (k === undefined) { if (dict === c.dict) { dict = [...dict]; codes = new Map(codes); } dict.push(label); k = dict.length - 1; codes.set(label, k); }
+        recode[j] = k;
+      });
+    }
     const data = engine.alloc(L.type, n), d = engine.live(data), a = engine.live(c.data), b = alt ? engine.live(alt.data) : null;
-    for (let i = 0; i < n; i++) { const r = ix[i]; d[i] = r !== MISSING ? a[r] : b && ax[i] !== MISSING ? b[ax[i]] : none; }
+    for (let i = 0; i < n; i++) { const r = ix[i]; d[i] = r !== MISSING ? a[r] : b && ax[i] !== MISSING ? (recode ? recode[b[ax[i]]] ?? none : b[ax[i]]) : none; }
     out.set(name, { data, dict, codes, strings: c.strings, date: c.date, zones: undefined });
   }
   for (const c of out.values()) c.data = engine.live(c.data);
