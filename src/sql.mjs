@@ -894,7 +894,7 @@ function compileSelect(ast, env, outer, tail) {
     const rs = { alias: j.alias, rel: right, names: new Map() };
     const rightHas = (name) => right.names.includes(name);
     const outerJoin = j.how === 'left' || j.how === 'right' || j.how === 'full';
-    let on, joinRange = null, joinCross = false, joinWhere = []; // (see anyJoinG in join.mjs)
+    let on, joinRange = null, joinRange2 = null, joinCross = false, joinWhere = []; // (see anyJoinG in join.mjs)
     const extra = []; // ON conditions that aren't key equalities (inner joins only)
     let rq = right.query;
     if (j.how === 'cross') { // every pair: both sides on one constant key
@@ -925,6 +925,9 @@ function compileSelect(ast, env, outer, tail) {
       // pair; the rest are checked on the pairs (inner joins: a filter after; outer joins: in the join, so
       // rows that keep no pair still come out)
       if (!lefts.length && ranges.length) joinRange = ranges.shift().range;
+      // (a second comparison, BETWEEN's other bound: checked as the pairs are made too, so they aren't all made
+      // first; it stays a condition below as well)
+      if (joinRange && ranges.length) joinRange2 = ranges[0].range;
       conds.push(...ranges.map((x) => x.c));
       // (a comparison with an expression whose hidden column isn't the join's key: as written, since the
       // hidden column is on the left table only, not on the pairs; ON a.v < b.v AND b.v < a.v + 2)
@@ -977,7 +980,7 @@ function compileSelect(ast, env, outer, tail) {
     const anyJoin = joinRange || joinCross || where;
     if (anyJoin && (j.how === 'right' || j.how === 'full') && (findDataset(q.node) || findDataset(rq.node))) fail(`${j.how.toUpperCase()} JOIN with conditions other than equalities works on tables in memory, not datasets`);
     if ((j.how === 'right' || j.how === 'full') && !anyJoin) q = outerJoinG(rq, on, j.how, leftNames, rightCols, rightOut, labels);
-    else q = q.join(rq, { on: keys, how: j.how === 'cross' ? 'inner' : j.how, labels, ...(joinRange ? { range: joinRange } : {}), ...(joinCross ? { cross: true } : {}), ...(where ? { where } : {}) });
+    else q = q.join(rq, { on: keys, how: j.how === 'cross' ? 'inner' : j.how, labels, ...(joinRange ? { range: joinRange } : {}), ...(joinRange2 ? { range2: joinRange2 } : {}), ...(joinCross ? { cross: true } : {}), ...(where ? { where } : {}) });
     scope.push(rs);
     if (j.using && !outerJoin) j.using.forEach((c, k) => usingMap.set(c.toLowerCase(), on.left[k])); // (SELECT *: a USING key once)
     if (j.using && outerJoin) {

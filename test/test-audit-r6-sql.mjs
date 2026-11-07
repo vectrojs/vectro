@@ -96,6 +96,25 @@ for (const how of ['JOIN', 'LEFT', 'RIGHT', 'FULL']) {
   same(Number.isNaN(sql('SELECT STDDEV(v) AS s FROM w', { w }).toRows()[0].s), true, 'STDDEV with an infinite value is missing (NaN), as before');
 }
 
+// 5. BETWEEN two columns of the right table (the second bound is checked as the pairs are made), with
+// missing and infinite bounds, every join kind
+{
+  const P = { id: [0, 1, 2, 3, 4, 5, 6], t: [5, -1, NaN, Infinity, 3, 3, -Infinity] };
+  const W = { id: [10, 11, 12, 13, 14, 15], lo: [0, 3, NaN, -Infinity, 4, 6], hi: [5, 3, 9, 0, Infinity, 2] };
+  const p = engine.table({ id: Float64Array.from(P.id), t: Float64Array.from(P.t) }), w = engine.table({ id: Float64Array.from(W.id), lo: Float64Array.from(W.lo), hi: Float64Array.from(W.hi) });
+  const ONS = [['l.t BETWEEN r.lo AND r.hi', (x, l, h) => x >= l && x <= h], ['l.t >= r.lo AND l.t < r.hi', (x, l, h) => x >= l && x < h], ['l.t > r.lo AND l.t <= r.hi', (x, l, h) => x > l && x <= h],
+    ['r.lo <= l.t AND r.hi >= l.t', (x, l, h) => l <= x && h >= x], ['l.t <= r.hi AND l.t >= r.lo', (x, l, h) => x <= h && x >= l], ['l.t NOT BETWEEN r.lo AND r.hi', (x, l, h) => x < l || x > h],
+    ['l.t >= r.lo AND l.t <= r.hi AND l.id < 5', (x, l, h, i) => x >= l && x <= h && i < 5]];
+  for (const how of ['JOIN', 'LEFT', 'RIGHT', 'FULL']) {
+    for (const [on, f] of ONS) {
+      const q = `SELECT l.id AS x, r.id AS y FROM p l ${how === 'JOIN' ? '' : how + ' '}JOIN w r ON ${on}`;
+      let got;
+      try { got = sorted(sql(q, { p, w }).toRows().map((r) => [r.x, r.y].map((v) => (v == null || Number.isNaN(v) ? null : v)))); } catch (e) { got = e.message; }
+      same(got, sorted(loop(P, W, how, (l, i, r, j) => f(l.t[i], r.lo[j], r.hi[j], l.id[i]))), q);
+    }
+  }
+}
+
 // 4. a dataset on the left, text keys made by an expression: labels first seen in a later chunk
 if (engine.writeDataset) {
   const dir = mkdtempSync(join(tmpdir(), 'r6sql-'));

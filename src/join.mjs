@@ -563,10 +563,11 @@ const MISSING = 0xffffffff, MAX_PAIRS = 2 ** 31;
 const tooMany = (n) => new RangeError(`vectro: join: ${n} pairs of rows is too many (at most 2^31); add an equality, or one comparison such as a.t < b.t, to the ON condition`);
 
 // L, R: tables without filters. opts: { on (keys, may be none), how: 'inner' | 'left' | 'right' | 'full',
-// range: { left, right, op } (op '<', '<=', '>' or '>=': left op right), where (an expression on the output
-// names, true for the pairs to keep), suffix }. keepG(table, expr) gives a 0 / 1 per row of a table.
+// range: { left, right, op } (op '<', '<=', '>' or '>=': left op right), range2 (a second one, with range:
+// checked as the pairs are made, so BETWEEN's other bound doesn't make every pair first), where (an
+// expression on the output names, true for the pairs to keep), suffix }. keepG(table, expr) gives a 0 / 1 per row of a table.
 export function* anyJoinG(L, R, opts, makeTable, keepG) {
-  const { how = 'inner', range = null, where = null, suffix = '_right' } = opts;
+  const { how = 'inner', range = null, range2 = null, where = null, suffix = '_right' } = opts;
   const engine = L.engine;
   if (R.engine !== engine) throw new Error('vectro: join needs two tables of the same engine');
   if (!['inner', 'left', 'right', 'full'].includes(how)) throw new Error(`vectro: join how must be 'inner', 'left', 'right' or 'full', got "${how}"`);
@@ -575,7 +576,7 @@ export function* anyJoinG(L, R, opts, makeTable, keepG) {
   const nL = L.n, nR = R.n;
   // 1. the candidate pairs
   let { li, ri, n } = lk.length ? yield* joinTablesG(L, R, { on: opts.on, how: 'inner', pairsOnly: true, labels: opts.labels }, makeTable)
-    : range ? rangePairs(engine, L, R, range, opts.labels) : crossPairs(nL, nR);
+    : range ? rangePairs(engine, L, R, range, range2) : crossPairs(nL, nR);
   if (range && lk.length) { // (keys and a range: the range checked on the key pairs)
     const lv = numbers(engine, L, range.left), rv = numbers(engine, R, range.right), cmp = COMPARE[range.op];
     let m = 0;
@@ -616,8 +617,9 @@ function numbers(engine, T, name) {
   return engine.live(c.data);
 }
 // left op right: the right rows sorted by key, then each left key's run of them found by binary search
-function rangePairs(engine, L, R, { left, right, op }, labels) {
+function rangePairs(engine, L, R, { left, right, op }, range2) {
   const lv = numbers(engine, L, left), rv = numbers(engine, R, right), nL = L.n, nR = R.n;
+  const lv2 = range2 && numbers(engine, L, range2.left), rv2 = range2 && numbers(engine, R, range2.right), cmp2 = range2 && COMPARE[range2.op];
   const order = [];
   for (let r = 0; r < nR; r++) if (rv[r] === rv[r]) order.push(r); // (missing keys never pair)
   order.sort((a, b) => rv[a] - rv[b] || a - b);
@@ -634,12 +636,15 @@ function rangePairs(engine, L, R, { left, right, op }, labels) {
     else if (op === '<=') { a = firstAbove(x, false); b = m; }
     else if (op === '>') { a = 0; b = firstAbove(x, false); } // (right < x)
     else { a = 0; b = firstAbove(x, true); }
-    from[i] = a; to[i] = b; total += b - a;
+    from[i] = a; to[i] = b;
+    if (!range2) total += b - a;
+    else { const y = lv2[i]; for (let j = a; j < b; j++) if (cmp2(y, rv2[order[j]])) total++; }
   }
   if (total > MAX_PAIRS) throw tooMany(total);
   const li = new Uint32Array(total), ri = new Uint32Array(total);
   let k = 0;
-  for (let i = 0; i < nL; i++) for (let j = from[i]; j < to[i]; j++) { li[k] = i; ri[k] = order[j]; k++; }
+  if (!range2) for (let i = 0; i < nL; i++) for (let j = from[i]; j < to[i]; j++) { li[k] = i; ri[k] = order[j]; k++; }
+  else for (let i = 0; i < nL; i++) { const y = lv2[i]; for (let j = from[i]; j < to[i]; j++) { const r = order[j]; if (cmp2(y, rv2[r])) { li[k] = i; ri[k] = r; k++; } } }
   return { li, ri, n: total };
 }
 function crossPairs(nL, nR) {

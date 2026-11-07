@@ -160,8 +160,8 @@ export function namesOf(node) {
 // The left and right columns a join's range and where read: [[left, null] | [null, right], ...].
 export function joinCondColumns(node) {
   const out = [];
-  const { range, where } = node.opts;
-  if (range) out.push([range.left, null], [null, range.right]);
+  const { range, range2, where } = node.opts;
+  for (const x of [range, range2]) if (x) out.push([x.left, null], [null, x.right]);
   if (where) {
     const { left, fromRight } = joinNames(node);
     for (const n of vars(parse(where))) { if (left.has(n)) out.push([n, null]); else if (fromRight.has(n)) out.push([null, fromRight.get(n)]); }
