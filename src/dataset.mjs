@@ -850,7 +850,9 @@ function* materializeRights(node, temps) {
     const left = yield* materializeRights(node.left, temps);
     let right = node.right;
     const L = findDataset(left), Rds = findDataset(right);
-    if (L && Rds && !node.opts.range && !node.opts.where && !node.opts.cross && onKeys(node.opts.on)[0].length) { // both on disk: too many right rows to hold? then both sides go to disk by key range
+    // (each chunk is joined on its own, so the right rows no chunk matched aren't known: they came out once per chunk)
+    if (L && (node.opts.how === 'right' || node.opts.how === 'full')) throw new Error(`vectro: join how: '${node.opts.how}' needs a table on the left, not a dataset: collect() the dataset's rows first, or use SQL ${node.opts.how.toUpperCase()} JOIN ... ON keys, which works on datasets`);
+    if (L && Rds &&!node.opts.range && !node.opts.where && !node.opts.cross && onKeys(node.opts.on)[0].length) { // both on disk: too many right rows to hold? then both sides go to disk by key range
       const [lk, rk] = onKeys(node.opts.on);
       const textKey = L.cols.get(lk[0])?.dict || Rds.cols.get(rk[0])?.dict; // (codes differ between files: not by range)
       const rows = textKey ? 0 : (yield* runPlanG({ op: 'total', spec: { n: parse('count()') }, input: right })).n;

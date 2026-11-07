@@ -3,8 +3,13 @@
 // nested loop (vectro-qa-2026-11-07/run2). A right / full join on a text key
 // with the same name on both sides showed the wrong label in the rows only
 // the right table has (the right table's code read in the left table's
-// dictionary).
+// dictionary). With a dataset on the left, right / full joins added the
+// right rows without a match once per chunk; they are refused now.
 import { Engine } from './test-mode.mjs';
+import { sql } from '../src/sql.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 let failures = 0, checks = 0;
 const str = (v) => JSON.stringify(v, (k, x) => (typeof x === 'number' && !Number.isFinite(x) ? String(x) : x));
@@ -32,6 +37,27 @@ same(a.join(c, { on: 'k', how: 'right' }).toRows(), [{ k: '名前', v: NaN, w: 1
 // numbers and two keys
 const n1 = engine.table({ k: [1, 2, 3], s: ['a', 'b', 'c'], v: [1, 2, 3] }), n2 = engine.table({ k: [5, 2, 3], s: ['e', 'b', 'x'], w: [1, 2, 3] });
 same(sorted(n1.join(n2, { on: ['k', 's'], how: 'full' }).toRows()), sorted([{ k: 2, s: 'b', v: 2, w: 2 }, { k: 1, s: 'a', v: 1, w: NaN }, { k: 3, s: 'c', v: 3, w: NaN }, { k: 5, s: 'e', v: NaN, w: 1 }, { k: 3, s: 'x', v: NaN, w: 3 }]), 'full join, two keys');
+
+// datasets on the left: right / full give each right row without a match once (or are refused)
+if (engine.writeDataset) {
+  const dir = mkdtempSync(join(tmpdir(), 'r6df-'));
+  try {
+    engine.writeDataset(join(dir, 'a.vectro'), a, { rowsPerChunk: 1 });
+    const ds = engine.openDataset(join(dir, 'a.vectro'));
+    for (const how of ['right', 'full']) {
+      const want = sorted(how === 'right' ? right : full);
+      for (const opts of [{ on: 'k', how }, { on: 'k', how, where: 'v < 5' }, { on: [], how, cross: true, where: 'k == k_right' }]) {
+        fails(() => ds.join(b, opts).toRows(), `dataset ${str(opts)}: refused`);
+        checks++; try { await ds.lazy().join(b, opts).toRowsAsync(); failures++; console.log(`FAIL dataset async ${str(opts)}: no error`); } catch (e) { if (!/^vectro/.test(e.message)) { failures++; console.log(`FAIL dataset async ${str(opts)}: ${e.message}`); } }
+      }
+      // SQL does them on datasets (keys only)
+      same(sorted(sql(`SELECT k, v, w FROM ds ${how.toUpperCase()} JOIN b USING (k)`, { ds, b }).toRows()), want, `dataset SQL ${how} join`);
+    }
+    // inner and left joins, and a table on the left with the dataset on the right, still work
+    same(sorted(ds.join(b, { on: 'k', how: 'left' }).toRows()), sorted([full[0], full[1], full[2]]), 'dataset left join');
+    same(sorted(a.lazy().join(ds.lazy(), { on: 'k', how: 'full' }).toRows()).length, 3, 'table full join a dataset (its rows read in)');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
 
 await engine.close();
 console.log(`${checks - failures}/${checks} audit r6 dataframe checks passed`);
