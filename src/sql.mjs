@@ -947,7 +947,7 @@ function compileSelect(ast, env, outer, tail) {
       // equalities are the keys; with none, the first comparison pairs the rows (sorted keys), else every
       // pair; the rest are checked on the pairs (inner joins: a filter after; outer joins: in the join, so
       // rows that keep no pair still come out)
-      if (!lefts.length && ranges.length) joinRange = ranges.shift().range;
+      if (ranges.length) joinRange = ranges.shift().range; // (with keys too: searched within each key's rows, not every key pair made first, R6-1.9)
       // (a second comparison, BETWEEN's other bound: checked as the pairs are made too, so they aren't all made
       // first; it stays a condition below as well)
       if (joinRange && ranges.length) joinRange2 = ranges[0].range;

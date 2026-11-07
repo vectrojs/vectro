@@ -81,6 +81,7 @@ export function* joinTablesG(L, R, opts = {}, makeTable) {
 
     // 3. the pairs (left rows in order, each with its matches in right-table order)
     const left = how === 'left';
+    if (opts.pairsOnly && opts.range) return keyRangePairs(engine, L, R, engine.live(lid), nL, start, rows, build.rowOf, opts.range, opts.range2); // (only the pairs the range keeps: R6-1.9)
     const total = countPairs(engine.live(lid), nL, start, build.rowOf, left);
     if (total > MAX_PAIRS) throw tooMany(total);
     const li = alloc(Uint32Array, total), ri = alloc(Uint32Array, total);
@@ -577,14 +578,10 @@ export function* anyJoinG(L, R, opts, makeTable, keepG) {
   const [lk, rk] = opts.on ? parseOn(opts.on) : [[], []];
   const nL = L.n, nR = R.n;
   // 1. the candidate pairs
-  let { li, ri, n } = lk.length ? yield* joinTablesG(L, R, { on: opts.on, how: 'inner', pairsOnly: true, labels: opts.labels }, makeTable)
+  // (keys and a range: each key group's right rows sorted by the range key and searched per left row, so only
+  // the pairs the range keeps are made; every key pair first took 1.9 GB for 200K x 1K rows, R6-1.9)
+  let { li, ri, n } = lk.length ? yield* joinTablesG(L, R, { on: opts.on, how: 'inner', pairsOnly: true, labels: opts.labels, range, range2 }, makeTable)
     : range ? rangePairs(engine, L, R, range, range2) : crossPairs(nL, nR);
-  if (range && lk.length) { // (keys and a range: the range checked on the key pairs)
-    const lv = numbers(engine, L, range.left), rv = numbers(engine, R, range.right), cmp = COMPARE[range.op];
-    let m = 0;
-    for (let i = 0; i < n; i++) if (cmp(lv[li[i]], rv[ri[i]])) { li[m] = li[i]; ri[m] = ri[i]; m++; }
-    n = m;
-  }
   const cols = outputColumns(L, R, lk, rk, suffix);
   // 2. the other conditions, on a table of the columns they read
   if (where) {
@@ -618,6 +615,42 @@ function numbers(engine, T, name) {
   if (!c) throw new Error(`vectro: join: no column "${name}"`);
   if (c.dict || c.strings) throw new Error(`vectro: join: a range condition (<, <=, >, >=) needs number or date columns, not the text column "${name}"`);
   return engine.live(c.data);
+}
+// keys and a range: the pairs of a hash join (left row i, its key group g) that also meet left op right (and range2)
+function keyRangePairs(engine, L, R, found, nL, start, rows, rowOf, { left, right, op }, range2) {
+  const lv = numbers(engine, L, left), rv = numbers(engine, R, right);
+  const lv2 = range2 && numbers(engine, L, range2.left), rv2 = range2 && numbers(engine, R, range2.right), cmp2 = range2 && COMPARE[range2.op];
+  let lo, hi, order; // each group's right rows in [lo[g], hi[g]) of order, sorted by key, missing keys left out
+  if (rowOf) { // (unique right keys: one row per group)
+    const G = rowOf.length;
+    order = Int32Array.from(rowOf); lo = new Int32Array(G); hi = new Int32Array(G);
+    for (let g = 0; g < G; g++) { lo[g] = g; hi[g] = rv[rowOf[g]] === rv[rowOf[g]] ? g + 1 : g; }
+  } else {
+    const G = start.length - 1;
+    order = Int32Array.from(rows.subarray(0, start[G])); lo = new Int32Array(G); hi = new Int32Array(G);
+    for (let g = 0; g < G; g++) {
+      const a = start[g], b = start[g + 1];
+      let w = a;
+      for (let j = a; j < b; j++) if (rv[order[j]] === rv[order[j]]) order[w++] = order[j];
+      order.subarray(a, w).sort((x, y) => rv[x] - rv[y] || x - y);
+      lo[g] = a; hi[g] = w;
+    }
+  }
+  const firstAbove = (a, b, x, strict) => { while (a < b) { const h = (a + b) >> 1; if (strict ? rv[order[h]] > x : rv[order[h]] >= x) b = h; else a = h + 1; } return a; };
+  const li = [], ri = [];
+  for (let i = 0; i < nL; i++) {
+    const g = found[i], x = lv[i];
+    if (g < 0 || x !== x) continue;
+    const a = op === '<' ? firstAbove(lo[g], hi[g], x, true) : op === '<=' ? firstAbove(lo[g], hi[g], x, false) : lo[g];
+    const b = op === '>' ? firstAbove(lo[g], hi[g], x, false) : op === '>=' ? firstAbove(lo[g], hi[g], x, true) : hi[g];
+    for (let j = a; j < b; j++) {
+      const r = order[j];
+      if (cmp2 && !cmp2(lv2[i], rv2[r])) continue;
+      li.push(i); ri.push(r);
+      if (li.length > MAX_PAIRS) throw tooMany(li.length);
+    }
+  }
+  return { li: Uint32Array.from(li), ri: Uint32Array.from(ri), n: li.length };
 }
 // left op right: the right rows sorted by key, then each left key's run of them found by binary search
 function rangePairs(engine, L, R, { left, right, op }, range2) {

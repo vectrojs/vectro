@@ -151,6 +151,18 @@ fails(() => sql('SELECT l.id AS x FROM a l LEFT JOIN b r ON l.v < r.v AND r.v < 
   same(v('SELECT id FROM a ORDER BY id LIMIT (SELECT n FROM nt) OFFSET (SELECT n - 1 FROM nt)'), [[1], [2]], 'LIMIT / OFFSET (SELECT ...)');
   fails(() => sql('SELECT id FROM a LIMIT (SELECT id FROM a)', { a }).toRows(), 'LIMIT (SELECT ...) with more than one row');
 }
+// R6-1.9: keys plus a range: only the pairs the range keeps (answers as a nested loop)
+{
+  const N = 3000, M = 60;
+  const ka = engine.table({ g: Float64Array.from({ length: N }, (_, i) => i % 7), t: Float64Array.from({ length: N }, (_, i) => (i * 37) % 600) });
+  const kb = engine.table({ g: Float64Array.from({ length: M }, (_, i) => i % 7), lo: Float64Array.from({ length: M }, (_, i) => i * 10), hi: Float64Array.from({ length: M }, (_, i) => (i % 9 === 0 ? NaN : i * 10 + 10)) });
+  const A = ka.toColumns(), B = kb.toColumns();
+  for (const how of ['JOIN', 'LEFT JOIN']) {
+    let want = 0;
+    for (let i = 0; i < N; i++) { let m = 0; for (let j = 0; j < M; j++) if (A.g[i] === B.g[j] && A.t[i] >= B.lo[j] && A.t[i] <= B.hi[j]) m++; want += m || (how === 'LEFT JOIN' ? 1 : 0); }
+    same(sql(`SELECT COUNT(*) AS n FROM ka ${how} kb ON ka.g = kb.g AND ka.t BETWEEN kb.lo AND kb.hi`, { ka, kb }).toRows()[0].n, want, `${how}: keys and BETWEEN`);
+  }
+}
 await engine.close();
 console.log(`${checks - failures}/${checks} audit r6 SQL checks passed`);
 if (failures) process.exit(1);
