@@ -145,7 +145,8 @@ fails(() => sql('SELECT l.id AS x FROM a l LEFT JOIN b r ON l.v < r.v AND r.v < 
   const s1 = engine.table({ k: [1, 2, 4], s: ['x', 'y', ''] }), s2 = engine.table({ k: [3, 2, 5], s: ['x', 'z', ''] }), nt = engine.table({ n: [2] });
   const v = (q) => sql(q, { s1, s2, nt, a }).toRows().map((r) => Object.values(r).map((x) => (x == null || Number.isNaN(x) ? null : x)));
   same(sorted(v('SELECT s1.k, s2.k AS bk FROM s1 FULL JOIN s2 ON s1.k = s2.k OR s1.s = s2.s')), sorted([[1, 3], [2, 2], [4, null], [null, 5]]), 'FULL JOIN ON keys OR text = text (missing text matches nothing)');
-  same(v("SELECT CAST('0x10' AS DOUBLE) AS a, CAST('0b11' AS INTEGER) AS b, CAST(' 12 ' AS INT) AS c FROM nt"), [[null, null, 12]], "CAST of '0x10' / '0b11' is missing, as DuckDB refuses them");
+  same(v("SELECT CAST('0x10' AS DOUBLE) AS a, CAST('0b11' AS INTEGER) AS b, CAST(' 12 ' AS INT) AS c FROM nt"), [[null, 3, 12]], "CAST of '0x10' to DOUBLE is missing; '0b11' to INTEGER is 3 (DuckDB)");
+  same(v("SELECT CAST('0x1F' AS INTEGER) AS a, CAST('0X1f' AS BIGINT) AS b, CAST('-0x1F' AS INT) AS c, CAST(' 0x1F ' AS INT) AS d, CAST('0o7' AS INT) AS e, CAST('0x1F' AS DECIMAL(10,2)) AS f FROM nt"), [[31, 31, null, null, null, null]], 'whole-number CAST takes exactly 0x.. / 0b.. (DuckDB)');
   same(v('SELECT id FROM a ORDER BY id LIMIT NULL'), [[0], [1], [2], [3]], 'LIMIT NULL: no limit');
   same(v("SELECT id FROM a ORDER BY id LIMIT CAST('2' AS INT)"), [[0], [1]], 'LIMIT CAST(...)');
   same(v('SELECT id FROM a ORDER BY id LIMIT (SELECT n FROM nt) OFFSET (SELECT n - 1 FROM nt)'), [[1], [2]], 'LIMIT / OFFSET (SELECT ...)');

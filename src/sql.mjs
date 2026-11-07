@@ -1555,13 +1555,13 @@ function compileSelect(ast, env, outer, tail) {
         if (e.x.k === 'str' && !DATE_TYPES.has(e.type)) {
           if (BOOL_TYPES.has(e.type)) return num(asBool(e.x.v));
           if (!INT_TYPES.has(e.type) && !FLOAT_TYPES.has(e.type)) fail(`CAST to ${e.type} is not supported`);
-          const x = textToNumber(e.x.v);
+          const x = textToNumber(e.x.v, INT_TYPES.has(e.type));
           return num(INT_TYPES.has(e.type) ? toWhole(x, e.type) : x);
         }
         if (from === 'text' && e.x.k !== 'str') { // text to a number or a date (missing where it isn't one)
           const whole = INT_TYPES.has(e.type), date = DATE_TYPES.has(e.type), bool = BOOL_TYPES.has(e.type);
           if (!whole && !date && !bool && !FLOAT_TYPES.has(e.type)) fail(`CAST to ${e.type} is not supported`);
-          return valueColumn(ctx, [argOf(e.x, ctx)], ([x]) => { if (bool) return asBool(x); if (date) { const t = textToDate(x); return e.type === 'DATE' ? Math.floor(t / 86_400_000) * 86_400_000 : t; } const v = textToNumber(x); return whole ? toWhole(v, e.type) : v; }, { text: false, date, label: e.type.toLowerCase() });
+          return valueColumn(ctx, [argOf(e.x, ctx)], ([x]) => { if (bool) return asBool(x); if (date) { const t = textToDate(x); return e.type === 'DATE' ? Math.floor(t / 86_400_000) * 86_400_000 : t; } const v = textToNumber(x, whole); return whole ? toWhole(v, e.type) : v; }, { text: false, date, label: e.type.toLowerCase() });
         }
         const x = V(e.x);
         if (INT_TYPES.has(e.type)) {

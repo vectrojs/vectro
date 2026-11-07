@@ -21,7 +21,8 @@ export const isNull = (v, kind) => (kind === 'text' ? v === '' : v !== v);
 // (also 'inf', '-inf', 'infinity' and 'nan' in any case, as DuckDB reads them)
 const SPECIAL = { inf: Infinity, '+inf': Infinity, '-inf': -Infinity, infinity: Infinity, '+infinity': Infinity, '-infinity': -Infinity, nan: NaN, '+nan': NaN, '-nan': NaN };
 // (not 0x10, 0b11 or 0o7: JavaScript's Number() reads them, DuckDB and PostgreSQL don't)
-export const textToNumber = (s) => { const t = s.trim(); return t === '' || /^[+-]?0[xXbBoO]/.test(t) ? NaN : SPECIAL[t.toLowerCase()] ?? Number(t); };
+// A whole-number CAST takes exactly 0x1F and 0b11, as DuckDB does (no sign, no spaces).
+export const textToNumber = (s, whole = false) => { if (whole && /^0(x[0-9a-f]+|b[01]+)$/i.test(s)) return Number(s); const t = s.trim(); return t === '' || /^[+-]?0[xXbBoO]/.test(t) ? NaN : SPECIAL[t.toLowerCase()] ?? Number(t); };
 export const textToDate = (s) => (s.trim() === '' ? NaN : parseDateText(s.trim()));
 
 const chars = (s) => Array.from(s);
