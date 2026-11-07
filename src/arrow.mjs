@@ -426,6 +426,8 @@ export class ArrowReader {
 // error unless left out).
 export function readArrow(bytes, { columns: pick } = {}) {
   if (!(bytes instanceof Uint8Array)) bytes = ArrayBuffer.isView(bytes) ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength) : new Uint8Array(bytes);
+  // (a file cut short after a message read as a shorter stream: fewer rows, no error)
+  if (isMagic(bytes, 0) && (bytes.length < 14 || !isMagic(bytes, bytes.length - 6))) throw new Error('vectro: this Arrow file has no footer at its end: it was cut short (truncated?)');
   let names = null, dates = [];
   const parts = [];
   const reader = new ArrowReader({

@@ -98,6 +98,21 @@ if (node) {
   same(rowsOf(k)[1].slice(-2), [{ email: 'u58@x.com', n: 58 }, { email: 'u59@x.com', n: 59 }], 'free text appended to a category reads back');
 }
 
+// An Arrow *file* (.arrow / .feather, "ARROW1" first) cut short exactly after a message loaded as
+// fewer rows (or none) without an error: it was read as a stream. A file needs its footer.
+{
+  const t = engine.table({ id: [1, 2, 3], g: ['a', 'b', 'a'] });
+  const whole = t.toArrow({ file: true }), stream = t.toArrow();
+  let wrong = 0, cut = 0;
+  for (let at = 0; at < whole.length; at++) {
+    try { const x = engine.fromArrow(whole.subarray(0, at)); cut++; if (x.length !== 3) wrong++; } catch (e) { if (!/^vectro/.test(e.message)) wrong++; }
+  }
+  same([wrong, cut], [0, 0], 'a cut Arrow file: always an error');
+  same(attempt(() => engine.fromArrow(whole).toRows().length), 3, 'a whole Arrow file reads');
+  same(attempt(() => engine.fromArrow(stream).toRows().length), 3, 'an Arrow stream reads');
+  same(/footer/.test(attempt(() => engine.fromArrow(whole.subarray(0, whole.length - 1)))), true, 'a cut Arrow file names the missing footer');
+}
+
 rmSync(dir, { recursive: true, force: true });
 await engine.close();
 console.log(`audit r6 loading: ${checks - failures}/${checks} checks passed`);
