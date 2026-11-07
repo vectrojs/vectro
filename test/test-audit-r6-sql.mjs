@@ -4,9 +4,15 @@
 // ON 1 = 1, a condition AND FALSE) failed inside the engine; two comparisons
 // with an expression on the left side (ON a.v < b.v AND b.v < a.v + 2) failed
 // with "no column __jl0"; STDDEV / VARIANCE of a whole table whose squares
-// overflow gave NaN instead of Infinity (GROUP BY gave Infinity).
+// overflow gave NaN instead of Infinity (GROUP BY gave Infinity). With a
+// dataset on the left, a text key made by an expression (ON UPPER(a.s) =
+// UPPER(b.s), ON a.s IS NOT DISTINCT FROM b.s) lost the matches of labels
+// first seen after the first chunk (silently wrong answers).
 import { Engine } from './test-mode.mjs';
 import { sql } from '../src/sql.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 let failures = 0, checks = 0;
 const str = (v) => JSON.stringify(v, (k, x) => (typeof x === 'number' && !Number.isFinite(x) ? String(x) : x)); // (Infinity and NaN apart)
@@ -88,6 +94,29 @@ for (const how of ['JOIN', 'LEFT', 'RIGHT', 'FULL']) {
   same(sql('SELECT STDDEV_POP(v) AS s, VAR_SAMP(v) AS x FROM u', { u }).toRows()[0], { s: Math.sqrt(1.25), x: 5 / 3 }, 'STDDEV of 1..4 unchanged');
   const w = engine.table({ v: Float64Array.from([1, Infinity, 3]) });
   same(Number.isNaN(sql('SELECT STDDEV(v) AS s FROM w', { w }).toRows()[0].s), true, 'STDDEV with an infinite value is missing (NaN), as before');
+}
+
+// 4. a dataset on the left, text keys made by an expression: labels first seen in a later chunk
+if (engine.writeDataset) {
+  const dir = mkdtempSync(join(tmpdir(), 'r6sql-'));
+  try {
+    const n = 60, ids = Float64Array.from({ length: n }, (_, i) => i), labels = Array.from({ length: n }, (_, i) => (i % 9 === 4 ? '' : `k${i % 23}`));
+    const lt = engine.table({ id: ids, s: labels });
+    const rt = engine.table({ rid: Float64Array.from({ length: 30 }, (_, i) => 100 + i), s: Array.from({ length: 30 }, (_, i) => (i === 29 ? '' : `K${i % 25}`)) });
+    engine.writeDataset(join(dir, 'l.vectro'), lt, { rowsPerChunk: 7 });
+    const ld = engine.openDataset(join(dir, 'l.vectro'));
+    for (const on of ['UPPER(l.s) = r.s', 'UPPER(l.s) = UPPER(r.s)', 'LOWER(r.s) = l.s', 'LOWER(r.s) IS NOT DISTINCT FROM l.s', "COALESCE(l.s, 'none') = COALESCE(LOWER(r.s), 'none')"]) {
+      for (const how of ['JOIN', 'LEFT JOIN']) {
+        const q = `SELECT l.id AS x, r.rid AS y FROM l ${how} r ON ${on}`;
+        let got;
+        try { got = sorted(sql(q, { l: ld, r: rt }).toRows().map((x) => [x.x, Number.isNaN(x.y) ? null : x.y])); } catch (e) { got = e.message; }
+        same(got, sorted(sql(q, { l: lt, r: rt }).toRows().map((x) => [x.x, Number.isNaN(x.y) ? null : x.y])), `dataset: ${q}`);
+      }
+    }
+    const want = sql('SELECT COUNT(*) AS n FROM l JOIN r ON UPPER(l.s) = r.s', { l: lt, r: rt }).toRows()[0].n;
+    same(want, 64, 'UPPER key on the table: 64 pairs');
+    ld.close?.();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 fails(() => sql('SELECT l.id AS x FROM a l LEFT JOIN b r ON l.v < r.v AND r.v < l.v + 2 AND UPPER(\'x\') = \'X\'', T).toRows(), 'outer join with a text function: a vectro error');

@@ -404,7 +404,9 @@ function makePairs(f, nL, nR, start, rows, rowOf, left, a, b) {
 const ids = new WeakMap();
 let nextId = 1;
 const idOf = (x) => { if (!x) return 0; let id = ids.get(x); if (!id) ids.set(x, (id = nextId++)); return id; };
-const dictId = idOf, arrayId = idOf;
+// (a dictionary and its length: a text column made on a dataset adds labels to one dictionary chunk by
+// chunk, and a build from before, which maps the right labels to the left codes, lacks the new ones)
+const dictId = (d) => (d ? `${idOf(d)}:${d.length}` : 0), arrayId = idOf;
 
 export function freeBuild(engine, build) { for (const a of build?.arrays ?? []) engine.free(a); }
 
