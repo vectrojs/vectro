@@ -9,7 +9,8 @@
 // vectro command had no --version and showed raw Node errors for a wrong
 // --root or port. FROM constructor (toString, __proto__) with no such table said
 // "sql() got not a Vectro Table" (found on the prototype). Hidden files (a
-// binary macOS ._x.csv) became tables; HEAD requests were 404
+// binary macOS ._x.csv) became tables; HEAD requests were 404. The browser
+// Engine lacked the Node names writeDatasetAsync / openDatasetAsync
 // (vectro-qa-2026-11-07/run4).
 import { serve } from '../src/serve/index.mjs';
 import { paramLiteral, bindParams } from '../src/serve/pgtypes.mjs';
@@ -131,6 +132,20 @@ eq([...s5.catalog.entries.keys()], ['a'], 'hidden files skipped');
 for (const path of ['/', '/tables', '/tables/a']) { const h = await fetch(`${s5.url}${path}`, { method: 'HEAD' }); ok(h.status === 200 && (await h.text()) === '', `HEAD ${path}: ${h.status}`); }
 await s5.close();
 rmSync(dir5, { recursive: true, force: true });
+
+// the browser Engine answers to the Node names too (datasets.mdx shows writeDatasetAsync / openDatasetAsync
+// "in Node as well"; the browser Engine only had writeDataset / openDataset)
+{
+  const { Engine: BrowserEngine, memoryFile } = await import('../src/browser.mjs');
+  const be = new BrowserEngine({ threads: 1 });
+  const f = memoryFile('scores.vectro');
+  await be.writeDatasetAsync(f, { team: ['red', 'blue', 'red'], score: [3, 5, 4] });
+  const scores = await be.openDatasetAsync(f.blob());
+  eq(await scores.groupBy('team').agg({ total: 'sum(score)' }).toRowsAsync(), [{ team: 'red', total: 7 }, { team: 'blue', total: 5 }], 'browser Engine: the datasets.mdx example with the Node names');
+  ok(['csvToDatasetAsync', 'createDatasetAsync'].every((m) => typeof be[m] === 'function'), 'browser Engine: csvToDatasetAsync / createDatasetAsync');
+  await scores.close();
+  await be.close();
+}
 
 // the vectro command: --version, and plain messages for a wrong --root or port (raw ENOENT / ENOTDIR / RangeError before)
 const { spawnSync } = await import('node:child_process');

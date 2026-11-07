@@ -77,6 +77,11 @@ export class Engine extends CoreEngine {
   async openStoredDataset(name) { return openDatasetAsync(this, await storedFile(name)); }
   storedDatasetFile(name) { return storedFile(name); } // (a File: to download, or to open)
   removeStoredDataset(name) { return removeStored(name); }
+  // the Node Engine's names for the same calls, so code shared with Node runs here too
+  openDatasetAsync(source) { return this.openDataset(source); }
+  writeDatasetAsync(target, source, opts) { return this.writeDataset(target, source, opts); }
+  csvToDatasetAsync(csv, target, opts) { return this.csvToDataset(csv, target, opts); }
+  createDatasetAsync(target, opts) { return this.createDataset(target, opts); }
 }
 
 // a name in browser storage or a FileSystemFileHandle -> a writable file; file objects as they are
