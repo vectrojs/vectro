@@ -166,6 +166,7 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
   }
 
   const server = createServer((req, res) => {
+    if (req.method === 'HEAD') req.method = 'GET'; // (answered as GET; the response sends no body for HEAD)
     const done = catalog.hold(), tables = catalog.named(); // (a reload meanwhile frees these tables only after this request)
     route(tables, req, res).finally(done).catch((err) => {
       const status = err.status ?? (err instanceof LoadError || /^vectro/.test(err.message) ? 400 : 500);

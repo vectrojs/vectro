@@ -8,7 +8,8 @@
 // The MCP tools gave missing text as "" (null over the other protocols). The
 // vectro command had no --version and showed raw Node errors for a wrong
 // --root or port. FROM constructor (toString, __proto__) with no such table said
-// "sql() got not a Vectro Table" (found on the prototype)
+// "sql() got not a Vectro Table" (found on the prototype). Hidden files (a
+// binary macOS ._x.csv) became tables; HEAD requests were 404
 // (vectro-qa-2026-11-07/run4).
 import { serve } from '../src/serve/index.mjs';
 import { paramLiteral, bindParams } from '../src/serve/pgtypes.mjs';
@@ -119,6 +120,17 @@ eq((await call('query', { table: 'o', filter: 'id == 2' })).rows.map((r) => r.re
 mcp.stdin.end();
 await new Promise((r) => mcp.on('exit', r));
 rmSync(dir3, { recursive: true, force: true });
+
+// hidden files (.x.csv, macOS ._x.csv copies) are not tables; HEAD answers as GET does (uptime checks)
+const dir5 = mkdtempSync(join(tmpdir(), 'vectro-r6-servers-'));
+writeFileSync(join(dir5, 'a.csv'), 'x\n1\n');
+writeFileSync(join(dir5, '.hidden.csv'), 'x\n1\n');
+writeFileSync(join(dir5, '._a.csv'), Buffer.from([0, 5, 22, 7, 0, 2, 0, 0, 77, 97, 99]));
+const s5 = await serve({ root: dir5, port: 0 });
+eq([...s5.catalog.entries.keys()], ['a'], 'hidden files skipped');
+for (const path of ['/', '/tables', '/tables/a']) { const h = await fetch(`${s5.url}${path}`, { method: 'HEAD' }); ok(h.status === 200 && (await h.text()) === '', `HEAD ${path}: ${h.status}`); }
+await s5.close();
+rmSync(dir5, { recursive: true, force: true });
 
 // the vectro command: --version, and plain messages for a wrong --root or port (raw ENOENT / ENOTDIR / RangeError before)
 const { spawnSync } = await import('node:child_process');
