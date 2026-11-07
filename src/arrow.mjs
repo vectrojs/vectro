@@ -444,7 +444,10 @@ export function readArrow(bytes, { columns: pick } = {}) {
     },
     onBatch(rows, cols) { parts.push([rows, cols]); }, // views stay valid: all bytes are pushed at once
   });
-  reader.push(bytes);
+  try { reader.push(bytes); } catch (err) { // (damaged bytes: a raw "Offset is outside the bounds of the DataView" before)
+    if (/^vectro/.test(err.message)) throw err;
+    throw new Error(`vectro: the Arrow data is damaged or isn't Arrow IPC (${err.message})`);
+  }
   if (!names) throw new Error('vectro: no Arrow schema found (is this Arrow IPC data?)');
   if (reader.len && !reader.ended) throw new Error('vectro: the Arrow data ends in the middle of a message (truncated?)');
   const rows = parts.reduce((a, [n]) => a + n, 0);
