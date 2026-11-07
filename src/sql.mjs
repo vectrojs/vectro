@@ -880,7 +880,7 @@ function compileSelect(ast, env, outer, tail) {
         const l = le.k === 'col' ? le : { k: 'col', name: `__jl${n.hidden}`, hidden: hide(translate(le, plain), '__jl') };
         let r = re;
         if (re.k !== 'col') { r = { k: 'col', table: j.alias, name: `__jr${n.hidden++}` }; exprKeys.push({ e: re, alias: r.name }); }
-        return { k: 'bin', op, l, r };
+        return { k: 'bin', op, l, r, orig: c }; // (orig: checked on the pairs, it reads the expression itself)
       });
       if (cs.length !== conjuncts(j.on).length || cs.some((c, i) => c !== conjuncts(j.on)[i])) {
         j = { ...j, on: andAll(cs) };
@@ -926,6 +926,9 @@ function compileSelect(ast, env, outer, tail) {
       // rows that keep no pair still come out)
       if (!lefts.length && ranges.length) joinRange = ranges.shift().range;
       conds.push(...ranges.map((x) => x.c));
+      // (a comparison with an expression whose hidden column isn't the join's key: as written, since the
+      // hidden column is on the left table only, not on the pairs; ON a.v < b.v AND b.v < a.v + 2)
+      for (let i = 0; i < conds.length; i++) if (conds[i].orig) conds[i] = conds[i].orig;
       if (!lefts.length && !joinRange) {
         if (outerJoin) joinCross = true;
         else { const k = `__x${n.hidden++}`; q = q.derive(k, '0'); rq = rq.derive(k, '0'); lefts.push(k); rights.push(k); } // (as CROSS JOIN)
