@@ -92,6 +92,9 @@ class Client {
         cur.rows.push(row);
       } else if (m.type === 'C') { (cur ??= {}).tag = m.body.toString().replace(/\0$/, ''); if (!out.includes(cur)) out.push(cur); cur = null; }
       else if (m.type === 's') { (cur ??= { rows: [] }).suspended = true; if (!out.includes(cur)) out.push(cur); cur = null; }
+      else if (m.type === 'H') { cur = { copy: [] }; out.push(cur); } // (COPY ... TO STDOUT: its lines)
+      else if (m.type === 'd') cur.copy.push(m.body.toString());
+      else if (m.type === 'c') { /* CopyDone: the tag follows */ }
       else if (m.type === 'E') out.push({ error: this.fields(m.body) });
       else if (m.type === 't') out.push({ params: Array.from({ length: m.body.readInt16BE(0) }, (_, i) => m.body.readInt32BE(2 + 4 * i)) });
       else if (m.type === 'Z') { this.tx = String.fromCharCode(m.body[0]); return out; }
@@ -194,6 +197,14 @@ for (const text of QUERIES) {
   check(same(got?.rows, want.rows) && got.tag === `SELECT ${want.rows.length}`, `rows: ${text}\n  got  ${JSON.stringify(got?.rows?.slice(0, 2))} ${got?.tag}\n  want ${JSON.stringify(want.rows.slice(0, 2))}`);
 }
 check(c.query === Client.prototype.query && (await c.query('SELECT 1 AS a; SELECT 2 AS b')).length === 2, 'two statements in one query');
+{ // COPY ... TO STDOUT (psql's \copy): text and CSV, NULL as \N / an empty field; COPY FROM is refused (read only)
+  const [t1] = await c.query("COPY (SELECT 1 AS a, 'x' || CHR(9) || 'y' AS b, NULL AS c) TO STDOUT");
+  check(same(t1.copy, ['1\tx\\ty\t\\N\n']) && t1.tag === 'COPY 1', `COPY TO STDOUT, text: ${JSON.stringify(t1)}`);
+  const [t2] = await c.query(`COPY (SELECT 1 AS a, 'say "hi"' AS b, NULL AS c) TO STDOUT WITH (FORMAT csv, HEADER)`);
+  check(same(t2.copy, ['a,b,c\n', '1,"say ""hi""",\n']), `COPY TO STDOUT, CSV with a header: ${JSON.stringify(t2)}`);
+  const [t3] = await c.query('COPY orders FROM STDIN');
+  check(t3.error && /read only/.test(t3.error.M), 'COPY FROM is refused');
+}
 // extended: a parameter, binary answers, a portal in parts, Describe of a statement
 {
   const text = 'SELECT cust, price, region, ts, day, price > $2 AS big FROM orders WHERE region = $1 ORDER BY ts, cust LIMIT 7';

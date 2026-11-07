@@ -17,7 +17,7 @@ import { readFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { sql, displayName } from '../sql.mjs';
 import { openTables } from './catalog.mjs';
-import { OID, TYPE_OF, typeLength, typeName, BINARY, paramLiteral, bindParams, dataRows, PgError } from './pgtypes.mjs';
+import { OID, TYPE_OF, typeLength, typeName, BINARY, paramLiteral, bindParams, dataRows, copyLines, PgError } from './pgtypes.mjs';
 import { describeTables, catalogTables, driverAnswer, readsCatalog, selectNames, plainOperators } from './pgcatalog.mjs';
 
 const VERSION = '16.0';
@@ -288,6 +288,14 @@ export async function servePg({ tables = {}, root = null, engine = null, catalog
         if (this.tx === 'E' && !/^\s*(rollback|abort|commit|end)\b/i.test(st)) throw new PgError('25P02', 'current transaction is aborted, commands ignored until end of transaction block');
         const res = await this.run(st);
         if (res.empty) { this.write(message('I')); continue; }
+        if (res.copy) { // CopyOutResponse (text, one format per column), the lines as CopyData, CopyDone
+          const head = Buffer.alloc(3 + 2 * res.columns.length);
+          head.writeInt8(0, 0); head.writeInt16BE(res.columns.length, 1);
+          this.write(message('H', head));
+          for (let a = 0; a < res.copy.length; a += BATCH) await this.writeAll(res.copy.slice(a, a + BATCH).map((line) => message('d', line)));
+          this.write(Buffer.concat([message('c'), complete(`COPY ${res.n}`)]));
+          continue;
+        }
         if (res.columns) {
           const formats = res.columns.map(() => (res.binary ? 1 : 0));
           this.write(rowDescription(res.columns, formats));
@@ -441,7 +449,17 @@ export async function servePg({ tables = {}, root = null, engine = null, catalog
         }
         case 'LISTEN': case 'UNLISTEN': case 'NOTIFY': return { tag: word };
         case 'ANALYZE': case 'VACUUM': case 'CHECKPOINT': return { tag: word };
-        case 'CREATE': case 'INSERT': case 'UPDATE': case 'DELETE': case 'DROP': case 'ALTER': case 'TRUNCATE': case 'COPY': case 'GRANT': case 'REVOKE': case 'MERGE': case 'COMMENT': case 'REFRESH': case 'LOCK': case 'CALL': case 'DO':
+        case 'COPY': { // COPY (query) TO STDOUT / COPY table [(cols)] TO STDOUT [WITH (FORMAT csv, HEADER, ...)]: it only reads (psql's \copy)
+          const m = /^\s*copy\s+(?:\(([\s\S]*)\)|("?)([^\s"(]+)\2\s*(?:\(([^)]*)\))?)\s+to\s+stdout\b([\s\S]*)$/i.exec(t);
+          if (!m) throw new PgError('25006', 'Vectro serves its tables read only: COPY works as COPY (query) TO STDOUT or COPY table TO STDOUT');
+          const opts = m[5] ?? '';
+          const csv = /\bformat\s*'?csv\b|\bcsv\b/i.test(opts), header = /\bheader\b(?!\s*(false|off|0)\b)/i.test(opts);
+          const delimiter = /\bdelimiter\s+(?:as\s+)?'((?:[^']|'')+)'/i.exec(opts)?.[1].replace(/''/g, "'");
+          const nullText = /\bnull\s+(?:as\s+)?'((?:[^']|'')*)'/i.exec(opts)?.[1].replace(/''/g, "'");
+          const res = await this.query(m[1] ?? `SELECT ${m[4] ?? '*'} FROM "${m[3]}"`);
+          return { copy: copyLines(res.columns, res.cell, res.n, { csv, header, ...(delimiter ? { delimiter } : {}), ...(nullText !== undefined ? { nullText } : {}) }), columns: res.columns, n: res.n };
+        }
+        case 'CREATE': case 'INSERT': case 'UPDATE': case 'DELETE': case 'DROP': case 'ALTER': case 'TRUNCATE': case 'GRANT': case 'REVOKE': case 'MERGE': case 'COMMENT': case 'REFRESH': case 'LOCK': case 'CALL': case 'DO':
           throw new PgError('25006', `Vectro serves its tables read only: ${word} is not possible here`);
         case 'PREPARE': case 'EXECUTE': throw new PgError('0A000', `${word} statements are not supported (use the extended query protocol)`);
         default: throw new PgError('42601', `syntax error at or near "${t.trim().split(/\s+/)[0]}"`);

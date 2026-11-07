@@ -197,3 +197,23 @@ export function dataRows(columns, formats, cell, from, to, keepEmpty) {
   }
   return buf.subarray(0, at);
 }
+
+// COPY ... TO STDOUT: the rows as lines, PostgreSQL's text format (tab between values, \N for NULL,
+// backslash escapes) or CSV (quotes where needed, an empty field for NULL), each line one Buffer.
+export function copyLines(columns, cell, n, { csv = false, header = false, delimiter = csv ? ',' : '\t', nullText = csv ? '' : '\\N' } = {}) {
+  const field = csv
+    ? (s) => (s === '' || /[",\r\n]/.test(s) || s.includes(delimiter) ? `"${s.replace(/"/g, '""')}"` : s)
+    : (s) => s.replace(/\\/g, '\\\\').replace(/\t/g, '\\t').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+  const lines = [];
+  if (header) lines.push(Buffer.from(columns.map((c) => (csv ? field(c.name) : field(c.name))).join(delimiter) + '\n'));
+  for (let i = 0; i < n; i++) {
+    const parts = columns.map((c, k) => {
+      const v = cell(i, k);
+      if (v === null || v === undefined || (typeof v === 'number' && v !== v)) return nullText;
+      const t = c.type === 'timestamp' && typeof v === 'number' ? fastTimestamp(v) : toPgText(c.type, v, false); // (missing text, '', is NULL, as in a SELECT)
+      return t === null ? nullText : field(t);
+    });
+    lines.push(Buffer.from(parts.join(delimiter) + '\n'));
+  }
+  return lines;
+}
