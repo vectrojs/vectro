@@ -4,7 +4,8 @@
 // with the same name on both sides showed the wrong label in the rows only
 // the right table has (the right table's code read in the left table's
 // dictionary). With a dataset on the left, right / full joins added the
-// right rows without a match once per chunk; they are refused now.
+// right rows without a match once per chunk; they are refused now. A range
+// op that isn't <, <=, > or >= ('==', '<>') was taken as '>='.
 import { Engine } from './test-mode.mjs';
 import { sql } from '../src/sql.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -37,6 +38,15 @@ same(a.join(c, { on: 'k', how: 'right' }).toRows(), [{ k: '名前', v: NaN, w: 1
 // numbers and two keys
 const n1 = engine.table({ k: [1, 2, 3], s: ['a', 'b', 'c'], v: [1, 2, 3] }), n2 = engine.table({ k: [5, 2, 3], s: ['e', 'b', 'x'], w: [1, 2, 3] });
 same(sorted(n1.join(n2, { on: ['k', 's'], how: 'full' }).toRows()), sorted([{ k: 2, s: 'b', v: 2, w: 2 }, { k: 1, s: 'a', v: 1, w: NaN }, { k: 3, s: 'c', v: 3, w: NaN }, { k: 5, s: 'e', v: NaN, w: 1 }, { k: 3, s: 'x', v: NaN, w: 3 }]), 'full join, two keys');
+
+// a range op that isn't a comparison is refused ('==' and '<>' were taken as '>='; with keys a TypeError)
+const r5 = engine.table({ a: [5, 6] });
+for (const op of ['==', '<>', '=', undefined]) {
+  fails(() => r5.join(r5, { on: [], range: { left: 'a', right: 'a', op } }).toRows(), `range op ${op}`);
+  fails(() => r5.join(r5, { on: 'a', range: { left: 'a', right: 'a', op } }).toRows(), `range op ${op} with keys`);
+}
+same(r5.join(r5, { on: [], range: { left: 'a', right: 'a', op: '>=' } }).count(), 3, 'range op >=');
+checks++; try { r5.join(r5, { on: 'a', how: 'outer' }); failures++; } catch (e) { if (!/'right' or 'full'/.test(e.message)) { failures++; console.log(`FAIL how message: ${e.message}`); } }
 
 // datasets on the left: right / full give each right row without a match once (or are refused)
 if (engine.writeDataset) {

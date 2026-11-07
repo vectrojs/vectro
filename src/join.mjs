@@ -38,7 +38,7 @@ export function* joinTablesG(L, R, opts = {}, makeTable) {
   const { on, how = 'inner', suffix = '_right' } = opts;
   const engine = L.engine;
   if (R.engine !== engine) throw new Error('vectro: join needs two tables of the same engine');
-  if (how !== 'inner' && how !== 'left') throw new Error(`vectro: join how must be 'inner' or 'left', got "${how}"`);
+  if (how !== 'inner' && how !== 'left') throw new Error(`vectro: join how must be 'inner', 'left', 'right' or 'full', got "${how}"`);
   if (L.type !== R.type) throw new Error('vectro: join needs two tables of the same number type (both float64 or both float32)');
   const [lk, rk] = parseOn(on);
   if (!lk.length || lk.length !== rk.length) throw new Error('vectro: join needs as many left keys as right keys');
@@ -572,6 +572,7 @@ export function* anyJoinG(L, R, opts, makeTable, keepG) {
   if (R.engine !== engine) throw new Error('vectro: join needs two tables of the same engine');
   if (!['inner', 'left', 'right', 'full'].includes(how)) throw new Error(`vectro: join how must be 'inner', 'left', 'right' or 'full', got "${how}"`);
   if (L.type !== R.type) throw new Error('vectro: join needs two tables of the same number type (both float64 or both float32)');
+  for (const r of [range, range2]) if (r && !COMPARE[r.op]) throw new Error(`vectro: join range op must be '<', '<=', '>' or '>=', got "${r.op}"`); // ('==' became '>=')
   const [lk, rk] = opts.on ? parseOn(opts.on) : [[], []];
   const nL = L.n, nR = R.n;
   // 1. the candidate pairs

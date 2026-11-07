@@ -109,7 +109,7 @@ for (const [label, make, opts] of engines) {
   for (const [label, f, text] of [
     ['unknown column', () => a.join(b, { on: 'nope' }), 'no column "nope"'],
     ['text vs number', () => a.join(b, { on: { left: 'name', right: 'id' } }), 'both be text or both numbers'],
-    ['bad how', () => a.join(b, { on: 'id', how: 'outer' }), "'inner' or 'left'"],
+    ['bad how', () => a.join(b, { on: 'id', how: 'outer' }), "'right' or 'full'"],
     ['no on', () => a.join(b, {}), 'join needs on'],
     ['key counts', () => a.join(b, { on: { left: ['id', 'name'], right: ['id'] } }), 'as many left keys'],
   ]) {
