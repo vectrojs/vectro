@@ -133,6 +133,8 @@ export class DatasetWriter {
     try {
       if (t.pred) { t = t.collect(); temps.push(t); }
       this.#schema(t);
+      const fit = this.#conform(t);
+      if (fit) { t = fit; temps.push(t); }
       hi = Math.min(hi, t.n);
       while (this.pendingRows + hi - lo >= this.rowsPerChunk) { // a full chunk: the waiting rows and the first of these
         const take = this.rowsPerChunk - this.pendingRows;
@@ -217,10 +219,43 @@ export class DatasetWriter {
     if (names.length !== want.length || want.some((c) => !t.cols.has(c.name))) {
       throw new Error(`vectro: appended columns (${names.join(', ')}) differ from the dataset's (${want.map((c) => c.name).join(', ')})`);
     }
-    for (const c of want) {
-      const k = kindOf(t.cols.get(c.name));
-      if (k !== c.kind) throw new Error(`vectro: column "${c.name}" is ${k} here but ${c.kind} in the dataset`);
-    }
+  }
+
+  // Columns of t whose kind isn't the dataset's but lose nothing as its kind: text as categories or
+  // free text (either way round), and a column with no values (no rows, or all missing: a plain []
+  // or [null, null] makes a number column). Returns a table of the dataset's kinds, or null. (Such a
+  // batch was refused: "column "note" is number here but category in the dataset".)
+  #conform(t) {
+    const kindOf = (c) => (c.strings ? 'text' : c.dict ? 'category' : c.date ? 'date' : 'number');
+    const fix = this.meta.columns.filter((c) => kindOf(t.cols.get(c.name)) !== c.kind);
+    if (!fix.length) return null;
+    const { engine } = this, n = t.n, plain = t.toColumns();
+    const cols = new Map(t.cols), owned = [], ownedBuffers = [];
+    const out = new Table(engine, cols, n, { owned, ownedBuffers, zones: false }); // (t's other columns as they are; t outlives it)
+    try {
+      for (const c of fix) {
+        const k = kindOf(t.cols.get(c.name)), v = plain[c.name];
+        const texts = v.codes ? Array.from(v.codes, (i) => v.labels[i]) : Array.isArray(v) ? v : null;
+        const empty = texts ? texts.every((s) => s === '') : v.every((x) => x !== x);
+        if (!empty && !(texts && (c.kind === 'category' || c.kind === 'text'))) throw new Error(`vectro: column "${c.name}" is ${k} here but ${c.kind} in the dataset`);
+        let col;
+        if (c.kind === 'number' || c.kind === 'date') col = { data: engine.alloc(t.type, n).fill(NaN), dict: null, codes: null, date: c.kind === 'date' };
+        else if (c.kind === 'category') {
+          const codes = new Map([['', 0]]), dict = [''], data = engine.alloc(t.type, n);
+          for (let i = 0; i < n; i++) {
+            const s = texts ? texts[i] : '';
+            let code = codes.get(s);
+            if (code === undefined) { code = dict.length; dict.push(s); codes.set(s, code); }
+            data[i] = code;
+          }
+          col = { data, dict, codes };
+        } else col = freeText(engine, texts ?? new Array(n).fill(''));
+        cols.set(c.name, col);
+        owned.push(c.name);
+        if (col.strings) ownedBuffers.push(col.strings);
+      }
+    } catch (err) { out.dispose(); throw err; }
+    return out;
   }
 
   // Rows [lo, hi) of t as one chunk: plain values (text as dataset codes),
@@ -297,6 +332,23 @@ export class DatasetWriter {
     this.pos += u8.length;
     return { off, len: u8.length };
   }
+}
+
+// Strings as a free-text column: their UTF-8 bytes, and each value's place in them ('' is missing).
+function freeText(engine, texts) {
+  const enc = new TextEncoder(), parts = texts.map((s) => (s === '' ? null : enc.encode(s)));
+  const total = parts.reduce((a, b) => a + (b ? b.length : 0), 0);
+  for (const b of parts) if (b && b.length >= STR_ESCAPED) throw new Error(`vectro: a free-text value of ${b.length} bytes is over the ${STR_ESCAPED - 1} a free-text column holds`);
+  const data = engine.alloc(Float64Array, texts.length), strings = engine.alloc(Uint8Array, total);
+  const d = engine.live(data), sb = engine.live(strings);
+  for (let i = 0, at = 0; i < parts.length; i++) {
+    const b = parts[i];
+    if (!b) { d[i] = NaN; continue; }
+    sb.set(b, at);
+    d[i] = at * STR_SHIFT + b.length;
+    at += b.length;
+  }
+  return { data, dict: null, codes: null, strings };
 }
 
 // Codes first, first + step, first + 2 * step... (row numbers, times at a

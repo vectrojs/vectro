@@ -61,6 +61,43 @@ if (node) {
   same(attempt(() => engine.writeDataset(p, { v: [6] }, { append: true }).rows), 2, 'free again after a failed append');
 }
 
+// A dataset writer refused batches that lose nothing in the dataset's column kinds: an empty batch
+// or a column of only nulls (plain [] / [null] are number columns), and text into a free-text column
+// (plain strings are categories). A feed whose optional field is null for a whole batch stopped.
+if (node) {
+  const rowsOf = (p) => { const ds = engine.openDataset(p); try { return [ds.columnNames, ds.toRows()]; } finally { ds.close(); } };
+  const p = join(dir, 'kinds.vectro');
+  const w = engine.createDataset(p, { rowsPerChunk: 3 });
+  w.append({ k: ['a', 'b'], v: [1, 2], d: [new Date(0), new Date(86400000)] });
+  w.append({ k: [], v: [], d: [] });
+  w.append({ k: [null, null], v: [3, null], d: [null, null] });
+  w.append({ k: ['c'], v: [null], d: [new Date(172800000)] });
+  w.append(engine.table({ k: ['z'], v: [9], d: [new Date(0)] }).filter('v > 100'));
+  w.close();
+  same(rowsOf(p), [['k', 'v', 'd'], [
+    { k: 'a', v: 1, d: new Date(0) }, { k: 'b', v: 2, d: new Date(86400000) },
+    { k: '', v: 3, d: null }, { k: '', v: NaN, d: null }, { k: 'c', v: NaN, d: new Date(172800000) }]].map((x) => JSON.parse(str(x))), 'writer: empty and all-null batches take the dataset\'s kinds');
+  const ds = engine.openDataset(p);
+  same(ds.groupBy('k').agg({ n: 'count()' }).sort('k').toRows(), [{ k: 'a', n: 1 }, { k: 'b', n: 1 }, { k: 'c', n: 1 }, { k: '', n: 2 }], 'writer: all-null text is missing text (sorted last)');
+  ds.close();
+  fails(() => engine.writeDataset(p, { k: ['x'], v: ['oops'], d: [null] }, { append: true }), /"v" is category here but number/, 'text into a number column is still refused');
+  fails(() => engine.writeDataset(p, { k: [1], v: [1], d: [null] }, { append: true }), /"k" is number here but category/, 'numbers into a text column are still refused');
+  // free text (from a CSV) and categories, either way round
+  let csv = 'email,n\n';
+  for (let i = 0; i < 60; i++) csv += `u${i}@x.com,${i}\n`;
+  const c = join(dir, 'emails.csv'), e = join(dir, 'emails.vectro');
+  writeFileSync(c, csv);
+  engine.csvToDataset(c, e);
+  same(attempt(() => engine.writeDataset(e, { email: ['new@x.com', null, 'ünï 🙂'], n: [100, 101, 102] }, { append: true }).rows), 63, 'plain strings appended to a free-text column');
+  same(attempt(() => engine.writeDataset(e, engine.parseCSV(csv, { types: { email: 'category' } }), { append: true }).rows), 123, 'a category appended to a free-text column');
+  same(rowsOf(e)[1].slice(60, 63), [{ email: 'new@x.com', n: 100 }, { email: '', n: 101 }, { email: 'ünï 🙂', n: 102 }], 'free text appended reads back');
+  same(rowsOf(e)[1].slice(-1), [{ email: 'u59@x.com', n: 59 }], 'category appended to free text reads back');
+  const k = join(dir, 'cat.vectro');
+  engine.writeDataset(k, { email: ['a@x', 'b@x'], n: [1, 2] });
+  same(attempt(() => engine.writeDataset(k, engine.parseCSV(csv), { append: true }).rows), 62, 'free text appended to a category column');
+  same(rowsOf(k)[1].slice(-2), [{ email: 'u58@x.com', n: 58 }, { email: 'u59@x.com', n: 59 }], 'free text appended to a category reads back');
+}
+
 rmSync(dir, { recursive: true, force: true });
 await engine.close();
 console.log(`audit r6 loading: ${checks - failures}/${checks} checks passed`);
