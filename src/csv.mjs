@@ -66,7 +66,18 @@ export function crOnlyToLF(b) {
   return true;
 }
 
+// Options every CSV loader takes, checked before anything is read. (A wrong one failed inside, as
+// "Cannot read properties of undefined (reading 'enc')" for columns: [], or silently: type: Int32Array
+// stored 2024 dates as 1969, sampleRows: 0 guessed from no rows.)
+export function checkCSVOptions({ types, columns, type, sampleRows } = {}) {
+  if (types !== undefined && (types === null || typeof types !== 'object' || Array.isArray(types))) throw new Error("vectro: types must be an object of column types, such as { zip: 'category' }");
+  if (columns !== undefined && columns !== null && (!Array.isArray(columns) || !columns.length || columns.some((c) => typeof c !== 'string'))) throw new Error("vectro: columns must be an array of one or more column names, such as ['ts', 'price']");
+  if (type !== undefined && type !== Float64Array && type !== Float32Array) throw new Error('vectro: type must be Float64Array or Float32Array');
+  if (sampleRows !== undefined && !(Number.isInteger(sampleRows) && sampleRows >= 1)) throw new Error('vectro: sampleRows must be a whole number, 1 or more');
+}
+
 function* loadBytesG(engine, bytes, opts = {}) {
+  checkCSVOptions(opts);
   crOnlyToLF(engine.live(bytes));
   const { delimiter = ',', header = true, types = {}, columns: only = null, type = Float64Array, sampleRows = 1000, chunkBytes = CHUNK_BYTES, pieces = null, onPieceRows = null, checkTypes = null, badType = 'retype', trimEnd = true } = opts;
   const temp = [bytes];

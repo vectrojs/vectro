@@ -38,7 +38,7 @@ import { KINDS, decodeOne } from './pack.mjs';
 import { conditions, mayMatch, computeZones } from './zones.mjs';
 import { STR_SHIFT, STR_ESCAPED, csvRowEnds } from './csv-kernel.mjs';
 import { trackAsyncMethods } from './engine.mjs';
-import { inspectCSV, loadBytes, loadBytesAsync, crOnlyToLF } from './csv.mjs';
+import { inspectCSV, loadBytes, loadBytesAsync, crOnlyToLF, checkCSVOptions } from './csv.mjs';
 import { freeBuild } from './join.mjs';
 import { copyRows, plainInto, remapCodes, textLength } from './rows.mjs';
 export { copyRows };
@@ -1821,8 +1821,12 @@ export async function csvToDatasetAsync(engine, csv, out, opts = {}) {
 // engine bytes, opts } (a table) and { flush } (wait for the writer); appends
 // each piece's rows to the writer (aborted on an error).
 // opts.onProgress({ bytes, size, rows }) is called after each piece.
-function* csvPiecesG(engine, size, writer, { pieceBytes = 64 << 20, header = true, delimiter = ',', types = {}, sampleRows, rowsPerChunk, bitPack, append, onProgress, ...rest } = {}) {
+function* csvPiecesG(engine, size, writer, opts = {}) {
+  let { pieceBytes = 64 << 20, header = true, delimiter = ',', types = {}, sampleRows, rowsPerChunk, bitPack, append, onProgress, ...rest } = opts;
   try {
+    checkCSVOptions(opts);
+    if (!(pieceBytes >= 1)) throw new Error('vectro: pieceBytes must be 1 or more'); // (0 read nothing, forever)
+    pieceBytes = Math.floor(pieceBytes);
     let pos = 0, carry = new Uint8Array(0), head = new Uint8Array(0), kinds = null, crOnly = null;
     const last0 = (at) => at >= size;
     while (true) {

@@ -171,6 +171,41 @@ if (node) {
   await split.close();
 }
 
+// Wrong CSV options: csvToDataset with pieceBytes: 0 never ended; type: Int32Array stored 2024 dates
+// as 1969 without a word; columns: [], types: null failed inside the engine; sampleRows: 0 guessed
+// types from no rows (and the error then said "in the first 1000 rows").
+{
+  const csv = 'a,b,c\n1,x,2024-01-01\n2,y,2024-01-02\n';
+  const bad = [
+    [{ type: Int32Array }, /type must be Float64Array or Float32Array/],
+    [{ columns: [] }, /columns must be an array/],
+    [{ columns: 'a' }, /columns must be an array/],
+    [{ types: null }, /types must be an object/],
+    [{ types: 'number' }, /types must be an object/],
+    [{ types: ['number'] }, /types must be an object/],
+    [{ sampleRows: 0 }, /sampleRows must be/],
+    [{ sampleRows: -1 }, /sampleRows must be/],
+    [{ sampleRows: NaN }, /sampleRows must be/],
+  ];
+  for (const [o, re] of bad) fails(() => engine.parseCSV(csv, o), re, `parseCSV ${str(o)}`);
+  same(attempt(() => engine.parseCSV(csv, { sampleRows: 1, type: Float32Array, columns: ['a', 'b'], types: {} }).toRows()), [{ a: 1, b: 'x' }, { a: 2, b: 'y' }], 'good options still load');
+  if (node) {
+    const p = join(dir, 'opts.csv');
+    writeFileSync(p, csv);
+    for (const [o, re] of [...bad, [{ pieceBytes: 0 }, /pieceBytes must be/], [{ pieceBytes: -5 }, /pieceBytes must be/], [{ pieceBytes: NaN }, /pieceBytes must be/]]) {
+      fails(() => engine.csvToDataset(p, join(dir, 'opts.vectro'), o), re, `csvToDataset ${str(o)}`);
+    }
+    same(attempt(() => engine.csvToDataset(p, join(dir, 'opts.vectro'), { pieceBytes: 2.5 }).rows), 2, 'csvToDataset pieceBytes 2.5 (whole bytes)');
+    let err = null;
+    try { await engine.csvToDatasetAsync(p, join(dir, 'opts.vectro'), { pieceBytes: 0 }); } catch (e) { err = e.message; }
+    same(/pieceBytes must be/.test(err), true, 'csvToDatasetAsync pieceBytes: 0');
+    const { SplitEngine } = await import('../src/node.mjs');
+    const split = new SplitEngine({ workers: 1 });
+    for (const [o, re] of bad) { let m = null; try { await split.parseCSVAsync(csv, o); } catch (e) { m = e.message; } same(re.test(m), true, `split parseCSVAsync ${str(o)}`); }
+    await split.close();
+  }
+}
+
 rmSync(dir, { recursive: true, force: true });
 await engine.close();
 console.log(`audit r6 loading: ${checks - failures}/${checks} checks passed`);
