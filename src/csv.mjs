@@ -89,7 +89,7 @@ function* loadBytesG(engine, bytes, opts = {}) {
       let kind = info.kinds[f];
       // free text is stored as byte offsets, which float32 can't hold exactly: a category instead
       if (kind === 'string' && type === Float32Array) {
-        if (types[nm] === 'string') throw new Error(`vectro: "${nm}" is a free-text column, and a Float32Array table can't hold its byte offsets exactly; load it with types: { ${nm}: 'category' }, or use the default Float64Array`);
+        if (Object.hasOwn(types, nm) && types[nm] === 'string') throw new Error(`vectro: "${nm}" is a free-text column, and a Float32Array table can't hold its byte offsets exactly; load it with types: { ${nm}: 'category' }, or use the default Float64Array`);
         kind = 'category';
       }
       out.push({ name: nm, kind: KIND[kind], date: kind === 'date' });
@@ -269,7 +269,7 @@ export function inspectCSV(bytes, { delimiter = ',', header = true, types = {}, 
   // text that repeats (regions, statuses) is a category.
   const guess = (k) => (isNumber[k] ? 'number' : isDate[k] && filled[k] ? 'date' : filled[k] >= 50 && distinct[k].size > filled[k] / 2 ? 'string' : 'category');
   const kinds = names.map((nm, f) => {
-    let kind = types[nm] ?? guess(f);
+    let kind = (Object.hasOwn(types, nm) ? types[nm] : undefined) ?? guess(f); // (not types.constructor: a column named so)
     if (kind === 'text') kind = guess(f) === 'string' ? 'string' : 'category';
     if (!(kind in KIND)) throw new Error(`vectro: type for "${nm}" must be 'number', 'category', 'string', 'text' or 'date'`);
     return kind;
