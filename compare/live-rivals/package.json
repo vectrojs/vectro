@@ -1,0 +1,11 @@
+{
+  "name": "vectro-live-rivals",
+  "private": true,
+  "type": "module",
+  "description": "Live sync latency: Vectro vs Hasura live queries vs Firestore listeners (see README.md)",
+  "dependencies": {
+    "firebase": "^13.2.0",
+    "firebase-tools": "^15.35.0",
+    "pg": "^8.23.1"
+  }
+}

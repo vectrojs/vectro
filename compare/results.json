@@ -617,5 +617,154 @@
         "bytes_p50": 3758
       }
     ]
+  },
+  "liveCompared": {
+    "title": "Live sync compared: from a change to the client having the new answer (same orders, same query, same changes)",
+    "scripts": "bench/bench-live.mjs (Vectro), compare/live-rivals/bench-hasura.mjs, compare/live-rivals/bench-firestore.mjs",
+    "date": "2026-11-08",
+    "vectroCommit": "0c6cd82",
+    "machine": "Apple M1 Pro, 8 cores, 16 GB, Node 25.2.1; everything on this one laptop (no network)",
+    "query": "revenue and order count per product (1,000 products), sorted by revenue",
+    "systems": {
+      "vectro": "live-sync branch: serve({ live }) + connectLive; runs the query again on a change and sends only the difference (see the live section)",
+      "hasura": "Hasura GraphQL Engine v2.50.8 + PostgreSQL 16.15, both in Docker; the query is a view (no GROUP BY in Hasura GraphQL), watched as a subscription (graphql-transport-ws); Hasura runs it again every refetch interval (1,000 ms default; also 100 ms) and sends the whole answer when it changed",
+      "firestore": "Cloud Firestore emulator v1.22.0 (firebase-tools 15.35.0, JS SDK 13.2.0, Java 21); Firestore can't keep a GROUP BY live, so the writer keeps the per-product totals itself (one batch: the order update + FieldValue.increment on its product's total) and the client listens to the totals ordered by revenue (onSnapshot); writer and listener are separate clients"
+    },
+    "load": "Vectro 2.31 before / 1.83 after; Hasura 1 s 3.18 / 3.86; Hasura 100 ms 3.64 / 2.91; Firestore 3.85 / 4.61 (one benchmark at a time; the emulator's own Java pushed the load up during its run)",
+    "note": "p50 / p99 ms from the write's start to the client receiving (Vectro: and applying) the change. Vectro: 200 samples, bytes = WebSocket text per change. Hasura: 60 samples at 1 s and 100 at 100 ms, random pauses so changes land anywhere in the refetch cycle; bytes = the subscription message (the whole 1,000-row answer). Firestore: 200 samples; bytes not measured (gRPC), docs = changed documents in the snapshot; 1M orders not loaded (the listener reads only the 1,000 totals, so the order count doesn't change its work; loading 1M into the emulator would take about 4 minutes). The emulator is not production Firestore: production adds the network round trip to Google's servers. Postgres query time for the view: 4.9 ms at 10k rows, 75-97 ms at 1M.",
+    "rows": [
+      {
+        "rows": 10000,
+        "changed": 1,
+        "vectro": {
+          "p50": 6,
+          "p99": 55.88,
+          "bytes": 135
+        },
+        "hasura_1000ms": {
+          "p50": 484.12,
+          "p99": 1023.82,
+          "bytes": 42304
+        },
+        "hasura_100ms": {
+          "p50": 81.88,
+          "p99": 198.21,
+          "bytes": 42304
+        },
+        "firestore": {
+          "p50": 43.66,
+          "p99": 70.5
+        }
+      },
+      {
+        "rows": 10000,
+        "changed": 100,
+        "vectro": {
+          "p50": 6.24,
+          "p99": 12,
+          "bytes": 3494
+        },
+        "hasura_1000ms": {
+          "p50": 418.65,
+          "p99": 1004.64,
+          "bytes": 42297
+        },
+        "hasura_100ms": {
+          "p50": 64.8,
+          "p99": 130.52,
+          "bytes": 42293
+        },
+        "firestore": {
+          "p50": 66.49,
+          "p99": 122.15
+        }
+      },
+      {
+        "rows": 100000,
+        "changed": 1,
+        "vectro": {
+          "p50": 6.02,
+          "p99": 9.96,
+          "bytes": 137
+        },
+        "hasura_1000ms": {
+          "p50": 491.01,
+          "p99": 1055.89,
+          "bytes": 44462
+        },
+        "hasura_100ms": {
+          "p50": 84.33,
+          "p99": 178.09,
+          "bytes": 44462
+        },
+        "firestore": {
+          "p50": 48.53,
+          "p99": 56.43
+        }
+      },
+      {
+        "rows": 100000,
+        "changed": 100,
+        "vectro": {
+          "p50": 6.51,
+          "p99": 56.8,
+          "bytes": 3579
+        },
+        "hasura_1000ms": {
+          "p50": 609.5,
+          "p99": 1067.36,
+          "bytes": 44462
+        },
+        "hasura_100ms": {
+          "p50": 82.84,
+          "p99": 176.36,
+          "bytes": 44463
+        },
+        "firestore": {
+          "p50": 72.7,
+          "p99": 81.75
+        }
+      },
+      {
+        "rows": 1000000,
+        "changed": 1,
+        "vectro": {
+          "p50": 12.46,
+          "p99": 15.04,
+          "bytes": 139
+        },
+        "hasura_1000ms": {
+          "p50": 598.25,
+          "p99": 1053.43,
+          "bytes": 46446
+        },
+        "hasura_100ms": {
+          "p50": 121.56,
+          "p99": 226.16,
+          "bytes": 46446
+        },
+        "firestore": null
+      },
+      {
+        "rows": 1000000,
+        "changed": 100,
+        "vectro": {
+          "p50": 12.69,
+          "p99": 14,
+          "bytes": 3758
+        },
+        "hasura_1000ms": {
+          "p50": 717.65,
+          "p99": 1155.55,
+          "bytes": 46446
+        },
+        "hasura_100ms": {
+          "p50": 112.29,
+          "p99": 229.55,
+          "bytes": 46446
+        },
+        "firestore": null
+      }
+    ]
   }
 }
