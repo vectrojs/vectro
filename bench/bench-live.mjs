@@ -19,8 +19,8 @@ const SAMPLES = Number(process.env.SAMPLES ?? 200);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const q = (a, p) => { const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(s.length * p))]; };
 const r2 = (x) => Math.round(x * 100) / 100;
-let seed = 1;
-const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+let seed = 1; // (mulberry32: a 32-bit generator that stays exact in doubles)
+const rand = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 
 const regions = ['EU', 'US', 'APAC', 'LATAM', 'MEA', 'UK', 'CA', 'ANZ'];
 const GROUP = 'SELECT product, SUM(price * qty) AS revenue, COUNT(*) AS n FROM orders GROUP BY product ORDER BY revenue DESC';
@@ -44,19 +44,21 @@ for (const size of SIZES) {
   await wait(100); // (the clock offset ping is in)
   for (const n of CHANGES) {
     const total = [], build = [], server = [], bytes = [];
+    let missing = 0;
     for (let i = 0; i < SAMPLES + 10; i++) {
       const b0 = s.live.stats.bytes;
-      const done = new Promise((r) => { got = r; });
+      const done = new Promise((r) => { got = r; setTimeout(() => r(null), 5000); }); // (no patch in 5 s: counted as missing)
       const t0 = performance.now();
       orders.upsert(Array.from({ length: n }, () => ({ id: Math.floor(rand() * size), price: Math.round(1 + rand() * 999) })));
       const c = await done;
       const ms = performance.now() - t0;
+      if (!c) { missing++; continue; }
       await wait(25); // (the other watch's patch, if any, is sent; the server is quiet again)
       if (i < 10) continue; // (warm-up)
       total.push(ms); build.push(s.live.stats.buildMs); server.push(c.ms); bytes.push(s.live.stats.bytes - b0);
     }
     const row = {
-      rows: size, changed: n, samples: SAMPLES,
+      rows: size, changed: n, samples: total.length, missing,
       p50_ms: r2(q(total, 0.5)), p99_ms: r2(q(total, 0.99)),
       build_p50_ms: r2(q(build, 0.5)), query_diff_p50_ms: r2(q(server, 0.5)),
       bytes_p50: q(bytes, 0.5),
