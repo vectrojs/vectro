@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**SQL**
+- A subquery in `FROM` or `JOIN` no longer needs a name, as in DuckDB and
+  PostgreSQL 16: `SELECT * FROM (SELECT ...)` works, and the subquery is
+  called `unnamed_subquery` (then `unnamed_subquery2`, ...), the same names
+  DuckDB gives (`test/test-sql-unnamed-subquery.mjs`).
+
 ## 0.2.1
 
 Fixes from audit round 6 (the published 0.2.0 checked again against DuckDB

@@ -116,7 +116,7 @@ const SOFT = new Set(['OVER', 'PARTITION', 'ROWS', 'RANGE', 'UNBOUNDED', 'PRECED
 
 function parseStatement(src, fold = false) {
   const toks = tokenize(src, fold);
-  let p = 0;
+  let p = 0, unnamed = 0;
   const peek = (o = 0) => toks[p + o];
   const isKw = (v, o = 0) => peek(o)?.t === 'kw' && peek(o).v === v;
   const isWord = (v, o = 0) => isKw(v, o) || (peek(o)?.t === 'id' && !peek(o).quoted && peek(o).v.toUpperCase() === v);
@@ -364,9 +364,9 @@ function parseStatement(src, fold = false) {
       if (!startsQuery()) fail(`expected a subquery (SELECT ...) ${near()}`);
       const q = query();
       needOp(')');
-      eatKw('AS');
-      if (peek()?.t !== 'id') fail('a subquery in FROM needs a name: (SELECT ...) AS name');
-      return { q, alias: ident() };
+      // the name is optional, as in DuckDB and PostgreSQL 16: without one it is unnamed_subquery, unnamed_subquery2, ...
+      if (eatKw('AS') || aliasNext()) return { q, alias: ident() };
+      return { q, alias: `unnamed_subquery${++unnamed > 1 ? unnamed : ''}` };
     }
     let name = ident(), schema = null;
     while (eatOp('.')) { schema = name; name = ident(); } // schema.table (db.schema.table: the last two)

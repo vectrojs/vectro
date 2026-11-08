@@ -211,7 +211,6 @@ for (const [label, make] of [['threads', () => new Engine()], ['single thread', 
     ['SELECT cust FROM orders o WHERE price > (SELECT MAX(price) FROM prices p WHERE p.price > o.price)', 'outer query'],
     ['SELECT * FROM orders o FULL JOIN customers c ON o.cust = c.cust AND o.price > (SELECT MIN(price) FROM orders)', "needs a step the join can't run"],
     ['SELECT CAST(region AS BLOB) FROM orders', 'CAST to BLOB'],
-    ['SELECT * FROM (SELECT cust FROM orders)', 'needs a name'],
     ['SELECT PERCENTILE_CONT(0.5) FROM orders', 'WITHIN GROUP'],
     ['SELECT cust FROM orders INTERSECT ALL SELECT cust FROM customers', 'INTERSECT ALL'],
   ]) {
