@@ -8,6 +8,23 @@
   called `unnamed_subquery` (then `unnamed_subquery2`, ...), the same names
   DuckDB gives (`test/test-sql-unnamed-subquery.mjs`).
 
+**Live sync** (`docs/live-sync.md`). A page watches SQL over a WebSocket;
+when the data changes, the server runs only the queries that read the
+changed table, compares the new answer with the old one by key, and sends
+only the difference. The page applies it: rows appear, disappear, change and
+move to their new place in sorted order, with the fewest moves.
+- `liveTable({ key, columns })` (`vectrojs/serve`): a table that changes by
+  key, with `insert`, `upsert` (only the columns given) and `delete`.
+- `serve({ live: { orders } })`: a WebSocket at `/live` (the token as
+  `?token=`); live tables are also served to `/sql` and the other endpoints.
+  `server.live.changed(name)` / `replace(name, table)` for other tables.
+- `connectLive(url).watch(sql, { key }, (rows, change) => ...)`
+  (`vectrojs/live`): no wasm, no dependencies; reconnects by itself.
+- Changes are merged per key; queries run at most once per 16 ms; watchers of
+  the same SQL share one run; a slow client gets one fresh answer instead of
+  a queue of differences; nothing runs while nothing changes.
+- Demo: `node examples/live/server.mjs`; latency: `npm run bench:live`.
+
 ## 0.2.1
 
 Fixes from audit round 6 (the published 0.2.0 checked again against DuckDB
