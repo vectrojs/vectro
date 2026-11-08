@@ -551,5 +551,71 @@
     "csv": 59.3
    }
   ]
- }
+ },
+  "live": {
+    "title": "Live sync: from a change in the data to the client having the new answer",
+    "script": "bench/bench-live.mjs (branch live-sync, not released)",
+    "date": "2026-11-08",
+    "vectroCommit": "0c6cd82",
+    "load": "2.31 before, 1.83 after (one benchmark at a time)",
+    "machine": "Apple M1 Pro, 8 cores, 16 GB, Node 25.2.1",
+    "query": "SELECT product, SUM(price * qty) AS revenue, COUNT(*) AS n FROM orders GROUP BY product ORDER BY revenue DESC (1,000 products), watched with key product; a second watch (top 100 EU orders by price) open at the same time",
+    "note": "server (serve({ live })) and client (connectLive over a WebSocket) in one process, one clock; 200 samples per row after 10 warm-ups, 25 ms pause between samples; changed = rows upserted at once (new price); p50/p99 = from orders.upsert() to the client's rows updated; build = copying the live table into an engine table; query_diff = running the SQL and diffing it with the last answer; bytes = WebSocket text sent per change (both watches). The p99 of 56 ms in two rows is single outliers (timer / GC); the other rows' p99 is 10-15 ms.",
+    "rows": [
+      {
+        "rows": 10000,
+        "changed": 1,
+        "p50_ms": 6,
+        "p99_ms": 55.88,
+        "build_p50_ms": 0.46,
+        "query_diff_p50_ms": 3.42,
+        "bytes_p50": 135
+      },
+      {
+        "rows": 10000,
+        "changed": 100,
+        "p50_ms": 6.24,
+        "p99_ms": 12,
+        "build_p50_ms": 0.44,
+        "query_diff_p50_ms": 3.34,
+        "bytes_p50": 3494
+      },
+      {
+        "rows": 100000,
+        "changed": 1,
+        "p50_ms": 6.02,
+        "p99_ms": 9.96,
+        "build_p50_ms": 1.36,
+        "query_diff_p50_ms": 3.14,
+        "bytes_p50": 137
+      },
+      {
+        "rows": 100000,
+        "changed": 100,
+        "p50_ms": 6.51,
+        "p99_ms": 56.8,
+        "build_p50_ms": 1.37,
+        "query_diff_p50_ms": 3.27,
+        "bytes_p50": 3579
+      },
+      {
+        "rows": 1000000,
+        "changed": 1,
+        "p50_ms": 12.46,
+        "p99_ms": 15.04,
+        "build_p50_ms": 6.73,
+        "query_diff_p50_ms": 2.46,
+        "bytes_p50": 139
+      },
+      {
+        "rows": 1000000,
+        "changed": 100,
+        "p50_ms": 12.69,
+        "p99_ms": 14,
+        "build_p50_ms": 6.73,
+        "query_diff_p50_ms": 2.43,
+        "bytes_p50": 3758
+      }
+    ]
+  }
 }
