@@ -779,6 +779,8 @@ const orders = await split.streamAsync({ format: 'arrow', columns: { ts: 'number
 | `vectrojs/browser` → `SplitEngine` | Any page | Each Web Worker owns a share of the rows; async API |
 | `vectrojs/portable` | Cloudflare Workers and other edge runtimes | One thread; a precompiled 11 KB module plus a vectorized interpreter |
 
+In a page without the COOP/COEP headers, `Engine` runs on one thread and logs a warning once; use `SplitEngine` there, or send the headers.
+
 Tested in Node 20, 22, 24 and 25 (Linux, macOS, Windows), Chrome, Safari 26.5, Firefox 158, Safari on iOS (real
 iPhone) and Cloudflare Workers.
 

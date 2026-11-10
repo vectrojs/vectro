@@ -47,7 +47,12 @@ export class Engine extends CoreEngine {
   // spinning workers starved the page: 4x slower queries, 9-40 ms stalls.
   constructor(opts = {}) {
     super({ platform: threadsAvailable() ? browserPlatform : null, spin: 0, ...opts });
+    if (!threadsAvailable() && opts.threads !== 1 && !Engine.#warned) { // the usual "fast in Node, slow in my app"
+      Engine.#warned = true;
+      console.warn('vectro: this page is not cross-origin isolated (COOP/COEP headers), so Engine runs on one thread. Send the headers, or use SplitEngine: https://vectrojs.dev/docs/browser');
+    }
   }
+  static #warned = false;
 
   // Fetch a CSV and parse it (on the workers when there are any).
   async loadCSV(url, opts) {
