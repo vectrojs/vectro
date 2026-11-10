@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vectro live sync</title>
+<style>
+  :root { --bg: #f7f8fa; --card: #fff; --ink: #1d2433; --muted: #6b7385; --line: #e3e6ec; --blue: #2f6fec; --up: #1f9d55; --down: #d64545; --new: #fff4c2; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #11141a; --card: #1a1f28; --ink: #e8ebf1; --muted: #8d95a8; --line: #2a303c; --blue: #6e9bff; --up: #46c37b; --down: #ff6b6b; --new: #4a4220; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 40px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 18px; }
+  .grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 2px; }
+  .card code { font-size: 12px; color: var(--muted); display: block; margin-bottom: 10px; white-space: pre-wrap; }
+  ol { list-style: none; margin: 0; padding: 0; position: relative; }
+  li { display: grid; grid-template-columns: 28px 1fr 90px 54px; gap: 8px; align-items: center; padding: 6px 8px; border-radius: 6px; border-bottom: 1px solid var(--line); background: var(--card); will-change: transform; }
+  li .rank { color: var(--muted); font-variant-numeric: tabular-nums; }
+  li .num { text-align: right; font-variant-numeric: tabular-nums; }
+  li.up .num.main { color: var(--up); } li.down .num.main { color: var(--down); }
+  li.flash { animation: flash 0.9s ease-out; }
+  @keyframes flash { from { background: var(--new); } to { background: var(--card); } }
+  .bar { height: 22px; display: grid; grid-template-columns: 120px 1fr 80px; gap: 8px; align-items: center; margin: 6px 0; }
+  .bar .track { background: var(--line); border-radius: 4px; height: 12px; overflow: hidden; }
+  .bar .fill { display: block; background: var(--blue); height: 100%; transition: width 0.25s ease-out; }
+  .bar .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 16px 0; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--blue); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 6px; }
+  .dot.open { background: var(--up); }
+  #log { font: 12px ui-monospace, monospace; color: var(--muted); max-height: 140px; overflow: auto; white-space: pre; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Vectro live sync</h1>
+  <p class="lead">The server changes orders all the time. For each query below it runs the SQL again, works out what changed in the answer, and sends only that. This page moves, adds and removes just those rows.</p>
+  <div class="controls">
+    <span><span class="dot" id="dot"></span><span id="status">connecting</span></span>
+    <button id="pause">Pause changes</button>
+    <button id="burst">Burst: 200 changes</button>
+    <label>Change every <select id="speed"><option>20</option><option>50</option><option>100</option><option selected>200</option><option>1000</option></select> ms</label>
+  </div>
+  <div class="stats">
+    <div class="stat"><b id="lat">–</b><span>change → page, median ms (last 100)</span></div>
+    <div class="stat"><b id="lat95">–</b><span>change → page, 95% under (ms)</span></div>
+    <div class="stat"><b id="srv">–</b><span>server: query + diff (ms)</span></div>
+    <div class="stat"><b id="sent">–</b><span>rows sent in the last change</span></div>
+    <div class="stat"><b id="count">–</b><span>orders in the table</span></div>
+  </div>
+  <div class="grid">
+    <section class="card">
+      <h2>Top 10 products by revenue</h2>
+      <code id="q1"></code>
+      <ol id="top"></ol>
+    </section>
+    <section class="card">
+      <h2>Revenue by region</h2>
+      <code id="q2"></code>
+      <div id="regions"></div>
+    </section>
+  </div>
+  <section class="card" style="margin-top:16px">
+    <h2>Last changes received</h2>
+    <div id="log"></div>
+  </section>
+</main>
+<script type="module">
+import { connectLive } from '/live/client.mjs';
+
+const livePort = new URLSearchParams(location.search).get('live') ?? '8795';
+const live = connectLive(`ws://${location.hostname}:${livePort}/live`, {
+  onStatus: (s) => { document.getElementById('status').textContent = s === 'open' ? 'live' : s; document.getElementById('dot').className = `dot ${s}`; },
+});
+const money = (v) => '$' + Math.round(v).toLocaleString('en');
+const lats = [];
+function note(change, label) {
+  if (change.snapshot) return;
+  lats.push(change.latency); if (lats.length > 100) lats.shift();
+  const sorted = [...lats].sort((a, b) => a - b);
+  document.getElementById('lat').textContent = sorted[Math.floor(sorted.length / 2)].toFixed(1);
+  document.getElementById('lat95').textContent = sorted[Math.floor(sorted.length * 0.95)].toFixed(1);
+  document.getElementById('srv').textContent = change.ms.toFixed(2);
+  const n = change.added.length + change.updated.length + change.removed.length + change.moved.length;
+  document.getElementById('sent').textContent = n;
+  const log = document.getElementById('log');
+  log.textContent = `${new Date().toLocaleTimeString()}  ${label}: +${change.added.length} added, ${change.updated.length} changed, -${change.removed.length} removed, ${change.moved.length} moved, ${change.latency.toFixed(1)} ms\n` + log.textContent.split('\n').slice(0, 30).join('\n');
+}
+
+// Top 10: one <li> per product, kept from patch to patch; rows slide to their new place (FLIP)
+const Q1 = `SELECT product, SUM(price * qty) AS revenue, COUNT(*) AS orders
+FROM orders GROUP BY product ORDER BY revenue DESC, product LIMIT 10`;
+document.getElementById('q1').textContent = Q1;
+const ol = document.getElementById('top'), items = new Map(), last = new Map();
+live.watch(Q1, { key: 'product' }, (rows, change) => {
+  const before = new Map([...items].map(([k, el]) => [k, el.getBoundingClientRect().top]));
+  const changed = new Set([...change.added, ...change.updated]);
+  const seen = new Set();
+  rows.forEach((r, i) => {
+    let el = items.get(r.product);
+    if (!el) { el = document.createElement('li'); el.innerHTML = '<span class="rank"></span><span class="name"></span><span class="num main"></span><span class="num orders"></span>'; items.set(r.product, el); }
+    el.children[0].textContent = i + 1;
+    el.children[1].textContent = r.product;
+    el.children[2].textContent = money(r.revenue);
+    el.children[3].textContent = r.orders;
+    if (changed.has(r) && !change.snapshot) {
+      const was = last.get(r.product);
+      el.classList.remove('up', 'down', 'flash'); void el.offsetWidth;
+      el.classList.add('flash'); if (was !== undefined) el.classList.add(r.revenue >= was ? 'up' : 'down');
+    }
+    last.set(r.product, r.revenue);
+    if (ol.children[i] !== el) ol.insertBefore(el, ol.children[i] ?? null);
+    seen.add(r.product);
+  });
+  for (const [k, el] of items) if (!seen.has(k)) { el.remove(); items.delete(k); last.delete(k); }
+  for (const [k, el] of items) { // FLIP: from the old place to the new one
+    const top = before.get(k);
+    if (top === undefined) continue;
+    const dy = top - el.getBoundingClientRect().top;
+    if (dy) el.animate([{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { duration: 350, easing: 'ease-out' });
+  }
+  note(change, 'top 10');
+});
+
+const Q2 = `SELECT region, SUM(price * qty) AS revenue, COUNT(*) AS orders
+FROM orders GROUP BY region ORDER BY revenue DESC`;
+document.getElementById('q2').textContent = Q2;
+const box = document.getElementById('regions'), bars = new Map();
+live.watch(Q2, { key: 'region' }, (rows, change) => {
+  const max = Math.max(...rows.map((r) => r.revenue), 1);
+  rows.forEach((r, i) => { // (one bar per region, kept, so its width animates)
+    let d = bars.get(r.region);
+    if (!d) {
+      d = document.createElement('div'); d.className = 'bar';
+      d.innerHTML = '<span></span><span class="track"><span class="fill"></span></span><span class="num"></span>';
+      d.children[0].textContent = r.region; bars.set(r.region, d);
+    }
+    d.querySelector('.fill').style.width = `${(r.revenue / max) * 100}%`;
+    d.children[2].textContent = money(r.revenue);
+    if (box.children[i] !== d) box.insertBefore(d, box.children[i] ?? null);
+  });
+  for (const r of change.removed) { bars.get(JSON.parse(r))?.remove(); bars.delete(JSON.parse(r)); }
+});
+
+const COUNT = 'SELECT COUNT(*) AS n FROM orders';
+live.watch(COUNT, (rows) => { document.getElementById('count').textContent = rows[0]?.n.toLocaleString('en') ?? '–'; });
+
+const control = (q) => fetch(`/control?${q}`, { method: 'POST' }).then((r) => r.json());
+document.getElementById('pause').onclick = async (e) => { const s = await control('do=pause'); e.target.textContent = s.paused ? 'Resume changes' : 'Pause changes'; };
+document.getElementById('burst').onclick = () => control('do=burst');
+document.getElementById('speed').onchange = (e) => control(`do=speed&ms=${e.target.value}`);
+</script>
+</body>
+</html>

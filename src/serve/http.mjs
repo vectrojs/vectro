@@ -7,6 +7,8 @@
 //   GET  /tables/<name>            one table's columns
 //   GET  /tables/<name>/rows?format=csv[&limit=n]
 //   POST /reload                   read the data folder again
+//   GET  /live (WebSocket)         live sync: watch SQL, get each change of its answer
+//                                  (with the live option; see docs/live-sync.md)
 //
 //   import { serve } from 'vectrojs/serve';
 //   const s = await serve({ tables: { orders }, port: 8787 });   // or { root: '~/data' }
@@ -22,6 +24,8 @@ import { sql } from '../node.mjs';
 import { openTables, LoadError } from './catalog.mjs';
 import { odata, ODataError } from './odata.mjs';
 import { FORMATS, columnsOf, encode } from './formats.mjs';
+import { LiveHub } from '../live/hub.mjs';
+import { acceptWebSocket, refuseUpgrade } from '../live/ws.mjs';
 
 const MAX_BODY = 1 << 20;
 
@@ -40,11 +44,15 @@ async function send(res, chunk) {
 
 // catalog: tables opened with openTables (catalog.mjs), to share them with
 // the PostgreSQL server; else tables / root / engine open them here.
-export async function serve({ tables = {}, root = null, engine = null, catalog = null, port = 8787, host = '127.0.0.1', token = null, cors = false, odataPage = 50_000, log = () => {} } = {}) {
+// live: true, or { name: liveTable(...) }, or { tables: { ... }, minInterval, maxRows, maxWatches, maxBuffered }:
+// a WebSocket at /live where pages watch SQL (src/live/hub.mjs); the live tables are served as tables too.
+export async function serve({ tables = {}, root = null, engine = null, catalog = null, port = 8787, host = '127.0.0.1', token = null, cors = false, odataPage = 50_000, live = null, log = () => {} } = {}) {
   const shared = !!catalog;
   catalog ??= await openTables({ tables, root, engine, log });
   const entries = catalog.entries, rootPath = catalog.root;
-  const reload = () => catalog.reload().catch((err) => { throw new HttpError(400, err.message); });
+  const liveOpts = !live ? null : live === true ? {} : live.tables && typeof live.tables === 'object' && !('tableFor' in live.tables) ? live : { tables: live };
+  const hub = liveOpts ? new LiveHub(catalog, { ...liveOpts, log }) : null;
+  const reload = () => catalog.reload().then((r) => { if (hub) for (const name of entries.keys()) hub.changed(name); return r; }, (err) => { throw new HttpError(400, err.message); });
 
   const allowed = (req, url) => {
     if (!token) return true;
@@ -175,6 +183,15 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
       json(res, status, { error: err.message });
     });
   });
+  server.on('upgrade', (req, socket, head) => {
+    socket.on('error', () => {});
+    const url = new URL(req.url, 'http://localhost');
+    if ((url.pathname.replace(/\/+$/, '') || '/') !== '/live') return refuseUpgrade(socket, 404, 'WebSockets are served at /live');
+    if (!hub) return refuseUpgrade(socket, 404, 'this server has no live sync (serve({ live: ... }))');
+    if (!allowed(req, url)) return refuseUpgrade(socket, 401, 'this server needs a token: add ?token= to the WebSocket URL');
+    const ws = acceptWebSocket(req, socket, head);
+    if (ws) { hub.accept(ws); log('live: a client connected'); }
+  });
   server.listen(port, host);
   await once(server, 'listening');
   const actual = server.address().port;
@@ -185,8 +202,10 @@ export async function serve({ tables = {}, root = null, engine = null, catalog =
     engine: catalog.engine,
     tables: entries,
     catalog,
+    live: hub,
     reload,
     async close() {
+      await hub?.close();
       server.closeAllConnections?.();
       await new Promise((r) => server.close(r));
       if (!shared) await catalog.close();
