@@ -600,7 +600,10 @@ function compileSQL(text, tables, opts) {
   const engine = Object.values(tables).find((t) => t?.engine)?.engine ?? null;
   const env = { tables, ctes: new Map(), engine, n: { hidden: 0 }, wantTypes: !!opts.types, pgNames: !!opts.foldCase, functions: opts.functions ?? null, session: opts.session ?? null, database: opts.database ?? null };
   const rel = compileQuery(ast, env, null);
-  if (opts.types) rel.query.columns = rel.names.map((name) => ({ name, type: rel.typeOf?.(name) ?? 'float' }));
+  // names that aren't plain ran under a plain one (encodeName): the answer shows them as written
+  const shown = new Map(rel.names.filter((name) => name.startsWith('__q_')).map((name) => [name, displayName(name)]));
+  if (shown.size) rel.query.node.shown = shown;
+  if (opts.types) rel.query.columns = rel.names.map((name) => ({ name: shown.get(name) ?? name, type: rel.typeOf?.(name) ?? 'float' }));
   return rel.query;
 }
 
@@ -670,6 +673,9 @@ function tableRelation(t) {
     const what = t?.constructor?.name === 'SplitTable' || t?.constructor?.name === 'StreamTable' ? `a ${t.constructor.name}: SQL runs on Table and Dataset, not on split tables (use its own methods, filter / groupBy / aggAsync, or copy its rows into a Table: splitEngine.local.table(await t.toColumnsAsync()))` : 'not a Vectro Table or Dataset';
     throw new TypeError(`vectro: sql() got ${what}`);
   }
+  // columns whose names aren't plain ("Order Date", from engine.table or an earlier answer) are read under their plain encoding
+  const odd = typeof t._renamed === 'function' ? t.columnNames.filter((name) => !PLAIN.test(name)) : [];
+  if (odd.length) t = t._renamed(new Map(odd.map((name) => [name, encodeName(name)])));
   return { query: t.lazy(), names: t.columnNames, kinds: new Map(t.columnNames.map((n) => [n, kindOfTable(t, n)])), typeOf: (n) => columnType(t, n) };
 }
 
@@ -1930,13 +1936,13 @@ function compileSelect(ast, env, outer, tail) {
   // ORDER BY item -> an output name or an expression
   function orderTarget(e, outs, tr) {
     if (e.k === 'num') { const o = outs[e.v - 1]; if (!o) fail(`ORDER BY ${e.v}: there is no select item ${e.v}`); return v(o.col); }
-    if (e.k === 'col' && !e.table) { const o = outs.find((x) => x.name === e.name); if (o) return v(o.col); }
+    if (e.k === 'col' && !e.table) { const o = outs.find((x) => x.name === e.name || x.name === encodeName(e.name)); if (o) return v(o.col); } // (a quoted name: kept encoded)
     const t = tr(e), same = outs.find((o) => toSourceAst(o.ast) === toSourceAst(t));
     return same ? v(same.col) : t;
   }
   // the kind (text or not) of what an ORDER BY item sorts: a select item by number or name, or the expression
   function orderKind(o, outs, ctx) {
-    const e = o.e.k === 'num' ? outs[o.e.v - 1]?.e : (o.e.k === 'col' && !o.e.table && outs.find((x) => x.name === o.e.name)?.e) || o.e;
+    const e = o.e.k === 'num' ? outs[o.e.v - 1]?.e : (o.e.k === 'col' && !o.e.table && outs.find((x) => x.name === o.e.name || x.name === encodeName(o.e.name))?.e) || o.e;
     try { return kindOf(e, ctx); } catch { return null; }
   }
   function sortKey(o, kind) {

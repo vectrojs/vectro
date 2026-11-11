@@ -164,6 +164,25 @@ fails(() => sql('SELECT l.id AS x FROM a l LEFT JOIN b r ON l.v < r.v AND r.v < 
     same(sql(`SELECT COUNT(*) AS n FROM ka ${how} kb ON ka.g = kb.g AND ka.t BETWEEN kb.lo AND kb.hi`, { ka, kb }).toRows()[0].n, want, `${how}: keys and BETWEEN`);
   }
 }
+// Names that aren't plain ("Order Date"): answers show them as written, not
+// as the plain name they run under (__q_Order_20_Date); ORDER BY finds the
+// quoted alias; an answer with such a name can be queried again.
+{
+  const t = await engine.parseCSVAsync('a,"we ird"\n1,x\n2,y\n2,x\n3,z\n');
+  same(Object.keys(sql('SELECT "we ird", COUNT(*) AS n FROM t GROUP BY "we ird"', { t }).toRows()[0]), ['we ird', 'n'], 'quoted column: shown as written');
+  same(sql('SELECT a, COUNT(*) AS "the count" FROM t GROUP BY a ORDER BY a', { t }).toRows()[0], { a: 1, 'the count': 1 }, 'quoted alias: shown as written');
+  const q = sql('SELECT a AS "Order Date" FROM t ORDER BY "Order Date" DESC', { t });
+  same(q.toRows().map((r) => r['Order Date']), [3, 2, 2, 1], 'ORDER BY a quoted alias');
+  same(q.limit(1).toRows(), [{ 'Order Date': 3 }], 'shown as written through a chained step');
+  same((await q.collectAsync()).columnNames, ['Order Date'], 'collectAsync: shown as written');
+  const r = q.collect();
+  same(sql('SELECT SUM("Order Date") AS s FROM r', { r }).toRows(), [{ s: 8 }], 'an answer with a quoted name, queried again');
+  r.dispose();
+  same(sql('SELECT a AS "x y" FROM t', { t }, { types: true }).columns, [{ name: 'x y', type: 'int' }], 'opts.types: the names as shown');
+  let err = '';
+  try { sql('SELECT "nope x" FROM t', { t }); } catch (e) { err = e.message; }
+  same(err, 'vectro SQL: no column "nope x"', 'an unknown quoted column is an error');
+}
 await engine.close();
 console.log(`${checks - failures}/${checks} audit r6 SQL checks passed`);
 if (failures) process.exit(1);

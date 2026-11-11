@@ -519,16 +519,28 @@ export function findDataset(node) {
   return node.op === 'join' ? findDataset(node.left) ?? findDataset(node.right) : findDataset(node.input);
 }
 
+// (SQL) answer columns whose names aren't plain ("Order Date") run under a
+// plain one; sql() marks its query with the names to show (node.shown), and
+// steps that keep columns pass the mark on to the answer.
+const KEEPS = new Set(['output', 'filter', 'derive', 'select', 'sort', 'limit']);
+function shownOf(node) {
+  for (let n = node; n; n = KEEPS.has(n.op) ? n.input : null) if (n.shown) return n.shown;
+  return null;
+}
+// (a filtered view's condition names its columns as they were: left as it is)
+const show = (t, shown) => (shown && typeof t?._renamedOwning === 'function' && !t.pred ? t._renamedOwning(shown) : t);
+
 function runSync(q) {
   const plan = optimize(q.node);
   const ds = findDataset(plan);
-  return ds ? ds.runPlan(plan, true) : execute(plan, true);
+  return show(ds ? ds.runPlan(plan, true) : execute(plan, true), shownOf(q.node));
 }
 
 function runAsync(q) {
   const plan = optimize(q.node);
-  const ds = findDataset(plan);
-  return ds ? ds.runPlan(plan, false) : execute(plan, false);
+  const ds = findDataset(plan), shown = shownOf(q.node);
+  const out = ds ? ds.runPlan(plan, false) : execute(plan, false);
+  return shown ? Promise.resolve(out).then((t) => show(t, shown)) : out;
 }
 
 // Run an optimized plan over tables in memory (sync: the result; else a promise).

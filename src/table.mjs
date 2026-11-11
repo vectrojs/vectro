@@ -1404,6 +1404,17 @@ export class Table {
     return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params, zones: false });
   }
 
+  // The same rows with columns renamed (map: old name -> new name), taking
+  // over what this table owned (SQL answers: names kept under plain ones,
+  // shown as written). This table is left owning nothing.
+  _renamedOwning(map) {
+    const cols = new Map([...this.cols].map(([name, c]) => [map.get(name) ?? name, c]));
+    const owned = this.owned.map((name) => map.get(name) ?? name), ownedBuffers = this.ownedBuffers;
+    this.owned = [];
+    this.ownedBuffers = [];
+    return new Table(this.engine, cols, this.n, { pred: this.pred, params: this.params, owned, ownedBuffers, zones: this.zones });
+  }
+
   // (SQL text functions) a new column `name` = fn(values of the input
   // columns), run once per distinct combination of them (see textmap.mjs):
   // text answers make a category column with state's labels ({ dict, codes },

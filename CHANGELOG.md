@@ -7,6 +7,12 @@
   PostgreSQL 16: `SELECT * FROM (SELECT ...)` works, and the subquery is
   called `unnamed_subquery` (then `unnamed_subquery2`, ...), the same names
   DuckDB gives (`test/test-sql-unnamed-subquery.mjs`).
+- Column names that aren't plain (`"Order Date"`, `AS "the count"`) come
+  back as written. Before, answers showed the plain name they run under
+  (`__q_Order_20_Date`); the PostgreSQL, OData and Flight servers already
+  showed them right.
+- `ORDER BY "Order Date"` finds a quoted alias (it said `no column`).
+- An answer with such a column can be queried again with SQL.
 
 ## 0.2.1
 
